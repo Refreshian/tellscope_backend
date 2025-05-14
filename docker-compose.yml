@@ -1,0 +1,67 @@
+version: '3.9'
+
+services:
+  # FastAPI Web Service
+  web:
+    build:
+      context: .
+    ports:
+      - "5001:5001"
+    volumes:
+      - .:/home/dev/fastapi/analytics_app
+    environment:
+      - SOME_ENV_VAR=some_value
+    depends_on:
+      - db
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ffsfds&fdv12w
+      POSTGRES_DB: datadb
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  # Grafana Service
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  # Prometheus Service
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus_data/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+volumes:
+  # Persistent data for PostgreSQL
+  pg_data:
+    driver: local
+
+  # Persistent data for Grafana
+  grafana_data:
+    driver: local
+
+  # Volume for Prometheus configuration
+  prometheus_data:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: ./prometheus_data
+
+networks:
+  # Custom network configuration
+  default:
+    name: hello_fastapi
