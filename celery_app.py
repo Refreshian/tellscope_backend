@@ -85,10 +85,10 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 # Создаем приложение Celery
-app = Celery('tellscope_backend')
+celery_app = Celery('tellscope_backend')
 
 # Настройки Celery с принудительным перезапуском воркеров
-app.conf.update(
+celery_app.conf.update(
     broker_url=os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
     result_backend=os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0'),
     task_serializer='json',
@@ -114,7 +114,7 @@ app.conf.update(
 )
 
 # Автоматическое обнаружение задач
-app.autodiscover_tasks(['tasks'])
+celery_app.autodiscover_tasks(['tasks'])
 
 if __name__ == '__main__':
-    app.start()
+    celery_app.start()

@@ -92,6 +92,7 @@ from torch import cuda
 
 from torch import bfloat16
 import transformers
+from contextlib import asynccontextmanager
 
 from umap import UMAP
 from hdbscan import HDBSCAN
@@ -100,6 +101,7 @@ import torch, os, json
 from sentence_transformers import SentenceTransformer
 from bertopic import BERTopic
 from bertopic.representation import KeyBERTInspired, MaximalMarginalRelevance, TextGeneration
+from celery_app import celery_app
 
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
@@ -110,7 +112,8 @@ import joblib  # import pickle
 import tensorflow as tf
 from prometheus_fastapi_instrumentator import Instrumentator
 from embedding_model_manager import model_manager
-from celery_app import app
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Скрыть INFO и WARNING сообщения TensorFlow
 
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:50"
 os.environ["SUNO_USE_SMALL_MODELS"] = "True"
@@ -144,19 +147,46 @@ es = Elasticsearch(
 
 path_json_files = '/home/dev/tellscope_app/tellscope_backend/data/json_files'
 
+torch.cuda.empty_cache() 
+gc.collect()
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
+
+# Инициализация модели при запуске приложения
+@asynccontextmanager
+async def model_lifespan():
+    try:
+        print("Инициализация модели при запуске приложения...")
+        model_manager.initialize_model()
+        print("Модель успешно инициализирована при запуске")
+        yield
+    finally:
+        print("Очистка модели при завершении приложения...")
+        model_manager.cleanup()
+        print("Модель успешно очищена")
+
+@asynccontextmanager
+async def redis_lifespan():
+    try:
+        await redis_db.ping()
+        logging.info("Redis подключен!")
+        existing_status = await redis_db.get("gpu:status")
+        if not existing_status:
+            logging.info("Инициализация статуса GPU как 'idle'.")
+            await redis_db.set("gpu:status", "idle")
+        yield
+    finally:
+        await redis_db.close()
+
+@asynccontextmanager
+async def combined_lifespan(app: FastAPI):
+    async with model_lifespan():
+        async with redis_lifespan():
+            yield
+
 app = FastAPI(
-    title="Analytics App"
+    title="Analytics App",
+    lifespan=combined_lifespan
 )
-Instrumentator().instrument(app).expose(app)
-
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
 
 # Настройка CORS
 origins = [ 
@@ -189,46 +219,7 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-# app.add_middleware(HTTPSRedirectMiddleware)
-
-# db
-
-torch.cuda.empty_cache() 
-gc.collect()
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
-
-# load LLM
-# os.chdir('/home/dev/fastapi/fastapi_app/data/LLM_models')
-
-# model = "gemma-2b-it"
-# tokenizer = AutoTokenizer.from_pretrained(model)
-# pipeline = pipeline(
-#     "text-generation",
-#     model=model,
-#     model_kwargs={"torch_dtype": torch.bfloat16},
-#     device="cuda",
-# )
-
-# Инициализация модели при запуске приложения
-@app.on_event("startup")
-async def startup_event():
-    try:
-        print("Инициализация модели при запуске приложения...")
-        model_manager.initialize_model()
-        print("Модель успешно инициализирована при запуске")
-    except Exception as e:
-        print(f"Ошибка при инициализации модели: {e}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    try:
-        print("Очистка модели при завершении приложения...")
-        model_manager.cleanup()
-        print("Модель успешно очищена")
-    except Exception as e:
-        print(f"Ошибка при очистке модели: {e}")
- 
+Instrumentator().instrument(app).expose(app)
 
 fastapi_users = FastAPIUsers[User, int]( 
     get_user_manager,
@@ -2697,9 +2688,10 @@ redis_db = redis.Redis(host='localhost', port=6379, db=0)
 # # Получаем список стоп-слов для русского языка
 # russian_stopwords = stopwords.words("russian")
 
-from sqlalchemy.orm import sessionmaker, declarative_base
+# from sqlalchemy.orm import sessionmaker, declarative_base
 
 # Определяем базовый класс для моделей
+from sqlalchemy.orm import declarative_base
 Base = declarative_base()
 
 # Определяем модель для хранения эмбеддингов
@@ -4036,24 +4028,24 @@ import asyncio
 import traceback
 import redis.asyncio
 
-@app.on_event("startup")
-async def startup_event():
-    try:
-        await redis_db.ping()
-        logging.info("Redis подключен!")
-        # Инициализируем статус GPU при старте
-        existing_status = await redis_db.get("gpu:status")
-        if not existing_status:
-            logging.info("Инициализация статуса GPU как 'idle'.")
-            await redis_db.set("gpu:status", "idle")
-    except Exception as e:
-        logging.error(f"Ошибка подключения к Redis: {e}")
-        raise RuntimeError("Не удалось подключиться к Redis")
+# @app.on_event("startup")
+# async def startup_event():
+#     try:
+#         await redis_db.ping()
+#         logging.info("Redis подключен!")
+#         # Инициализируем статус GPU при старте
+#         existing_status = await redis_db.get("gpu:status")
+#         if not existing_status:
+#             logging.info("Инициализация статуса GPU как 'idle'.")
+#             await redis_db.set("gpu:status", "idle")
+#     except Exception as e:
+#         logging.error(f"Ошибка подключения к Redis: {e}")
+#         raise RuntimeError("Не удалось подключиться к Redis")
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await redis_db.close()
+# @app.on_event("shutdown")
+# async def shutdown_event():
+#     await redis_db.close()
 
 
 @app.get("/is_gpu_busy", tags=['metrics'])
@@ -4695,25 +4687,28 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
     )
 
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # Добавьте options для отключения проверки audience
+        payload = jwt.decode(
+            token, 
+            SECRET_KEY, 
+            algorithms=[ALGORITHM],
+            options={"verify_aud": False}  # Отключаем проверку audience
+        )
     except ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired. Please log in again.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    except jwt.InvalidTokenError:
+        raise credentials_exception
 
     user_id: str = payload.get("sub")
-
-    # Здесь мы предполагаем, что определена ORM модель User
-    # query = select(User).where(User.id == int(user_id)).options(selectinload(User.role))
-    # result = await db.execute(query)
-    # user_record = result.scalars().first()  # Используйте first() для получения единственного объекта 
     
-    # if user_record is None:
-    #     raise credentials_exception
+    if user_id is None:
+        raise credentials_exception
 
-    return user_id 
+    return user_id
  
 
 class ResponseModel(BaseModel):
@@ -5762,9 +5757,15 @@ async def delete_file(user_id: str, directory_type: str, directory_name: str, fi
 #     return f"Файл '{old_file_name}' переименован в '{new_file_name}' в папке '{folder_name}' у пользователя {user_id}!"
 
 
-# Эндпойнт получения папок и файлов для пользователя с данными из Elasticsearch
+# Создайте функцию для получения es
+def get_elasticsearch():
+    return es
+
 @app.get("/user-folders/{user_id}", tags=['data & folders'])
-async def get_user_folders(user_id: str):
+async def get_user_folders(
+    user_id: str, 
+    es: Elasticsearch = Depends(get_elasticsearch)  # Добавьте эту зависимость
+):
     # Проверяем, существует ли пользователь в БД
     user = get_user_profile(user_id)
     
@@ -5777,18 +5778,21 @@ async def get_user_folders(user_id: str):
     indexes = load_dict_from_pickle(file_path)
     
     # Получаем папки пользователя из Redis
-    folders = await redis_db.hgetall(user_id)  # Используем await для асинхронного вызова
+    folders = await redis_db.hgetall(user_id)
 
     if not folders:
         return {"user_id": user_id, "json_files_directory": {}, "bertopic_files_directory": {}}
 
-   
     # Преобразуем данные из Redis в формат JSON
     formatted_folders = {folder.decode('utf-8'): json.loads(files) for folder, files in folders.items()}
 
-    # Получение данных из Elasticsearch
-    es_indexes = [index for index in es.indices.get(index='*')]  # список всех индексов elastic
-    es_indexes = [x.strip() for x in es_indexes]
+    # Получение данных из Elasticsearch с обработкой ошибок
+    try:
+        es_indexes = list(es.indices.get(index='*').keys())
+    except Exception as e:
+        logger.error(f"Ошибка подключения к Elasticsearch: {e}")
+        # В случае ошибки используем пустой список
+        es_indexes = []
 
     # Запрос для поиска мин и макс дат в данных/файлах
     query = {
