@@ -99,9 +99,9 @@ celery_app.conf.update(
     
     # КРИТИЧЕСКИ ВАЖНЫЕ НАСТРОЙКИ для очистки памяти
     worker_preload_app=False,
-    worker_pool='solo',
-    worker_concurrency=1,
-    worker_max_tasks_per_child=1,  # Каждый воркер выполняет ТОЛЬКО одну задачу
+    worker_pool='processes',
+    worker_concurrency=2,  # Увеличьте concurrency
+    worker_max_tasks_per_child=10,  # Увеличьте лимит задач
     worker_proc_alive_timeout=10,  # Быстрое завершение
     task_soft_time_limit=7200,     # 2 час на задачу
     task_time_limit=3900,          # 65 минут максимум
@@ -110,11 +110,26 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     
-    include=['tasks']
+    include=['tasks'],
+
+    # КРИТИЧЕСКИ ВАЖНО для стабильности Elasticsearch соединений
+    broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    broker_connection_max_retries=10,
+    
+    # Настройки для предотвращения memory leaks
+    worker_disable_rate_limits=True,
+    worker_send_task_events=False,
+    task_send_sent_event=False,
+    
+    # Более агрессивная очистка
+    worker_cancel_long_running_tasks_on_connection_loss=True
 )
 
 # Автоматическое обнаружение задач
 celery_app.autodiscover_tasks(['tasks'])
+
+
 
 if __name__ == '__main__':
     celery_app.start()

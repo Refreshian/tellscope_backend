@@ -1287,7 +1287,16 @@ async def information_graph(# user: User = Depends(current_user),
     df = df[['hub', 'timeCreate', 'audienceCount']]
 
     # Заменяем строку с ошибкой на безопасное преобразование
-    df['audienceCount'] = [int(x) if x != '' and x != '-' else 0 for x in df['audienceCount'].values]
+    def safe_convert(x):
+        try:
+            if x == '' or x == '-':
+                return 0
+            return int(float(x))
+        except (ValueError, TypeError):
+            return 0
+
+    df['audienceCount'] = [safe_convert(x) for x in df['audienceCount'].values]
+
     listhubs = [x for x in list(set(df['hub'].values)) if x != '']
     set_timeCreate = set(df['timeCreate'].values)
 

@@ -35,75 +35,228 @@ es = Elasticsearch(
     hosts=["http://localhost:9200"],
     basic_auth=("elastic", "biz8z5i1w0nLPmEweKgP"),
     verify_certs=False,
-    headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=9"}
+    headers={"Accept": "application/vnd.elasticsearch+json; compatible-with=9"},
+    # Отключаем sniffing - это важно!
+    sniff_on_start=False,
+    sniff_on_node_failure=False,
+    sniff_before_requests=False,
+    # Настройки таймаутов
+    request_timeout=30,
+    max_retries=3,
+    retry_on_timeout=True
 )
+
+# Добавьте в начало load_data_elastic.py для проверки
+try:
+    info = es.info()
+    logger.info(f"✅ Подключение к Elasticsearch: {info['version']['number']}")
+except Exception as e:
+    logger.error(f"❌ Ошибка подключения к Elasticsearch: {e}")
 
 client_qdrant = QdrantClient("localhost", port=6333)
 
 # Оптимизированные константы
-MAX_TOKENS = 6000  # Уменьшено для ускорения
-OVERLAP = 150      # Уменьшено
-EMBED_BATCH_SIZE = 256  # Увеличено значительно
-QDRANT_BATCH_SIZE = 200  # Увеличено для Qdrant
-ES_BATCH_SIZE = 2000     # Увеличено для Elasticsearch
+MAX_TOKENS = 6000
+OVERLAP = 150
+EMBED_BATCH_SIZE = 256
+QDRANT_BATCH_SIZE = 200
+ES_BATCH_SIZE = 2000
 
 encoding = tiktoken.get_encoding("cl100k_base")
 
+def safe_bulk_index(actions, index_name, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            success, errors = helpers.bulk(
+                es,
+                actions,
+                chunk_size=100,
+                request_timeout=120,
+                raise_on_error=False
+            )
+            return success, errors
+        except ConnectionError as e:
+            if attempt == max_retries - 1:
+                raise e
+            logger.warning(f"Попытка {attempt + 1} не удалась, переподключаемся...")
+            time.sleep(2 ** attempt)
+            
 def split_text_into_chunks_optimized(text, max_tokens=MAX_TOKENS, overlap=OVERLAP):
     """Оптимизированная разбивка текста"""
-    if not text or not text.strip():
+    if not text or not isinstance(text, str) or not text.strip():
         return []
+    
+    try:
+        tokens = encoding.encode(text)
         
-    tokens = encoding.encode(text)
-    if len(tokens) <= max_tokens:
-        return [text]
+        if not tokens or len(tokens) == 0:
+            return []
+            
+        if len(tokens) <= max_tokens:
+            return [text]
+        
+        chunks = []
+        step = max_tokens - overlap
+        
+        for i in range(0, len(tokens), step):
+            chunk_tokens = tokens[i:i + max_tokens]
+            
+            if chunk_tokens and isinstance(chunk_tokens, list) and len(chunk_tokens) > 50:
+                try:
+                    decoded_chunk = encoding.decode(chunk_tokens)
+                    if decoded_chunk and decoded_chunk.strip():
+                        chunks.append(decoded_chunk)
+                except Exception as e:
+                    logger.warning(f"Ошибка декодирования чанка: {e}")
+                    continue
+        
+        return chunks
+        
+    except Exception as e:
+        logger.error(f"Ошибка разбивки текста: {e}")
+        return []
+
+def validate_document_numeric_fields(doc):
+    """Валидация числовых полей документа с детальным логированием"""
+    if not isinstance(doc, dict):
+        return doc
     
-    chunks = []
-    step = max_tokens - overlap
+    numeric_fields = ["timeCreate", "audienceCount"]
     
-    for i in range(0, len(tokens), step):
-        chunk_tokens = tokens[i:i + max_tokens]
-        if len(chunk_tokens) > 50:  # Минимальный размер чанка
-            chunks.append(encoding.decode(chunk_tokens))
+    for field in numeric_fields:
+        if field in doc:
+            original_value = doc[field]
+            
+            # 🔍 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ
+            logger.debug(f"Проверка поля {field}: value={original_value}, type={type(original_value)}")
+            
+            # Проверка и конвертация
+            if original_value is None or original_value == "" or original_value == "null":
+                logger.warning(f"Поле {field} содержит None/пустое значение, устанавливаем 0")
+                doc[field] = 0
+            else:
+                try:
+                    if isinstance(original_value, (int, float)):
+                        if np.isnan(original_value) or np.isinf(original_value):
+                            logger.warning(f"Поле {field} содержит NaN/Inf, устанавливаем 0")
+                            doc[field] = 0
+                        else:
+                            doc[field] = float(original_value)
+                    elif isinstance(original_value, str):
+                        cleaned = original_value.strip()
+                        if cleaned and cleaned.lower() not in ['none', 'null', 'nan']:
+                            cleaned = cleaned.replace(',', '.').replace(' ', '')
+                            if cleaned.replace('.', '').replace('-', '').replace('+', '').isdigit():
+                                converted = float(cleaned)
+                                if np.isnan(converted) or np.isinf(converted):
+                                    logger.warning(f"Поле {field} конвертировано в NaN/Inf, устанавливаем 0")
+                                    doc[field] = 0
+                                else:
+                                    doc[field] = converted
+                            else:
+                                logger.warning(f"Поле {field} не является числом: '{cleaned}', устанавливаем 0")
+                                doc[field] = 0
+                        else:
+                            logger.warning(f"Поле {field} пустое после очистки, устанавливаем 0")
+                            doc[field] = 0
+                    else:
+                        logger.warning(f"Поле {field} неизвестного типа: {type(original_value)}, устанавливаем 0")
+                        doc[field] = 0
+                        
+                except (ValueError, TypeError, AttributeError) as e:
+                    logger.warning(f"Ошибка конвертации {field}: {original_value} -> {e}, устанавливаем 0")
+                    doc[field] = 0
+            
+            # 🔍 ФИНАЛЬНАЯ ПРОВЕРКА
+            final_value = doc[field]
+            logger.debug(f"Поле {field} после валидации: {final_value}, type={type(final_value)}")
+            
+            # Критическая проверка
+            if final_value is None:
+                logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Поле {field} все еще None после валидации!")
+                doc[field] = 0
     
-    return chunks
+    return doc
 
 def process_documents_batch(documents_batch):
-    """Обработка батча документов (может быть распараллелена)"""
+    """Обработка батча документов с детальным логированием"""
     results = []
     text_fields = ["text", "Текст сообщения", "title", "content", "message", "description"]
     
-    for document in documents_batch:
-        if not isinstance(document, dict):
-            continue
+    for idx, document in enumerate(documents_batch):
+        try:
+            if not isinstance(document, dict):
+                logger.warning(f"Документ {idx} не является словарем: {type(document)}")
+                continue
             
-        text = None
-        for field in text_fields:
-            if field in document and isinstance(document[field], str) and document[field].strip():
-                text = document[field].strip()
-                break
-                
-        if not text:
-            continue
+            # 🔍 ЛОГИРОВАНИЕ ДО ВАЛИДАЦИИ
+            logger.debug(f"Документ {idx} ДО валидации: timeCreate={document.get('timeCreate')}, audienceCount={document.get('audienceCount')}")
             
-        chunks = split_text_into_chunks_optimized(text)
-        if not chunks:
-            continue
+            # Валидация
+            document = validate_document_numeric_fields(document)
             
-        metadata = document.copy()
-        metadata["used_text_field"] = next(
-            (field for field in text_fields if field in document and document[field] == text), None
-        )
-        
-        doc_id = document.get('id', str(uuid.uuid4()))
-        results.append((doc_id, text, chunks, metadata))
+            # 🔍 ЛОГИРОВАНИЕ ПОСЛЕ ВАЛИДАЦИИ
+            logger.debug(f"Документ {idx} ПОСЛЕ валидации: timeCreate={document.get('timeCreate')}, audienceCount={document.get('audienceCount')}")
+            
+            # Критическая проверка
+            for field in ["timeCreate", "audienceCount"]:
+                if field in document:
+                    value = document[field]
+                    if value is None:
+                        logger.error(f"❌ НАЙДЕН None в документе {idx} поле {field} ПОСЛЕ валидации!")
+                        document[field] = 0
+                    # 🔍 ПРОВЕРКА НА ВОЗМОЖНОСТЬ СРАВНЕНИЯ
+                    try:
+                        _ = value < 0  # Пробуем сравнение
+                    except TypeError as te:
+                        logger.error(f"❌ Ошибка сравнения в документе {idx} поле {field}: {te}")
+                        logger.error(f"   Значение: {value}, тип: {type(value)}")
+                        document[field] = 0
+            
+            # Поиск текстового поля
+            text = None
+            for field in text_fields:
+                if field in document:
+                    field_value = document[field]
+                    if isinstance(field_value, str) and field_value.strip():
+                        text = field_value.strip()
+                        break
+            
+            if not text:
+                continue
+            
+            # Разбивка на чанки
+            chunks = split_text_into_chunks_optimized(text)
+            
+            if not chunks or len(chunks) == 0:
+                logger.warning(f"Не удалось создать чанки для документа {document.get('id', 'unknown')}")
+                continue
+            
+            # Подготовка метаданных
+            metadata = document.copy()
+            
+            # 🔍 ФИНАЛЬНАЯ ПРОВЕРКА МЕТАДАННЫХ
+            for key in ["timeCreate", "audienceCount"]:
+                if key in metadata and metadata[key] is None:
+                    logger.error(f"❌ Найден None в метаданных для ключа {key}")
+                    metadata[key] = 0
+            
+            metadata["used_text_field"] = next(
+                (field for field in text_fields if field in document and document.get(field) == text), 
+                None
+            )
+            
+            doc_id = document.get('id') or document.get('idExternal') or str(uuid.uuid4())
+            results.append((doc_id, text, chunks, metadata))
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки документа {idx}: {e}", exc_info=True)
+            continue
     
     return results
 
-from concurrent.futures import ThreadPoolExecutor  # leave this
-
 def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
-    """Оптимизированная обработка документов с векторизацией"""
+    """Оптимизированная обработка с детальным логированием"""
     if task_id:
         safe_update_progress(task_id, 30, stage="chunking", 
                            stage_details=f"Обработка {len(documents)} документов")
@@ -111,7 +264,18 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
     try:
         logger.info(f"Начало обработки {len(documents)} документов")
         
-        # Параллельная обработка документов батчами
+        # 🔍 ПРОВЕРКА ВХОДНЫХ ДАННЫХ
+        logger.info(f"Проверка первых 3 документов на None значения...")
+        for i, doc in enumerate(documents[:3]):
+            if isinstance(doc, dict):
+                for field in ["timeCreate", "audienceCount"]:
+                    if field in doc:
+                        value = doc[field]
+                        logger.info(f"  Документ {i}, поле {field}: {value} (type: {type(value)})")
+                        if value is None:
+                            logger.error(f"  ❌ НАЙДЕН None во входных данных!")
+        
+        # Параллельная обработка
         cpu_count = min(os.cpu_count() or 1, 4)
         batch_size = max(len(documents) // cpu_count, 100)
         document_batches = [documents[i:i + batch_size] for i in range(0, len(documents), batch_size)]
@@ -127,13 +291,21 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
             logger.warning("Нет документов для обработки")
             return []
         
-        logger.info(f"Обработано {len(results)} документов, получено текстовых фрагментов")
+        logger.info(f"Обработано {len(results)} документов")
         
-        # Подготовка данных для векторизации
+        # Подготовка для векторизации
         global_chunks = []
         index_info = []
         
         for doc_id, text, chunks, metadata in results:
+            # 🔍 ПРОВЕРКА МЕТАДАННЫХ
+            for field in ["timeCreate", "audienceCount"]:
+                if field in metadata:
+                    value = metadata[field]
+                    if value is None:
+                        logger.error(f"❌ None в метаданных документа {doc_id} поле {field}")
+                        metadata[field] = 0
+            
             start = len(global_chunks)
             global_chunks.extend(chunks)
             end = len(global_chunks)
@@ -145,7 +317,7 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
             safe_update_progress(task_id, 40, stage="embedding", 
                                stage_details=f"Векторизация {len(global_chunks)} фрагментов")
         
-        # Оптимизированная векторизация большими батчами
+        # Векторизация
         all_vectors = []
         chunk_batch_size = EMBED_BATCH_SIZE
         total_batches = (len(global_chunks) + chunk_batch_size - 1) // chunk_batch_size
@@ -167,13 +339,11 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
                 
                 all_vectors.extend(batch_vectors)
                 
-                # Очистка памяти после каждого батча
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                # Обновление прогресса
                 if task_id:
-                    progress = 40 + int(((batch_idx + chunk_batch_size) / len(global_chunks)) * 30)
+                    progress = 40 + int(((batch_idx + chunk_batch_size) / len(global_chunks)) * 30) if global_chunks else 40
                     safe_update_progress(task_id, progress, stage="embedding",
                                        stage_details=f"Обработано {min(batch_idx + chunk_batch_size, len(global_chunks))}/{len(global_chunks)} фрагментов")
                 
@@ -181,24 +351,37 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
                 
             except Exception as e:
                 logger.error(f"Ошибка векторизации батча: {e}")
-                # Добавляем пустые векторы для пропущенного батча
                 all_vectors.extend([None] * len(batch_chunks))
         
         if task_id:
             safe_update_progress(task_id, 75, stage="preparing", 
                                stage_details="Подготовка документов для загрузки")
         
-        # Быстрая сборка финальных документов
+        # Сборка финальных документов
         processed_docs = []
         
         for doc_id, text, (start, end), metadata in index_info:
+            # 🔍 ФИНАЛЬНАЯ ПРОВЕРКА ПЕРЕД ДОБАВЛЕНИЕМ
+            for field in ["timeCreate", "audienceCount"]:
+                if field in metadata:
+                    value = metadata[field]
+                    if value is None:
+                        logger.error(f"❌ None в финальных метаданных {doc_id} поле {field}")
+                        metadata[field] = 0
+                    # Проверка на возможность сравнения
+                    try:
+                        _ = value < 0
+                    except TypeError as te:
+                        logger.error(f"❌ Ошибка сравнения в финальных метаданных: {te}")
+                        logger.error(f"   doc_id={doc_id}, field={field}, value={value}, type={type(value)}")
+                        metadata[field] = 0
+            
             chunk_vectors = [v for v in all_vectors[start:end] if v is not None and len(v) > 0]
             
             if not chunk_vectors:
                 continue
             
             try:
-                # Оптимизированное вычисление среднего
                 avg_vector = np.mean(chunk_vectors, axis=0).tolist()
             except Exception as e:
                 logger.error(f"Ошибка среднего вектора для {doc_id}: {e}")
@@ -226,10 +409,9 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         return processed_docs
         
     except Exception as e:
-        logger.error(f"Критическая ошибка в batch_process_documents_with_embeddings_optimized: {e}")
+        logger.error(f"Критическая ошибка в batch_process_documents_with_embeddings_optimized: {e}", exc_info=True)
         return []
     finally:
-        # Очистка памяти
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -242,14 +424,12 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
     try:
         logger.info(f"Начало загрузки {len(documents)} документов в Qdrant")
         
-        # Получение блокировки
         if not acquire_qdrant_lock(collection_name, task_id):
             raise Exception("Не удалось получить блокировку коллекции")
         
         safe_update_progress(task_id, 80, stage="qdrant_preparation", 
                            stage_details="Подготовка к загрузке в Qdrant")
         
-        # Создание коллекции если не существует
         if not client_qdrant.collection_exists(collection_name):
             vector_size = len(documents[0]["vector"])
             logger.info(f"Создание коллекции {collection_name} с размерностью {vector_size}")
@@ -260,27 +440,24 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
                     size=vector_size,
                     distance=models.Distance.COSINE
                 ),
-                # Оптимизация для быстрой загрузки
                 optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=0,  # Отключаем индексацию во время загрузки
+                    indexing_threshold=0,
                 ),
                 hnsw_config=models.HnswConfigDiff(
                     payload_m=16,
-                    m=0  # Временно отключаем HNSW
+                    m=0
                 )
             )
         
-        # Оптимизированная загрузка большими батчами
         batch_size = QDRANT_BATCH_SIZE
         total_docs = len(documents)
         
-        # Подготавливаем все точки сразу
         points = []
         for i, doc in enumerate(documents):
             if isinstance(doc["id"], str) and doc["id"].isdigit():
                 point_id = int(doc["id"])
             else:
-                point_id = hash(str(doc["id"])) % (2**31)  # Положительное число
+                point_id = hash(str(doc["id"])) % (2**31)
             
             points.append(
                 models.PointStruct(
@@ -290,7 +467,6 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
                 )
             )
         
-        # Загрузка батчами с параллелизмом
         uploaded = 0
         for i in range(0, len(points), batch_size):
             batch = points[i:i + batch_size]
@@ -299,29 +475,24 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
                 client_qdrant.upsert(
                     collection_name=collection_name,
                     points=batch,
-                    wait=False  # Асинхронная загрузка для ускорения
+                    wait=False
                 )
                 
                 uploaded += len(batch)
-                progress = 85 + int((uploaded / total_docs) * 15)
+                progress = 85 + int((uploaded / total_docs) * 15) if total_docs > 0 else 85
                 
                 safe_update_progress(task_id, progress, stage="qdrant_upload",
                                    stage_details=f"Загружено {uploaded}/{total_docs} документов")
                 
-                # logger.info(f"Загружен батч {i//batch_size + 1}, всего: {uploaded}/{total_docs}")
-                
             except Exception as e:
                 logger.error(f"Ошибка загрузки батча: {e}")
-                # Продолжаем с меньшим батчем
                 if batch_size > 50:
                     batch_size = batch_size // 2
                     continue
                 raise e
         
-        # Ждем завершения всех операций
         time.sleep(1)
         
-        # Включаем индексацию обратно
         client_qdrant.update_collection(
             collection_name=collection_name,
             optimizers_config=models.OptimizersConfigDiff(
@@ -334,21 +505,19 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
                            stage_details="Индексация завершена успешно")
         
     except Exception as e:
-        logger.error(f"Ошибка загрузки в Qdrant: {e}")
+        logger.error(f"Ошибка загрузки в Qdrant: {e}", exc_info=True)
         safe_update_progress(task_id, 0, status="failed", error=str(e))
         raise e
     finally:
         release_qdrant_lock(collection_name, task_id)
 
 def load_file_to_elstic(filename, path=None, task_id=None):
-    """Оптимизированная загрузка файла"""
-    # logger.info("🚀 Запуск оптимизированной загрузки файла")
+    """Загрузка файла с детальным логированием"""
     
     if task_id is None:
         task_id = str(uuid.uuid4())
     
     try:
-        # Оптимизированный mapping для Elasticsearch
         mapping = {
             "mappings": {
                 "properties": {
@@ -367,8 +536,8 @@ def load_file_to_elstic(filename, path=None, task_id=None):
                     "mapping.total_fields.limit": 3000,
                     "mapping.ignore_malformed": True,
                     "number_of_shards": 1,
-                    "number_of_replicas": 0,  # Отключаем реплики для ускорения
-                    "refresh_interval": "30s",  # Увеличиваем интервал обновления
+                    "number_of_replicas": 0,
+                    "refresh_interval": "30s",
                     "translog": {
                         "flush_threshold_size": "1gb"
                     }
@@ -384,78 +553,119 @@ def load_file_to_elstic(filename, path=None, task_id=None):
         
         logger.info(f"Создание оптимизированного индекса: {new_index}")
         
-        # Удаляем существующий индекс
         if es.indices.exists(index=new_index):
             es.indices.delete(index=new_index, ignore=[400, 404])
         
-        # Создаем новый индекс
         response = es.indices.create(index=new_index, body=mapping, ignore=400)
         
         if not ('acknowledged' in response and response['acknowledged']):
             logger.error(f"Ошибка создания индекса: {response}")
             return {"status": "failed", "error": "Ошибка создания индекса"}
         
-        # Быстрая загрузка JSON
         logger.info(f"Загрузка данных из {file_name}")
         with open(file_name, 'r', encoding='utf-8') as file:
             data = json.load(file)
-        
+
         if not isinstance(data, list) or not data:
             return {"status": "failed", "error": "Некорректный формат JSON"}
+
+        # 🔍 ДЕТАЛЬНАЯ ПРОВЕРКА ИСХОДНЫХ ДАННЫХ
+        logger.info("=" * 50)
+        logger.info("ПРОВЕРКА ИСХОДНЫХ ДАННЫХ ИЗ JSON")
+        logger.info("=" * 50)
         
-        logger.info(f"Загружено {len(data)} документов из JSON")
-        
-        # Оптимизированная подготовка для bulk индексации
-        actions = []
-        for i, doc in enumerate(data):
-            if not isinstance(doc, dict):
-                continue
-            
-            doc_id = str(doc.get('id', doc.get('idExternal', str(uuid.uuid4()))))
-            
-            if not any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
-                continue
-            
-            actions.append({
-                "_index": new_index,
-                "_id": doc_id,
-                "_source": doc
-            })
-        
-        if not actions:
-            return {"status": "failed", "error": "Нет данных для индексации"}
-        
-        logger.info(f"Подготовлено {len(actions)} документов для Elasticsearch")
-        
-        # Оптимизированная bulk индексация
-        success_count = 0
-        error_count = 0
-        
-        for success, info in parallel_bulk(
-            es,
-            actions,
-            chunk_size=ES_BATCH_SIZE,
-            max_chunk_bytes=50*1024*1024,  # 50MB батчи
-            thread_count=4,  # Параллельные потоки
-            queue_size=8
-        ):
-            if not success:
-                error_count += 1
-                logger.error(f"Ошибка индексации: {info}")
+        for i, doc in enumerate(data[:5]):  # Проверяем первые 5 документов
+            if isinstance(doc, dict):
+                logger.info(f"\nДокумент {i}:")
+                for field in ["timeCreate", "audienceCount"]:
+                    if field in doc:
+                        value = doc[field]
+                        logger.info(f"  {field}: {value} (type: {type(value).__name__})")
+                        
+                        # Проверка на None
+                        if value is None:
+                            logger.error(f"  ❌ НАЙДЕН None В ИСХОДНОМ JSON!")
+                        
+                        # Проверка на возможность сравнения
+                        try:
+                            _ = value < 0
+                            logger.info(f"  ✅ Сравнение возможно")
+                        except TypeError as te:
+                            logger.error(f"  ❌ Ошибка сравнения: {te}")
+
+        # Предварительная очистка
+        cleaned_data = []
+        for idx, doc in enumerate(data):
+            if isinstance(doc, dict):
+                # Логируем ДО валидации
+                if idx < 3:
+                    logger.info(f"\nОчистка документа {idx} ДО валидации:")
+                    logger.info(f"  timeCreate: {doc.get('timeCreate')} (type: {type(doc.get('timeCreate')).__name__})")
+                    logger.info(f"  audienceCount: {doc.get('audienceCount')} (type: {type(doc.get('audienceCount')).__name__})")
+                
+                doc = validate_document_numeric_fields(doc)
+                
+                # Логируем ПОСЛЕ валидации
+                if idx < 3:
+                    logger.info(f"  ПОСЛЕ валидации:")
+                    logger.info(f"  timeCreate: {doc.get('timeCreate')} (type: {type(doc.get('timeCreate')).__name__})")
+                    logger.info(f"  audienceCount: {doc.get('audienceCount')} (type: {type(doc.get('audienceCount')).__name__})")
+                
+                cleaned_data.append(doc)
             else:
-                success_count += 1
+                logger.warning(f"Пропущен документ {idx} неверного типа: {type(doc)}")
+
+        data = cleaned_data
+        logger.info(f"После очистки осталось {len(data)} валидных документов")
         
-        # Принудительное обновление индекса
+        # Загрузка в Elasticsearch
+        try:
+            from elasticsearch.helpers import streaming_bulk
+            
+            def actions_generator():
+                for doc in data:
+                    if not isinstance(doc, dict):
+                        continue
+                    
+                    doc_id = str(doc.get('id', doc.get('idExternal', str(uuid.uuid4()))))
+                    
+                    if not any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
+                        continue
+                    
+                    yield {
+                        "_index": new_index,
+                        "_id": doc_id,
+                        "_source": doc
+                    }
+            
+            success_count = 0
+            for ok, response in streaming_bulk(
+                es,
+                actions_generator(),
+                chunk_size=200,
+                max_retries=3,
+                initial_backoff=2,
+                yield_ok=False,
+                raise_on_error=False
+            ):
+                if ok:
+                    success_count += 1
+                else:
+                    logger.warning(f"Ошибка индексации: {response}")
+                    
+        except Exception as bulk_error:
+            logger.error(f"Ошибка bulk индексации: {bulk_error}", exc_info=True)
+        
         es.indices.refresh(index=new_index)
         total_docs = es.count(index=new_index)['count']
         
         logger.info(f"✅ Elasticsearch индексация завершена:")
-        logger.info(f"   Успешно: {success_count}, Ошибок: {error_count}, Всего в индексе: {total_docs}")
+        logger.info(f"   Успешно: {success_count}, Всего в индексе: {total_docs}")
         
         if total_docs == 0:
             return {"status": "failed", "error": "Индекс пуст после загрузки"}
         
-        # Оптимизированная обработка для Qdrant
+        # Обработка для Qdrant
         logger.info("🔄 Начало обработки для Qdrant")
         processed_docs = batch_process_documents_with_embeddings_optimized(data, task_id)
         
@@ -467,7 +677,6 @@ def load_file_to_elstic(filename, path=None, task_id=None):
         logger.info(f"   Обработано для Qdrant: {len(processed_docs)}")
         logger.info(f"   Пропущено: {len(data) - len(processed_docs)}")
         
-        # Создаем задачу в Redis
         redis_client.hset(
             f"task:{task_id}",
             mapping={
@@ -479,11 +688,10 @@ def load_file_to_elstic(filename, path=None, task_id=None):
             }
         )
         
-        # Оптимизированная загрузка в Qdrant
         try:
             load_to_qdrant_optimized(new_index, processed_docs, task_id)
         except Exception as e:
-            logger.error(f"Ошибка Qdrant: {e}")
+            logger.error(f"Ошибка Qdrant: {e}", exc_info=True)
             return {"status": "failed", "error": str(e)}
         
         logger.info("🎉 Обработка файла полностью завершена")
@@ -497,23 +705,20 @@ def load_file_to_elstic(filename, path=None, task_id=None):
         }
         
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
         return {"status": "failed", "error": str(e)}
     finally:
         try:
             model_manager.cleanup()
-            # logger.info("✅ Ресурсы очищены")
         except Exception as e:
             logger.warning(f"Ошибка очистки: {e}")
 
-# Вспомогательные функции (без изменений)
 def acquire_qdrant_lock(collection_name, task_id, timeout=30):
     lock_key = f"qdrant_lock:{collection_name}"
     deadline = time.time() + timeout
     
     while time.time() < deadline:
-        if redis_client.set(lock_key, task_id, nx=True, ex=120):  # 2 минуты
-            # logger.info(f"🔒 Получена блокировка {collection_name}")
+        if redis_client.set(lock_key, task_id, nx=True, ex=120):
             return True
         time.sleep(1)
     
@@ -525,6 +730,5 @@ def release_qdrant_lock(collection_name, task_id):
     
     if owner and owner.decode('utf-8') == task_id:
         redis_client.delete(lock_key)
-        # logger.info(f"🔓 Освобождена блокировка {collection_name}")
         return True
     return False
