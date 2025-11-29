@@ -189,25 +189,26 @@ app = FastAPI(
 )
 
 # Настройка CORS
-origins = [ 
+origins = [
     "http://localhost",
     "http://localhost:5000",
     "http://localhost:5173",
-    "http://194.146.113.124:5000",
     "http://localhost:5174",
-    "http://194.146.113.124",
-    "https://194.146.113.124",
-    "http://194.146.113.124:8000",  # добавлена запятая
-    "http://194.146.113.124:3000",
-    "http://194.146.113.124:4000",  # ваш фронтенд порт
-    "http://194.146.113.124:5173",
-    "http://194.146.113.124:5175",
-    "https://localhost:4000",
     "http://localhost:4000",
     "http://localhost:5175",
+    "http://194.146.113.124",
+    "http://194.146.113.124:3000",
+    "http://194.146.113.124:4000",
+    "http://194.146.113.124:5000",
+    "http://194.146.113.124:5173",
+    "http://194.146.113.124:5175",
+    "http://194.146.113.124:8000",
+    "http://194.146.113.124:8080",
+    "https://194.146.113.124",
     "https://194.146.113.124:4000",
-    "http://194.146.113.124:8080",  # добавлена запятая
+    "https://localhost:4000",
     "https://tellscope.headsmade.com",
+    "https://tellscope40.headsmade.com",  # ← ДОБАВЬТЕ ЭТО
     "https://tsdoc.headsmade.com"
 ]
 
@@ -3298,7 +3299,11 @@ def visualize_document_datamap(
 
 
 from qdrant_client import QdrantClient
-client_qdrant = QdrantClient("localhost", port=6333)
+client_qdrant = QdrantClient(
+    url="http://localhost:6333",
+    timeout=300,  # 5 минут вместо стандартных 60 секунд
+    prefer_grpc=False
+)
 
 
 
@@ -4614,61 +4619,135 @@ async def delete_theme_files(user_id: int, folder_name: str, file_name: str):
     import logging
     logging.warning(f"Delete requested: {user_id=} {folder_name=} {file_name=}")
 
-    """
-    Удалить только файлы с указанным временным суффиксом (не всю папку темы)
-    """
-    base_path = f"/home/dev/tellscope_app/tellscope_backend/data/{user_id}/bertopic_files_directory/{folder_name}"
-
-    # Из file_name выделяем общий ключ темы и временной суффикс
+    # Извлекаем тему из имени файла (без даты и расширения)
+    # Пример: beyond_taylor_10.06.2025-16.06.2025_20250824_152603.html
     match = re.match(r"(.+)_(\d{8}_\d{6})\.html$", file_name)
     if not match:
-        raise HTTPException(status_code=400, detail="Некорректное название файла")
+        raise HTTPException(status_code=400, detail=f"Некорректное название файла: {file_name}")
     
-    theme_prefix = match.group(1)  # "beyond_taylor_10.06.2025-16.06.2025"
-    datetime_suffix = match.group(2)  # "20250728_220627"
+    theme_prefix = match.group(1)  # например: "beyond_taylor_10.06.2025-16.06.2025"
+    datetime_suffix = match.group(2)  # например: "20250824_152603"
 
-    # Перечень паттернов (только для указанного временного суффикса)
+    logging.warning(f"Extracted theme_prefix: {theme_prefix}, datetime_suffix: {datetime_suffix}")
+
+    # Базовый путь к папке с темой (подпапка внутри folder_name)
+    # folder_name - это родительская папка (например, "test")
+    # theme_prefix - это название подпапки темы
+    base_path = f"/home/dev/tellscope_app/tellscope_backend/data/{user_id}/bertopic_files_directory/{folder_name}/{theme_prefix}"
+    
+    logging.warning(f"Base path: {base_path}")
+
+    # Список файлов для удаления
     targets = [
         f"{theme_prefix}_{datetime_suffix}.html",
         f"datamapplot_{theme_prefix}_{datetime_suffix}.html",
-        f"topic_model_{theme_prefix}_{datetime_suffix}",  # папка
+        f"topic_model_{theme_prefix}_{datetime_suffix}",
         f"my_list_llm_ans_{theme_prefix}_{datetime_suffix}.pkl",
         f"topic_names_{theme_prefix}_{datetime_suffix}.pkl"
     ]
 
     deleted = []
     errors = []
+    not_found = []
 
-    # Удаляем только указанные файлы/папки
+    # Проверяем существование базовой папки
+    if not os.path.exists(base_path):
+        logging.error(f"Base path does not exist: {base_path}")
+        raise HTTPException(status_code=404, detail=f"Папка темы не найдена: {base_path}")
+
+    # Удаляем файлы
     for obj in targets:
-        obj_path = os.path.join(base_path, theme_prefix, obj)  # Ищем в подпапке темы
-        if not os.path.exists(obj_path):
-            obj_path = os.path.join(base_path, obj)  # Проверяем и в корне (на всякий случай)
+        obj_path = os.path.join(base_path, obj)
+        logging.warning(f"Trying to delete: {obj_path}")
         
         if os.path.isdir(obj_path):
             try:
                 shutil.rmtree(obj_path)
-                deleted.append(obj_path)
+                deleted.append(obj)
+                logging.warning(f"✓ Deleted directory: {obj_path}")
             except Exception as e:
-                errors.append(f"Ошибка при удалении директории {obj_path}: {e}")
+                error_msg = f"Ошибка при удалении директории {obj}: {e}"
+                errors.append(error_msg)
+                logging.error(error_msg)
         elif os.path.isfile(obj_path):
             try:
                 os.remove(obj_path)
-                deleted.append(obj_path)
+                deleted.append(obj)
+                logging.warning(f"✓ Deleted file: {obj_path}")
             except Exception as e:
-                errors.append(f"Ошибка при удалении файла {obj_path}: {e}")
+                error_msg = f"Ошибка при удалении файла {obj}: {e}"
+                errors.append(error_msg)
+                logging.error(error_msg)
+        else:
+            not_found.append(obj)
+            logging.warning(f"✗ Not found: {obj_path}")
 
+    # Проверяем, пуста ли папка темы после удаления
+    try:
+        if os.path.exists(base_path) and not os.listdir(base_path):
+            shutil.rmtree(base_path)
+            deleted.append(f"[folder] {theme_prefix}")
+            logging.warning(f"✓ Deleted empty theme folder: {base_path}")
+    except Exception as e:
+        error_msg = f"Ошибка при удалении пустой папки темы {base_path}: {e}"
+        errors.append(error_msg)
+        logging.error(error_msg)
+
+    # Если ничего не удалено и есть ошибки
     if not deleted and errors:
-        raise HTTPException(status_code=500, detail="Не удалось удалить ни один файл: " + "; ".join(errors))
-    elif not deleted:
-        return {
-            "deleted": [],
-            "errors": ["Ни одного элемента для удаления не найдено"]
-        }
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Не удалось удалить ни один файл. Ошибки: {'; '.join(errors)}"
+        )
+    
+    # Если ничего не найдено для удаления
+    if not deleted and not errors:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Ни одного элемента для удаления не найдено. Ожидаемые файлы: {', '.join(targets)}"
+        )
+
+    # Обновляем данные в Redis
+    try:
+        user_data = await redis_db.hgetall(str(user_id))
+        user_data_decoded = {key.decode('utf-8'): value.decode('utf-8') for key, value in user_data.items()}
+        
+        if "bertopic_files_directory" in user_data_decoded:
+            bertopic_data = json.loads(user_data_decoded["bertopic_files_directory"])
+            
+            # Удаляем файл из структуры данных
+            if folder_name in bertopic_data:
+                original_count = len(bertopic_data[folder_name])
+                bertopic_data[folder_name] = [
+                    file_info for file_info in bertopic_data[folder_name]
+                    if file_info.get("html-file") != file_name
+                ]
+                new_count = len(bertopic_data[folder_name])
+                logging.warning(f"Redis update: removed {original_count - new_count} entries from {folder_name}")
+                
+                # Если в папке не осталось файлов, удаляем папку из структуры
+                if not bertopic_data[folder_name]:
+                    del bertopic_data[folder_name]
+                    logging.warning(f"Redis update: removed empty folder {folder_name}")
+            
+            # Сохраняем обратно в Redis
+            await redis_db.hset(
+                str(user_id), 
+                "bertopic_files_directory", 
+                json.dumps(bertopic_data)
+            )
+            logging.warning("✓ Redis data updated successfully")
+            
+    except Exception as e:
+        error_msg = f"Ошибка при обновлении Redis: {e}"
+        logging.error(error_msg)
+        errors.append(error_msg)
 
     return {
         "deleted": deleted,
-        "errors": errors
+        "not_found": not_found if not_found else None,
+        "errors": errors if errors else None,
+        "message": f"Успешно удалено файлов: {len(deleted)}"
     }
 
 
@@ -7476,7 +7555,11 @@ def process_data_by_tab(data):
 # Подключение к Qdrant (если используется локальный сервер)
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
-qdrant_client = QdrantClient(host="localhost", port=6333)
+qdrant_client = QdrantClient(
+    url="http://localhost:6333",
+    timeout=300,  # 5 минут вместо стандартных 60 секунд
+    prefer_grpc=False
+)
 
 @app.post("/ai-question-information-graph", tags=['data analytics'])
 async def ai_question_information_graph(request: Request):
@@ -8387,39 +8470,97 @@ async def ai_question_analysis(request: Request):
         print(f'User ID: {user_id}')
         print(f'Folder name: {folder_name}')
 
-        # ======= Создаем эмбеддинг для вопроса с помощью ModelManager =======
+        # ======= Создаем эмбеддинг для вопроса =======
         try:
             print("Создание эмбеддинга для вопроса...")
             
-            # Используем глобальный менеджер моделей
-            embedding = model_manager.encode_texts(
-                question,
-                normalize_embeddings=True
+            # 🔥 КЛЮЧЕВОЕ: Проверяем, нормализованы ли векторы в коллекции
+            # Для этого загружаем sample ПЕРЕД созданием query embedding
+            
+            # Временный эмбеддинг для проверки
+            temp_embedding = model_manager.encode_texts(
+                [question],
+                batch_size=1,
+                normalize_embeddings=False
             )
-
-            print(f"Embedding dim: {len(embedding)}")
-            print(f"Embedding sample (first 5 dims): {embedding[:5]}")
-            print(f"Embedding norm: {np.linalg.norm(embedding)}")
-
-            # Приводим embedding к правильному формату
-            if isinstance(embedding, np.ndarray):
-                if embedding.ndim > 1:
-                    embedding = embedding.squeeze()
+            
+            if isinstance(temp_embedding, np.ndarray):
+                if temp_embedding.ndim == 2:
+                    temp_embedding = temp_embedding[0]
+                temp_embedding = temp_embedding.astype(np.float32)
+            
+            # 🔍 АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ НОРМАЛИЗАЦИИ
+            should_normalize = False
+            
+            # Проверяем первую доступную коллекцию
+            indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+            
+            first_collection = None
+            for db_name in selected_databases:
+                for idx, name in indexes.items():
+                    if name == db_name or db_name in name:
+                        first_collection = name
+                        break
+                if first_collection:
+                    break
+            
+            if first_collection:
+                try:
+                    # Берём 10 sample векторов
+                    sample_points = qdrant_client.scroll(
+                        collection_name=first_collection,
+                        limit=10,
+                        with_vectors=True
+                    )[0]
                     
-                if embedding.ndim != 1:
-                    raise ValueError(f"Invalid embedding shape: {embedding.shape}")
-
-                embedding = embedding.astype(np.float32).tolist()
-            elif isinstance(embedding, list):
-                embedding = np.array(embedding, dtype=np.float32).tolist()
-            else:
-                raise ValueError(f"Unexpected embedding type: {type(embedding)}")
-
-            print(f"Final embedding (first 5 dims): {embedding[:5]}")
-            print(f"Embedding length: {len(embedding)}")
+                    if sample_points:
+                        # Проверяем нормализацию коллекции
+                        norms = [np.linalg.norm(p.vector) for p in sample_points]
+                        avg_norm = np.mean(norms)
+                        
+                        logger.info(f"📊 Средняя норма векторов в коллекции: {avg_norm:.6f}")
+                        
+                        # Если коллекция нормализована (норма ≈ 1.0)
+                        collection_normalized = abs(avg_norm - 1.0) < 0.05
+                        
+                        if collection_normalized:
+                            should_normalize = True
+                            logger.info("✅ Коллекция НОРМАЛИЗОВАНА → нормализуем query")
+                        else:
+                            should_normalize = False
+                            logger.info("✅ Коллекция НЕ нормализована → оставляем query как есть")
+                            
+                except Exception as check_error:
+                    logger.warning(f"Не удалось проверить нормализацию: {check_error}")
+                    # Fallback: не нормализуем (по умолчанию)
+                    should_normalize = False
+            
+            # 🔥 СОЗДАЁМ ФИНАЛЬНЫЙ ЭМБЕДДИНГ с правильной нормализацией
+            embedding = model_manager.encode_texts(
+                [question],
+                batch_size=1,
+                normalize_embeddings=should_normalize  # ✅ Автоматически
+            )
+            
+            if isinstance(embedding, np.ndarray):
+                if embedding.ndim == 2:
+                    embedding = embedding[0]
+                embedding = embedding.astype(np.float32)
+            
+            if embedding is None or len(embedding) == 0:
+                raise ValueError("Получен пустой эмбеддинг")
+            
+            query_norm = np.linalg.norm(embedding)
+            logger.info(f"📌 Query эмбеддинг: норма = {query_norm:.6f}, нормализован = {should_normalize}")
+            
+            # Конвертируем в список для Qdrant
+            if isinstance(embedding, np.ndarray):
+                embedding = embedding.tolist()
+            
+            print(f"✅ Эмбеддинг создан: размерность {len(embedding)}, норма {query_norm:.4f}")
             
         except Exception as e:
-            print(f"Ошибка при создании эмбеддинга: {e}")
+            logger.error(f"Ошибка при создании эмбеддинга: {e}", exc_info=True)
             return JSONResponse(
                 status_code=500,
                 content={"error": "Ошибка при создании эмбеддинга", "details": str(e)}
@@ -8428,62 +8569,282 @@ async def ai_question_analysis(request: Request):
         # ======= Загружаем индексы =======
         try:
             indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+            logger.info(f"Загружено {len(indexes)} индексов")
         except Exception as e:
-            print(f"Ошибка при загрузке индексов: {e}")
+            logger.error(f"Ошибка загрузки индексов: {e}")
             return JSONResponse(
                 status_code=500,
                 content={"error": "Ошибка при загрузке индексов", "details": str(e)}
             )
+
+        print("=" * 60)
+        print("🔍 Начало поиска по базам данных...")
+        print(f"Selected databases: {selected_databases}")
+        print("=" * 60)
 
         all_relevant_texts = []
         search_results_summary = []
 
         # ======= Поиск по каждой выбранной базе данных =======
         for db_name in selected_databases:
+            collection_name = None
+            
             try:
-                # Находим соответствующий индекс для базы данных
-                collection_name = None
+                # Находим соответствующий индекс
                 for idx, name in indexes.items():
                     if name == db_name or db_name in name:
                         collection_name = name
                         break
                 
                 if not collection_name:
-                    print(f"Коллекция не найдена для базы: {db_name}")
+                    logger.warning(f"Коллекция не найдена для базы: {db_name}")
+                    search_results_summary.append({
+                        "database": db_name,
+                        "error": "Коллекция не найдена"
+                    })
                     continue
 
-                print(f"Поиск в коллекции: {collection_name}")
+                logger.info(f"Поиск в коллекции: {collection_name}")
 
-                # ======= Поиск в Qdrant =======
-                search_result = qdrant_client.search(
-                    collection_name=collection_name,
-                    query_vector=embedding,
-                    limit=50,
-                    with_payload=True,
-                    score_threshold=0.1
-                )
+                # 🔥 Диагностика коллекции
+                try:
 
-                print(f"Found {len(search_result)} points in Qdrant")
-                if search_result:
-                    print(f"First point ID: {search_result[0].id}, Score: {search_result[0].score}")
+                    # ======= 🔍 ДИАГНОСТИКА НОРМАЛИЗАЦИИ КОЛЛЕКЦИИ =======
+                    logger.info("=" * 60)
+                    logger.info("🔬 ДЕТАЛЬНАЯ ДИАГНОСТИКА КОЛЛЕКЦИИ")
+                    logger.info("=" * 60)
 
-                if not search_result:
-                    print(f"Не найдено релевантных результатов в {collection_name}")
+                    # 1. Проверяем конфигурацию коллекции
+                    collection_info = qdrant_client.get_collection(collection_name)
+                    logger.info(f"📦 Коллекция: {collection_name}")
+                    logger.info(f"   Точек: {collection_info.points_count}")
+                    logger.info(f"   Размерность: {collection_info.config.params.vectors.size}")
+
+                    # 2. Получаем БОЛЬШЕ sample для надежной статистики
+                    sample_points = qdrant_client.scroll(
+                        collection_name=collection_name,
+                        limit=100,  # 🔥 Берем 100 точек для точной статистики
+                        with_vectors=True
+                    )[0]
+
+                    if sample_points:
+                        # Проверяем нормализацию
+                        norms = [np.linalg.norm(p.vector) for p in sample_points]
+                        avg_norm = np.mean(norms)
+                        std_norm = np.std(norms)
+                        min_norm = min(norms)
+                        max_norm = max(norms)
+                        
+                        logger.info(f"\n📊 СТАТИСТИКА ВЕКТОРОВ В КОЛЛЕКЦИИ:")
+                        logger.info(f"   Средняя норма: {avg_norm:.6f}")
+                        logger.info(f"   Стд. отклонение: {std_norm:.6f}")
+                        logger.info(f"   Мин норма: {min_norm:.6f}")
+                        logger.info(f"   Макс норма: {max_norm:.6f}")
+                        
+                        # 3. Проверяем query вектор
+                        query_norm = np.linalg.norm(embedding)
+                        logger.info(f"\n📌 QUERY ВЕКТОР:")
+                        logger.info(f"   Норма: {query_norm:.6f}")
+                        logger.info(f"   Нормализован: {'✅ ДА' if abs(query_norm - 1.0) < 0.01 else '❌ НЕТ'}")
+                        
+                        # 4. Определяем состояние нормализации
+                        collection_normalized = abs(avg_norm - 1.0) < 0.05
+                        query_normalized = abs(query_norm - 1.0) < 0.01
+                        
+                        logger.info(f"\n🔍 АНАЛИЗ НОРМАЛИЗАЦИИ:")
+                        logger.info(f"   Коллекция нормализована: {'✅ ДА' if collection_normalized else '❌ НЕТ'}")
+                        logger.info(f"   Query нормализован: {'✅ ДА' if query_normalized else '❌ НЕТ'}")
+                        
+                        # 5. КРИТИЧЕСКАЯ ПРОВЕРКА
+                        if query_normalized and not collection_normalized:
+                            logger.error("=" * 60)
+                            logger.error("🚨 ПРОБЛЕМА НАЙДЕНА!")
+                            logger.error("   Query НОРМАЛИЗОВАН, коллекция НЕТ!")
+                            logger.error("   Это объясняет 0 результатов!")
+                            logger.error("=" * 60)
+                            logger.error("\n🔧 ВАРИАНТЫ РЕШЕНИЯ:")
+                            logger.error("   1. ПЕРЕИНДЕКСИРОВАТЬ коллекцию с normalize_embeddings=True")
+                            logger.error("   2. Временно денормализовать query для поиска")
+                            
+                            # Временный фикс
+                            logger.warning("\n⚠️ Применяем временный фикс: денормализация query...")
+                            embedding_array = np.array(embedding)
+                            denormalized_embedding = (embedding_array * avg_norm).tolist()
+                            embedding = denormalized_embedding
+                            logger.info(f"✅ Query денормализован. Новая норма: {np.linalg.norm(embedding):.6f}")
+                            
+                        elif not query_normalized and collection_normalized:
+                            logger.error("=" * 60)
+                            logger.error("🚨 ПРОБЛЕМА НАЙДЕНА!")
+                            logger.error("   Коллекция НОРМАЛИЗОВАНА, query НЕТ!")
+                            logger.error("=" * 60)
+                            logger.error("\n🔧 ВАРИАНТЫ РЕШЕНИЯ:")
+                            logger.error("   1. Нормализовать query перед поиском")
+                            logger.error("   2. Переиндексировать БЕЗ нормализации")
+                            
+                            # Временный фикс
+                            logger.warning("\n⚠️ Применяем временный фикс: нормализация query...")
+                            embedding_array = np.array(embedding)
+                            normalized_embedding = (embedding_array / np.linalg.norm(embedding_array)).tolist()
+                            embedding = normalized_embedding
+                            logger.info(f"✅ Query нормализован. Новая норма: {np.linalg.norm(embedding):.6f}")
+                            
+                        else:
+                            logger.info("\n✅ Нормализация СООТВЕТСТВУЕТ между query и коллекцией")
+                        
+                        # 6. Тестовый поиск с первой точкой из коллекции
+                        logger.info("\n🧪 ТЕСТОВЫЙ ПОИСК (с вектором из коллекции):")
+                        test_vector = sample_points[0].vector
+                        test_result = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=test_vector,
+                            limit=5
+                        )
+                        logger.info(f"   Найдено: {len(test_result)} (ожидается минимум 1)")
+                        if test_result:
+                            logger.info(f"   Лучший score: {test_result[0].score:.6f}")
+                            if test_result[0].score < 0.99:  # Должен найти сам себя с score ~1.0
+                                logger.error("   ❌ Score слишком низкий для идентичного вектора!")
+                                logger.error("   Это указывает на проблему с метрикой или индексом")
+                        else:
+                            logger.error("   ❌ Не найдено ничего даже с вектором из коллекции!")
+                            logger.error("   Коллекция ПОВРЕЖДЕНА или метрика неверная!")
+
+                    logger.info("=" * 60)
+
+                    # 4️⃣ Поиск с мониторингом
+                    logger.info(f"🔍 Выполняем поиск...")
+                    
+                    # 🔥 Оптимизированные параметры поиска для больших коллекций
+                    search_params = models.SearchParams(
+                        hnsw_ef=128,              # ✅ Увеличиваем для больших коллекций
+                        exact=False,              # ✅ Используем индекс (быстрее)
+                        quantization=None
+                    )
+
+                    search_result = qdrant_client.search(
+                        collection_name=collection_name,
+                        query_vector=embedding,
+                        limit=50,
+                        with_payload=True,
+                        score_threshold=0.3,      # ✅ Разумный порог (не 0.05!)
+                        search_params=search_params,
+                        with_vectors=False        # ✅ Не загружаем векторы (экономим память)
+                    )
+
+                    logger.info(f"✅ Найдено {len(search_result)} результатов (порог: 0.3)")
+
+                    # Если мало результатов - понижаем порог
+                    if len(search_result) < 5:
+                        logger.warning(f"⚠️ Мало результатов ({len(search_result)}), понижаем порог до 0.1")
+                        
+                        search_result = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=embedding,
+                            limit=50,
+                            with_payload=True,
+                            score_threshold=0.1,
+                            search_params=search_params,
+                            with_vectors=False
+                        )
+                        logger.info(f"✅ После понижения порога: {len(search_result)} результатов")
+                    
+                    if search_result:
+                        logger.info("📋 ТОП-5:")
+                        for i, point in enumerate(search_result[:5], 1):
+                            logger.info(f"   {i}. Score: {point.score:.4f}, ID: {point.id}")
+                    else:
+                        logger.warning(f"⚠️ Нет результатов с порогом 0.05")
+                        
+                        # Пробуем БЕЗ порога
+                        search_result_no_threshold = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=embedding,
+                            limit=10,
+                            with_payload=True
+                        )
+                        
+                        if search_result_no_threshold:
+                            logger.info(f"БЕЗ порога найдено: {len(search_result_no_threshold)}")
+                            logger.info(f"Лучший score: {search_result_no_threshold[0].score:.6f}")
+                            
+                            # Если scores слишком низкие - проблема с нормализацией
+                            if search_result_no_threshold[0].score < 0.1:
+                                logger.error("❌ Scores слишком низкие - ПРОБЛЕМА С НОРМАЛИЗАЦИЕЙ!")
+                                logger.error("🔧 ТРЕБУЕТСЯ ПЕРЕИНДЕКСАЦИЯ КОЛЛЕКЦИИ!")
+                        else:
+                            logger.error("❌ Не найдено НИЧЕГО даже без порога!")
+                            logger.error("   Проверьте, что коллекция не пуста")
+
+                except Exception as search_error:
+                    logger.error(f"Ошибка поиска: {search_error}", exc_info=True)
+                    search_results_summary.append({
+                        "database": db_name,
+                        "error": str(search_error)
+                    })
                     continue
 
-                # ======= Извлекаем hash'и и получаем полные тексты из Elasticsearch =======
+                # ======= Извлекаем hash'и =======
                 hash_values = []
                 for point in search_result:
-                    if "metadata" in point.payload and "hash" in point.payload["metadata"]:
-                        hash_values.append(point.payload["metadata"]["hash"])
+                    try:
+                        if hasattr(point, 'payload') and point.payload:
+                            # 🔥 Проверяем разные возможные пути к hash
+                            hash_value = None
+                            
+                            if "metadata" in point.payload and isinstance(point.payload["metadata"], dict):
+                                hash_value = point.payload["metadata"].get("hash")
+                            elif "hash" in point.payload:
+                                hash_value = point.payload.get("hash")
+                            
+                            if hash_value:
+                                hash_values.append(hash_value)
+                            else:
+                                logger.warning(f"Hash не найден в point {point.id}")
+                    except Exception as hash_error:
+                        logger.warning(f"Ошибка извлечения hash из point {point.id}: {hash_error}")
+                        continue
 
-                print(f'Hash values found: {hash_values}')
+                logger.info(f"Извлечено {len(hash_values)} hash-значений")
 
                 if not hash_values:
-                    print(f"Не найдено hash для поиска в Elasticsearch для {collection_name}")
+                    logger.warning(f"Не найдено hash для поиска в Elasticsearch")
+                    
+                    # 🔥 Fallback: используем данные напрямую из Qdrant
+                    texts_from_qdrant = []
+                    for point in search_result:
+                        try:
+                            payload = point.payload if hasattr(point, 'payload') else {}
+                            
+                            text_item = {
+                                "text": payload.get("content", ""),
+                                "title": payload.get("metadata", {}).get("title", "") if isinstance(payload.get("metadata"), dict) else "",
+                                "hash": str(point.id),
+                                "source": {
+                                    "hub": payload.get("metadata", {}).get("hub", "") if isinstance(payload.get("metadata"), dict) else "",
+                                    "url": payload.get("metadata", {}).get("url", "") if isinstance(payload.get("metadata"), dict) else "",
+                                    "database": db_name,
+                                    "author": "",
+                                    "timeCreate": "",
+                                    "audienceCount": 0
+                                },
+                                "score": point.score
+                            }
+                            texts_from_qdrant.append(text_item)
+                        except Exception as point_error:
+                            logger.warning(f"Ошибка обработки point: {point_error}")
+                            continue
+                    
+                    all_relevant_texts.extend(texts_from_qdrant)
+                    search_results_summary.append({
+                        "database": db_name,
+                        "found_documents": len(texts_from_qdrant),
+                        "collection_name": collection_name,
+                        "source": "qdrant_only"
+                    })
                     continue
 
-                # Запрос к Elasticsearch по полю hash
+                # ======= Запрос к Elasticsearch =======
                 elastic_query = {
                     "query": {
                         "terms": {
@@ -8500,21 +8861,30 @@ async def ai_question_analysis(request: Request):
                         body=elastic_query
                     )
                     
-                    print(f"Elasticsearch found {len(elastic_response['hits']['hits'])} documents")
+                    logger.info(f"Elasticsearch нашел {len(elastic_response['hits']['hits'])} документов")
                     
-                    # Создаем маппинг hash -> score из Qdrant результатов
+                    # Маппинг hash -> score
                     hash_to_score = {}
                     for point in search_result:
-                        if "metadata" in point.payload and "hash" in point.payload["metadata"]:
-                            hash_to_score[point.payload["metadata"]["hash"]] = point.score
+                        try:
+                            if hasattr(point, 'payload') and point.payload:
+                                hash_value = None
+                                if "metadata" in point.payload and isinstance(point.payload["metadata"], dict):
+                                    hash_value = point.payload["metadata"].get("hash")
+                                elif "hash" in point.payload:
+                                    hash_value = point.payload.get("hash")
+                                
+                                if hash_value:
+                                    hash_to_score[hash_value] = point.score
+                        except Exception as e:
+                            logger.warning(f"Ошибка создания маппинга: {e}")
+                            continue
 
-                    # Обрабатываем результаты из Elasticsearch
+                    # Обрабатываем результаты
                     texts_from_elastic = []
                     for hit in elastic_response['hits']['hits']:
                         source = hit['_source']
                         hash_value = source.get('hash', '')
-                        
-                        # Получаем score из Qdrant по hash
                         relevance_score = hash_to_score.get(hash_value, 0.0)
                         
                         text_item = {
@@ -8531,59 +8901,74 @@ async def ai_question_analysis(request: Request):
                             },
                             "score": relevance_score
                         }
-                        
                         texts_from_elastic.append(text_item)
-                        
-                    print(f"Processed {len(texts_from_elastic)} documents from Elasticsearch")
+                    
+                    logger.info(f"Обработано {len(texts_from_elastic)} документов из Elasticsearch")
+                    
+                    all_relevant_texts.extend(texts_from_elastic)
+                    search_results_summary.append({
+                        "database": db_name,
+                        "found_documents": len(texts_from_elastic),
+                        "collection_name": collection_name,
+                        "source": "elasticsearch"
+                    })
                     
                 except Exception as elastic_error:
-                    print(f"Ошибка при запросе к Elasticsearch: {elastic_error}")
-                    # Fallback: используем данные из Qdrant
-                    texts_from_elastic = []
+                    logger.error(f"Ошибка Elasticsearch: {elastic_error}")
+                    
+                    # Fallback на Qdrant
+                    texts_from_qdrant = []
                     for point in search_result:
-                        if "metadata" in point.payload:
-                            texts_from_elastic.append({
-                                "text": point.payload.get("text", ""),
-                                "title": point.payload.get("title", ""),
-                                "hash": point.payload.get("metadata", {}).get("hash", ""),
+                        try:
+                            payload = point.payload if hasattr(point, 'payload') else {}
+                            
+                            text_item = {
+                                "text": payload.get("content", ""),
+                                "title": payload.get("metadata", {}).get("title", "") if isinstance(payload.get("metadata"), dict) else "",
+                                "hash": str(point.id),
                                 "source": {
-                                    "hub": point.payload.get("hub", ""),
-                                    "url": point.payload.get("url", ""),
+                                    "hub": payload.get("metadata", {}).get("hub", "") if isinstance(payload.get("metadata"), dict) else "",
+                                    "url": payload.get("metadata", {}).get("url", "") if isinstance(payload.get("metadata"), dict) else "",
                                     "database": db_name,
                                     "author": "",
                                     "timeCreate": "",
                                     "audienceCount": 0
                                 },
                                 "score": point.score
-                            })
-                    print(f"Using fallback data from Qdrant: {len(texts_from_elastic)} documents")
+                            }
+                            texts_from_qdrant.append(text_item)
+                        except Exception as e:
+                            continue
+                    
+                    all_relevant_texts.extend(texts_from_qdrant)
+                    search_results_summary.append({
+                        "database": db_name,
+                        "found_documents": len(texts_from_qdrant),
+                        "collection_name": collection_name,
+                        "source": "qdrant_fallback"
+                    })
 
-                all_relevant_texts.extend(texts_from_elastic)
+            except Exception as db_error:
+                logger.error(f"Ошибка поиска в базе {db_name}: {db_error}", exc_info=True)
                 search_results_summary.append({
                     "database": db_name,
-                    "found_documents": len(texts_from_elastic),
-                    "collection_name": collection_name
+                    "error": str(db_error)
                 })
 
-            except Exception as e:
-                print(f"Ошибка при поиске в базе {db_name}: {e}")
-                search_results_summary.append({
-                    "database": db_name,
-                    "error": str(e)
-                })
-
-        # ======= Сортируем результаты по релевантности =======
+        # ======= Сортировка результатов =======
         all_relevant_texts.sort(key=lambda x: x.get("score", 0), reverse=True)
-        
-        # Ограничиваем количество текстов для анализа
         top_texts = all_relevant_texts[:15]
 
-        # ======= Формируем контент для LLM =======
+        logger.info(f"📊 Итоговая статистика поиска:")
+        logger.info(f"  - Всего найдено: {len(all_relevant_texts)}")
+        logger.info(f"  - Отобрано для анализа: {len(top_texts)}")
+
+        # ======= Формируем ответ =======
         if not top_texts:
             return JSONResponse(
                 status_code=200,
                 content={
-                    "answer": "По вашему запросу не найдено релевантных материалов в выбранных базах данных. Попробуйте изменить формулировку вопроса или выбрать другие источники данных.",
+                    "answer": "По вашему запросу не найдено релевантных материалов в выбранных базах данных. Попробуйте:\n- Изменить формулировку вопроса\n- Использовать другие ключевые слова\n- Выбрать другие источники данных",
                     "sources": selected_databases,
                     "confidence": 0.0,
                     "status": "no_results",
@@ -8592,15 +8977,17 @@ async def ai_question_analysis(request: Request):
                 }
             )
 
-        # Создаем markdown с найденными текстами
+        # Создаем markdown
         relevant_texts_md = f"""## Найденные релевантные материалы
 
-По запросу "{question}" найдено {len(top_texts)} релевантных документов в следующих базах данных:
+По запросу "{question}" найдено {len(top_texts)} релевантных документов.
+
+### Распределение по базам данных:
 """
 
         for summary in search_results_summary:
             if "error" not in summary:
-                relevant_texts_md += f"- **{summary['database']}**: {summary['found_documents']} документов\n"
+                relevant_texts_md += f"- **{summary['database']}**: {summary['found_documents']} документов (источник: {summary.get('source', 'unknown')})\n"
 
         relevant_texts_md += "\n### Наиболее релевантные тексты:\n\n"
 
@@ -8619,12 +9006,11 @@ async def ai_question_analysis(request: Request):
 {author_text}- **Заголовок**: {text_item.get("title", "без заголовка")}
 - **Текст**: {text_preview}
 - **URL**: {text_item.get("source", {}).get("url", "")}
-- **Hash**: {text_item.get("hash", "")}
 
 ---
 """
 
-        # ======= Формируем prompt для LLM =======
+        # ======= Запрос к LLM =======
         user_message = f"""
 **Запрос пользователя:** {question}
 **Тема анализа:** {topic}
@@ -8644,7 +9030,6 @@ async def ai_question_analysis(request: Request):
             "Если данных недостаточно для полного ответа — честно об этом скажи."
         )
 
-        # ======= Запрос к LLM =======
         try:
             chat_result = client.chat.completions.create(
                 messages=[
@@ -8658,12 +9043,12 @@ async def ai_question_analysis(request: Request):
 
             answer = chat_result.choices[0].message.content
             
-            # Рассчитываем confidence на основе количества найденных документов и их релевантности
+            # Рассчитываем confidence
             avg_score = sum(text.get("score", 0) for text in top_texts) / len(top_texts) if top_texts else 0
             confidence = min(0.95, avg_score * 0.8 + (len(top_texts) / 50) * 0.2)
 
-            print(f'Processed {len(top_texts)} documents successfully')
-            print(f'Average relevance score: {avg_score:.3f}')
+            logger.info(f'✅ Успешно обработано {len(top_texts)} документов')
+            logger.info(f'📊 Средний score: {avg_score:.3f}, Confidence: {confidence:.2f}')
 
             return JSONResponse(
                 status_code=200,
@@ -8675,31 +9060,118 @@ async def ai_question_analysis(request: Request):
                     "topic": topic,
                     "search_summary": search_results_summary,
                     "documents_analyzed": len(top_texts),
-                    "total_documents_found": len(all_relevant_texts)
+                    "total_documents_found": len(all_relevant_texts),
+                    "average_relevance": round(avg_score, 3)
                 }
             )
 
-        except Exception as e:
-            print(f"Ошибка при запросе к LLM: {e}")
+        except Exception as llm_error:
+            logger.error(f"Ошибка LLM: {llm_error}", exc_info=True)
             return JSONResponse(
                 status_code=500,
-                content={"error": "Ошибка при генерации ответа", "details": str(e)}
+                content={"error": "Ошибка при генерации ответа", "details": str(llm_error)}
             )
         
     except json.JSONDecodeError as e:
-        print(f'JSON Decode Error: {str(e)}')
+        logger.error(f'JSON Decode Error: {str(e)}')
         return JSONResponse(
             status_code=400,
             content={"error": "Неверный формат данных", "details": str(e)}
         )
+
     
-    except Exception as e:
-        print(f'General Error: {str(e)}')
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Произошла ошибка при обработке запроса", "details": str(e)}
+# Инициализация клиента OpenAI
+client = OpenAI(
+    api_key="sk-aitunnel-PrKMg8fNFewHciI2DvmAHGaD8g7cSyjD",
+    base_url="https://api.aitunnel.ru/v1/",
+)
+
+# Модель запроса
+class ChatRequest(BaseModel):
+    message: str
+    model: Optional[str] = "deepseek-chat-v3.1"
+    max_tokens: Optional[int] = 50000
+
+# Модель ответа
+class ChatResponse(BaseModel):
+    response: str
+    model: str
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        chat_result = client.chat.completions.create(
+            messages=[{"role": "user", "content": request.message}],
+            model=request.model,
+            max_tokens=request.max_tokens,
         )
-    
- 
+        
+        return ChatResponse(
+            response=chat_result.choices[0].message.content,
+            model=request.model
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/models")
+async def get_models():
+    """Возвращает список доступных моделей"""
+    return {
+        "models": [
+            "deepseek-chat-v3.1",
+            "gpt-5.1-chat",
+            "gpt-4o-mini",
+            "claude-sonnet-4.5"
+        ]
+    }
+
+@app.get("/test-collection/{collection_name}")
+async def test_collection(collection_name: str):
+    """Диагностика коллекции"""
+    try:
+        # 1. Инфо о коллекции
+        info = qdrant_client.get_collection(collection_name)
+        
+        # 2. Sample векторов
+        sample = qdrant_client.scroll(
+            collection_name=collection_name,
+            limit=100,
+            with_vectors=True
+        )[0]
+        
+        norms = [float(np.linalg.norm(p.vector)) for p in sample]
+        
+        # 3. Тестовый поиск
+        test_vector = sample[0].vector
+        test_search = qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=test_vector,
+            limit=5
+        )
+        
+        return {
+            "collection": collection_name,
+            "points_count": int(info.points_count),
+            "vector_size": int(info.config.params.vectors.size),
+            "distance": str(info.config.params.vectors.distance),
+            "hnsw_m": int(info.config.hnsw_config.m),
+            "hnsw_ef_construct": int(info.config.hnsw_config.ef_construct),
+            "sample_vectors": {
+                "count": len(sample),
+                "avg_norm": float(np.mean(norms)),
+                "std_norm": float(np.std(norms)),
+                "min_norm": float(min(norms)),
+                "max_norm": float(max(norms)),
+                "normalized": bool(abs(np.mean(norms) - 1.0) < 0.05)  # Преобразуем в bool
+            },
+            "test_search": {
+                "found": len(test_search),
+                "best_score": float(test_search[0].score) if test_search else 0.0
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)

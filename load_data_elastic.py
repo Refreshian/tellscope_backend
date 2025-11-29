@@ -417,7 +417,7 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         gc.collect()
 
 def load_to_qdrant_optimized(collection_name, documents, task_id):
-    """Оптимизированная загрузка в Qdrant"""
+    """Оптимизированная загрузка в Qdrant с COSINE метрикой"""
     if not documents:
         raise ValueError("Список документов пуст!")
     
@@ -434,21 +434,35 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
             vector_size = len(documents[0]["vector"])
             logger.info(f"Создание коллекции {collection_name} с размерностью {vector_size}")
             
+            # ✅ ИСПРАВЛЕНИЕ: создаём с индексацией С САМОГО НАЧАЛА
             client_qdrant.create_collection(
                 collection_name=collection_name,
                 vectors_config=models.VectorParams(
                     size=vector_size,
                     distance=models.Distance.COSINE
                 ),
-                optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=0,
-                ),
+                # ❌ УДАЛИТЕ ЭТО:
+                # optimizers_config=models.OptimizersConfigDiff(
+                #     indexing_threshold=0,
+                # ),
                 hnsw_config=models.HnswConfigDiff(
-                    payload_m=16,
-                    m=0
+                    m=16,              # ✅ Для 768 размерности
+                    ef_construct=100,  # ✅ Достаточно для старта
+                    full_scan_threshold=10000,
                 )
             )
+            logger.info(f"✅ Коллекция создана с индексом HNSW")
+        else:
+            # Проверяем существующую метрику
+            collection_info = client_qdrant.get_collection(collection_name)
+            current_distance = collection_info.config.params.vectors.distance
+            logger.info(f"Существующая коллекция использует метрику: {current_distance}")
+            
+            if current_distance == models.Distance.DOT:
+                logger.warning(f"⚠️ Коллекция использует DOT, но код ожидает COSINE")
+                logger.warning("🔧 Рекомендуется переиндексировать коллекцию")
         
+        # Остальной код без изменений
         batch_size = QDRANT_BATCH_SIZE
         total_docs = len(documents)
         
