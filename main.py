@@ -3354,6 +3354,32 @@ def get_or_create_model(model_path: str) -> SentenceTransformer:
         model_cache[model_path] = SentenceTransformer(model_path, device='cpu')
     return model_cache[model_path]
 
+def post_process_labels(labels: List[str], topic_model: BERTopic) -> List[str]:
+    """Финальная постобработка заголовков для обеспечения уникальности и качества"""
+    
+    processed = []
+    seen = {}
+    topics_dict = topic_model.get_topics()
+    
+    for i, label in enumerate(labels):
+        # Если заголовок уже использован
+        if label in seen:
+            # Пытаемся сделать уникальным через ключевые слова
+            topic_id = list(topics_dict.keys())[i]
+            if topic_id in topics_dict and topics_dict[topic_id]:
+                # Берём уникальное ключевое слово из топа
+                unique_word = topics_dict[topic_id][0][0].capitalize()
+                new_label = f"{label}: {unique_word}"
+                processed.append(new_label)
+                seen[new_label] = i
+            else:
+                processed.append(f"{label} (вариант {seen[label] + 1})")
+        else:
+            processed.append(label)
+            seen[label] = i
+    
+    return processed
+
 async def run_llm_query(task_data: dict):
     """Оптимизированная обработка LLM-запроса"""
     print(f'task_data: {task_data}')
@@ -3463,6 +3489,8 @@ async def run_llm_query(task_data: dict):
 
         # 12. Параллельная генерация заголовков топиков
         topic_labels = await generate_topic_labels_batch(topic_model)
+        # НОВОЕ: Постобработка для финальной проверки
+        topic_labels = post_process_labels(topic_labels, topic_model)
         topic_model.set_topic_labels(topic_labels)
 
         # 13. Параллельное сохранение результатов
@@ -3776,11 +3804,38 @@ def prepare_valid_data(texts: List[str], llm_labels: List, embeddings: np.ndarra
     valid_data['embeddings'] = np.array(valid_data['embeddings'])
     return valid_data
 
+
+def clean_label(label: str) -> str:
+    """Очистка и форматирование заголовка"""
+    # Удаляем лишние символы
+    label = label.strip().strip('"').strip("'").strip()
+    
+    # Удаляем типичные префиксы
+    prefixes_to_remove = [
+        "Заголовок:", "Тема:", "Название:", 
+        "Краткое название:", "Короткий заголовок:"
+    ]
+    for prefix in prefixes_to_remove:
+        if label.lower().startswith(prefix.lower()):
+            label = label[len(prefix):].strip()
+    
+    # Ограничиваем длину (5-8 слов оптимально)
+    words = label.split()
+    if len(words) > 8:
+        label = ' '.join(words[:8]) + '...'
+    elif len(words) < 2:
+        return label.capitalize()
+
+    # Капитализация первой буквы
+    return label[0].upper() + label[1:] if label else label
+
+
 async def generate_topic_labels_batch(topic_model: BERTopic) -> List[str]:
-    """Батчевая генерация заголовков топиков с обработкой пустых ключевых слов"""
+    """Батчевая генерация заголовков топиков с контролем уникальности"""
     topics_dict = topic_model.get_topics()
     
-    # Создаем семафор для ограничения параллельных запросов
+    # Для контроля уникальности
+    used_labels = set()
     semaphore = asyncio.Semaphore(10)
     
     async def generate_single_label(topic_id, topic_words, semaphore):
@@ -3799,8 +3854,22 @@ async def generate_topic_labels_batch(topic_model: BERTopic) -> List[str]:
             if not valid_tokens:
                 return "Разные темы (нет общего)"
             
-            key_words = " | ".join(valid_tokens[:30])
-            return await generate_topic_label_optimized(key_words)
+            # Берём топ-15 ключевых слов с весами
+            top_keywords = valid_tokens[:15]
+            weights = [token[1] for token in topic_words[:15] if token[0] in top_keywords]
+            
+            # Формируем контекст с весами
+            keywords_with_weights = [
+                f"{word} ({weight:.2f})" 
+                for word, weight in zip(top_keywords, weights)
+            ]
+            
+            return await generate_topic_label_optimized(
+                key_words=" | ".join(top_keywords),
+                keywords_with_weights=keywords_with_weights,
+                topic_id=topic_id,
+                used_labels=used_labels
+            )
 
     # Параллельно генерируем все заголовки
     tasks = [
@@ -3809,26 +3878,81 @@ async def generate_topic_labels_batch(topic_model: BERTopic) -> List[str]:
     ]
     labels = await asyncio.gather(*tasks)
     
-    # Обрабатываем результаты
+    # Обрабатываем результаты и проверяем уникальность
     processed_labels = []
-    for label in labels:
-        if label and label not in ["Ошибка генерации", "Модель не ответила"]:
-            words = label.split()
-            shortened = ' '.join(words[:10]) + ('...' if len(words) > 10 else '')
-            processed_labels.append(shortened.capitalize())
+    label_counts = defaultdict(int)
+    
+    for i, label in enumerate(labels):
+        if label and label not in ["Ошибка генерации", "Модель не ответила", "Разные темы (нет общего)"]:
+            # Очистка и форматирование
+            cleaned = clean_label(label)
+            
+            # Проверка уникальности
+            if cleaned in label_counts:
+                label_counts[cleaned] += 1
+                cleaned = f"{cleaned} ({label_counts[cleaned]})"
+            else:
+                label_counts[cleaned] = 1
+            
+            processed_labels.append(cleaned)
         else:
             processed_labels.append("Разные темы (нет общего)")
     
     return processed_labels
 
-async def generate_topic_label_optimized(key_words: str, max_retries: int = 2) -> str:
-    """Оптимизированная генерация заголовков топиков с проверкой входных данных"""
+
+def validate_label(label: str, key_words: str) -> bool:
+    """Валидация качества сгенерированного заголовка"""
+    if not label or len(label.strip()) == 0:
+        return False
+    
+    # Проверка длины (не меньше 5 символов, не больше 100)
+    if len(label) < 5 or len(label) > 100:
+        return False
+    
+    # Проверка количества слов (2-10)
+    words = label.split()
+    if len(words) < 2 or len(words) > 10:
+        return False
+    
+    # Проверка на "мусорные" ответы
+    bad_patterns = [
+        "ключевые слова",
+        "нет данных",
+        "ошибка",
+        "не удалось",
+        "повторите",
+        "заголовок:",
+        "тема:"
+    ]
+    
+    label_lower = label.lower()
+    if any(pattern in label_lower for pattern in bad_patterns):
+        return False
+    
+    # Проверка, что заголовок не является просто перечислением ключевых слов
+    keywords_list = [kw.strip() for kw in key_words.split('|')][:5]
+    matches = sum(1 for kw in keywords_list if kw.lower() in label_lower)
+    
+    # Если в заголовке просто перечислены все ключевые слова - плохой заголовок
+    if matches >= len(keywords_list) and len(keywords_list) > 2:
+        return False
+    
+    return True
+
+async def generate_topic_label_optimized(
+    key_words: str, 
+    keywords_with_weights: List[str] = None,
+    topic_id: int = None,
+    used_labels: set = None,
+    max_retries: int = 2
+) -> str:
+    """Оптимизированная генерация заголовков с контролем качества"""
     
     # Проверка входных данных
     if not key_words or len(key_words.strip()) == 0:
         return "Разные темы (нет общего)"
     
-    # Проверка, что ключевые слова не состоят только из разделителей
     clean_keywords = key_words.replace('|', '').replace(' ', '').strip()
     if len(clean_keywords) == 0:
         return "Разные темы (нет общего)"
@@ -3836,8 +3960,39 @@ async def generate_topic_label_optimized(key_words: str, max_retries: int = 2) -
     url = "http://localhost:8000/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
     
-    system_prompt = "Сделай очень короткий и понятный заголовок на русском языке по ключевым словам. Используй только русский язык, только сам заголовок."
-    user_content = f"Ключевые слова: {key_words}\n\nОтвет (короткий заголовок на русском):"
+    # УЛУЧШЕННЫЙ ПРОМПТ с чёткой структурой
+    system_prompt = """Ты эксперт по созданию коротких, понятных заголовков для тематических кластеров текстов.
+
+ПРАВИЛА:
+1. Заголовок должен быть на РУССКОМ языке
+2. Длина: 3-6 слов (максимум 8)
+3. Формат: существительное + определение ИЛИ глагольная конструкция
+4. БЕЗ общих слов типа "тема", "вопрос", "проблема"
+5. БЕЗ перечисления ключевых слов через запятую
+6. Заголовок должен отражать СУТЬ, а не просто список слов
+7. Используй конкретные термины из ключевых слов
+
+ПРИМЕРЫ ХОРОШИХ заголовков:
+- "Управление персоналом и мотивация"
+- "Цифровая трансформация бизнеса"
+- "Стратегии работы с клиентами"
+- "Инновации в образовании"
+
+ПРИМЕРЫ ПЛОХИХ заголовков:
+- "10 ключевых моментов" (слишком общо)
+- "HR, персонал, управление" (просто список)
+- "Основные понятия и практики" (нет конкретики)
+
+Отвечай ТОЛЬКО заголовком, без пояснений."""
+
+    # Формируем контекст с весами для лучшего понимания
+    context = f"Ключевые слова: {key_words}"
+    if keywords_with_weights:
+        context += f"\n\nСлова с важностью: {', '.join(keywords_with_weights[:10])}"
+    
+    user_content = f"""{context}
+
+Создай краткий заголовок (3-6 слов), который точно отражает тему:"""
 
     payload = {
         "model": "Qwen/Qwen3-32B-FP8",
@@ -3845,8 +4000,9 @@ async def generate_topic_label_optimized(key_words: str, max_retries: int = 2) -
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
         ],
-        "temperature": 0.7,
-        "top_p": 0.8,
+        "temperature": 0.5,  # Понижена для более стабильных результатов
+        "top_p": 0.85,
+        "max_tokens": 50,  # Ограничение длины ответа
         "chat_template_kwargs": {"enable_thinking": False}
     }
 
@@ -3858,16 +4014,25 @@ async def generate_topic_label_optimized(key_words: str, max_retries: int = 2) -
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status == 200:
                         data = await response.json()
-                        label = data["choices"][0]["message"]["content"]
-                        return label.strip() if label and len(label.strip()) > 0 else "Разные темы (нет общего)"
+                        label = data["choices"][0]["message"]["content"].strip()
+                        
+                        # Валидация ответа
+                        if validate_label(label, key_words):
+                            return label
+                        else:
+                            # Если валидация не прошла, пробуем ещё раз
+                            if attempt < max_retries:
+                                await asyncio.sleep(0.2)
+                                continue
+                            return "Разные темы (нет общего)"
                     else:
                         if attempt < max_retries:
-                            await asyncio.sleep(0.1)
+                            await asyncio.sleep(0.2)
                             continue
                         return "Разные темы (нет общего)"
         except Exception:
             if attempt < max_retries:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.2)
                 continue
             return "Разные темы (нет общего)"
     
