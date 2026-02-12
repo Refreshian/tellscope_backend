@@ -382,7 +382,21 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
                 continue
             
             try:
-                avg_vector = np.mean(chunk_vectors, axis=0).tolist()
+                # ✅ ПРАВИЛЬНОЕ УСРЕДНЕНИЕ С НОРМАЛИЗАЦИЕЙ
+                avg_vector = np.mean(chunk_vectors, axis=0)
+                
+                # 🔥 КРИТИЧЕСКИ ВАЖНО: Нормализуем после усреднения!
+                norm = np.linalg.norm(avg_vector)
+                if norm > 0:
+                    avg_vector = avg_vector / norm
+                
+                avg_vector = avg_vector.tolist()
+                
+                # Проверка (для отладки)
+                final_norm = np.linalg.norm(avg_vector)
+                if abs(final_norm - 1.0) > 0.01:
+                    logger.warning(f"⚠️ Вектор документа {doc_id} не нормализован: {final_norm:.6f}")
+                
             except Exception as e:
                 logger.error(f"Ошибка среднего вектора для {doc_id}: {e}")
                 continue
@@ -417,9 +431,28 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         gc.collect()
 
 def load_to_qdrant_optimized(collection_name, documents, task_id):
-    """Оптимизированная загрузка в Qdrant с COSINE метрикой"""
+    """Оптимизированная загрузка в Qdrant с ПРАВИЛЬНОЙ индексацией"""
     if not documents:
         raise ValueError("Список документов пуст!")
+
+    # ✅ ПЕРЕД загрузкой - проверяем нормализацию
+    logger.info("🔍 Проверка нормализации векторов перед загрузкой...")
+    
+    norms = []
+    for doc in documents[:100]:  # Проверяем первые 100
+        norm = np.linalg.norm(doc["vector"])
+        norms.append(norm)
+        
+        if abs(norm - 1.0) > 0.01:
+            logger.warning(f"⚠️ Вектор {doc['id']} не нормализован: {norm:.6f}")
+    
+    avg_norm = np.mean(norms)
+    logger.info(f"📊 Средняя норма векторов: {avg_norm:.6f}")
+    
+    if abs(avg_norm - 1.0) > 0.05:
+        logger.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Векторы не нормализованы (avg={avg_norm:.3f})")
+        logger.error("   Требуется пересоздание векторов!")
+        raise ValueError(f"Векторы должны быть нормализованы! Текущая норма: {avg_norm:.3f}")
     
     try:
         logger.info(f"Начало загрузки {len(documents)} документов в Qdrant")
@@ -430,39 +463,35 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
         safe_update_progress(task_id, 80, stage="qdrant_preparation", 
                            stage_details="Подготовка к загрузке в Qdrant")
         
+        # ============================================================
+        # ✅ ПРАВИЛЬНОЕ СОЗДАНИЕ КОЛЛЕКЦИИ
+        # ============================================================
         if not client_qdrant.collection_exists(collection_name):
             vector_size = len(documents[0]["vector"])
             logger.info(f"Создание коллекции {collection_name} с размерностью {vector_size}")
             
-            # ✅ ИСПРАВЛЕНИЕ: создаём с индексацией С САМОГО НАЧАЛА
+            # ✅ ПРОСТАЯ И НАДЁЖНАЯ КОНФИГУРАЦИЯ
             client_qdrant.create_collection(
                 collection_name=collection_name,
                 vectors_config=models.VectorParams(
                     size=vector_size,
                     distance=models.Distance.COSINE
                 ),
-                # ❌ УДАЛИТЕ ЭТО:
-                # optimizers_config=models.OptimizersConfigDiff(
-                #     indexing_threshold=0,
-                # ),
+                # Минимальные настройки - Qdrant сам всё сделает
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=20000,  # Индексация после 20К
+                ),
                 hnsw_config=models.HnswConfigDiff(
-                    m=16,              # ✅ Для 768 размерности
-                    ef_construct=100,  # ✅ Достаточно для старта
+                    m=16,
+                    ef_construct=100,
                     full_scan_threshold=10000,
                 )
             )
-            logger.info(f"✅ Коллекция создана с индексом HNSW")
-        else:
-            # Проверяем существующую метрику
-            collection_info = client_qdrant.get_collection(collection_name)
-            current_distance = collection_info.config.params.vectors.distance
-            logger.info(f"Существующая коллекция использует метрику: {current_distance}")
-            
-            if current_distance == models.Distance.DOT:
-                logger.warning(f"⚠️ Коллекция использует DOT, но код ожидает COSINE")
-                logger.warning("🔧 Рекомендуется переиндексировать коллекцию")
+            logger.info("✅ Коллекция создана")
         
-        # Остальной код без изменений
+        # ============================================================
+        # ✅ ЗАГРУЗКА С СИНХРОНИЗАЦИЕЙ
+        # ============================================================
         batch_size = QDRANT_BATCH_SIZE
         total_docs = len(documents)
         
@@ -486,17 +515,20 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
             batch = points[i:i + batch_size]
             
             try:
+                # ✅ ВКЛЮЧАЕМ wait=True для синхронизации
                 client_qdrant.upsert(
                     collection_name=collection_name,
                     points=batch,
-                    wait=False
+                    wait=True  # ✅ ЖДЁМ завершения!
                 )
                 
                 uploaded += len(batch)
-                progress = 85 + int((uploaded / total_docs) * 15) if total_docs > 0 else 85
+                progress = 85 + int((uploaded / total_docs) * 10) if total_docs > 0 else 85
                 
                 safe_update_progress(task_id, progress, stage="qdrant_upload",
                                    stage_details=f"Загружено {uploaded}/{total_docs} документов")
+                
+                logger.info(f"Загружено {uploaded}/{total_docs} документов")
                 
             except Exception as e:
                 logger.error(f"Ошибка загрузки батча: {e}")
@@ -505,14 +537,84 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
                     continue
                 raise e
         
-        time.sleep(1)
+        # ============================================================
+        # ✅ ПРИНУДИТЕЛЬНАЯ ИНДЕКСАЦИЯ
+        # ============================================================
+        logger.info("🔄 Запуск принудительной индексации...")
+        safe_update_progress(task_id, 95, stage="indexing",
+                           stage_details="Построение индекса HNSW...")
         
-        client_qdrant.update_collection(
-            collection_name=collection_name,
-            optimizers_config=models.OptimizersConfigDiff(
-                indexing_threshold=20000,
+        try:
+            # Метод 1: Оптимизируем коллекцию
+            client_qdrant.update_collection(
+                collection_name=collection_name,
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=1000,  # ✅ Низкий порог
+                )
             )
-        )
+            
+            # Метод 2: Принудительная оптимизация (создаёт индекс)
+            # Это блокирующая операция!
+            time.sleep(2)  # Даём время на применение настроек
+            
+            logger.info("⏳ Ожидание завершения индексации (может занять время)...")
+            
+            # Проверяем статус индексации
+            max_wait_time = 300  # 5 минут
+            start_time = time.time()
+            
+            while time.time() - start_time < max_wait_time:
+                collection_info = client_qdrant.get_collection(collection_name)
+                
+                # Проверяем статус
+                if collection_info.status == models.CollectionStatus.GREEN:
+                    logger.info("✅ Индексация завершена успешно!")
+                    break
+                elif collection_info.status == models.CollectionStatus.YELLOW:
+                    logger.info("⏳ Индексация в процессе...")
+                    time.sleep(5)
+                else:
+                    logger.warning(f"⚠️ Статус коллекции: {collection_info.status}")
+                    time.sleep(5)
+            else:
+                logger.warning("⚠️ Превышено время ожидания индексации")
+            
+        except Exception as index_error:
+            logger.error(f"❌ Ошибка индексации: {index_error}")
+            # Не критично, продолжаем
+        
+        # ============================================================
+        # ✅ ВЕРИФИКАЦИЯ
+        # ============================================================
+        logger.info("🔍 Верификация коллекции...")
+        
+        try:
+            collection_info = client_qdrant.get_collection(collection_name)
+            logger.info(f"📊 Финальная статистика:")
+            logger.info(f"   Векторов в коллекции: {collection_info.points_count}")
+            logger.info(f"   Статус: {collection_info.status}")
+            logger.info(f"   Индексированные сегменты: {collection_info.indexed_vectors_count}")
+            
+            if collection_info.points_count == 0:
+                raise Exception("Коллекция пустая после загрузки!")
+            
+            # Тестовый поиск
+            test_vector = documents[0]["vector"]
+            test_results = client_qdrant.search(
+                collection_name=collection_name,
+                query_vector=test_vector,
+                limit=5,
+                with_payload=False
+            )
+            
+            if test_results:
+                logger.info(f"✅ Тестовый поиск успешен: {len(test_results)} результатов")
+                logger.info(f"   Лучший score: {test_results[0].score:.4f}")
+            else:
+                logger.warning("⚠️ Тестовый поиск не дал результатов!")
+            
+        except Exception as verify_error:
+            logger.error(f"❌ Ошибка верификации: {verify_error}")
         
         logger.info(f"✅ Загрузка в Qdrant завершена: {total_docs} документов")
         safe_update_progress(task_id, 100, status="completed", stage="completed",
@@ -524,6 +626,53 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
         raise e
     finally:
         release_qdrant_lock(collection_name, task_id)
+
+def reindex_existing_collection(collection_name):
+    """Переиндексация существующей коллекции"""
+    try:
+        logger.info(f"🔄 Начало переиндексации коллекции: {collection_name}")
+        
+        # Проверяем существование
+        if not client_qdrant.collection_exists(collection_name):
+            logger.error(f"❌ Коллекция {collection_name} не существует!")
+            return False
+        
+        # Получаем информацию
+        collection_info = client_qdrant.get_collection(collection_name)
+        logger.info(f"📊 Текущее состояние:")
+        logger.info(f"   Векторов: {collection_info.points_count}")
+        logger.info(f"   Статус: {collection_info.status}")
+        
+        # Обновляем параметры оптимизации
+        client_qdrant.update_collection(
+            collection_name=collection_name,
+            optimizers_config=models.OptimizersConfigDiff(
+                indexing_threshold=1000,
+                memmap_threshold=20000,
+            ),
+            hnsw_config=models.HnswConfigDiff(
+                m=16,
+                ef_construct=128,
+                full_scan_threshold=10000,
+            )
+        )
+        
+        logger.info("✅ Параметры обновлены, ожидание индексации...")
+        
+        # Ждём завершения
+        time.sleep(10)
+        
+        # Проверяем результат
+        collection_info = client_qdrant.get_collection(collection_name)
+        logger.info(f"✅ Переиндексация завершена:")
+        logger.info(f"   Статус: {collection_info.status}")
+        logger.info(f"   Индексировано: {collection_info.indexed_vectors_count}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка переиндексации: {e}", exc_info=True)
+        return False
 
 def load_file_to_elstic(filename, path=None, task_id=None):
     """Загрузка файла с детальным логированием"""

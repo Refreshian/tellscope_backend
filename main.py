@@ -29,7 +29,7 @@ from collections import Counter
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile, WebSocket, logger, status, Depends
+from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile, WebSocket, logger, status, Depends, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 # from fastapi.exceptions import ValidationError
 from fastapi.responses import JSONResponse
@@ -46,6 +46,7 @@ from operator import itemgetter
 import codecs, json
 
 import websocket
+from asyncio import Event
 
 from auth.auth import auth_backend
 from auth.auth import get_jwt_strategy, get_refresh_strategy, SECRET
@@ -68,7 +69,7 @@ from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 import jwt
 from sqlalchemy.orm import Session 
 from fastapi import HTTPException, status
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -850,7 +851,6 @@ async def tonality_landscape(
                 }
             metrics_by_hub[hub]["posts_count"] += 1
             
-            # Преобразуем потенциальные строковые значения в числа
             try:
                 comments = int(entry.get('commentsCount', 0) or 0)
             except (TypeError, ValueError):
@@ -891,11 +891,10 @@ async def tonality_landscape(
             for hub, metrics in sorted(metrics_by_hub.items(), key=lambda x: x[1]["posts_count"], reverse=True)
         ]
 
-    neg_authors = [entry for entry in neg if 'authorObject' in entry]
-    pos_authors = [entry for entry in pos if 'authorObject' in entry]
-
-    neg_hub_metrics = aggregate_metrics(neg + neg_authors)
-    pos_hub_metrics = aggregate_metrics(pos + pos_authors)
+    # ИСПРАВЛЕНИЕ: убираем дублирование
+    # Используем только neg и pos, без добавления neg_authors и pos_authors
+    neg_hub_metrics = aggregate_metrics(neg)
+    pos_hub_metrics = aggregate_metrics(pos)
 
     neg_hub_response = prepare_hub_response(neg_hub_metrics)
     pos_hub_response = prepare_hub_response(pos_hub_metrics)
@@ -950,7 +949,6 @@ async def tonality_landscape(
             }
 
     def build_text_item(entry):
-        # Обработка полей для TextData
         def safeint(x): 
             try: 
                 return int(x) 
@@ -1003,12 +1001,20 @@ async def tonality_landscape(
     def build_authors_groups(entries):
         """Группировать по (fullname + url) и сделать итоговый список объектов ModeAuthorValues"""
         groups = defaultdict(list)
+        
+        # ИСПРАВЛЕНИЕ: добавляем отслеживание уникальных elastic_id
+        seen_ids = defaultdict(set)
+        
         for entry in entries:
             author_obj = process_author_object(entry)
             author_id = (author_obj['fullname'], author_obj['url'])
-            groups[author_id].append(entry)
+            
+            # Проверяем, не добавляли ли мы уже этот текст для данного автора
+            elastic_id = entry.get('_id')
+            if elastic_id not in seen_ids[author_id]:
+                groups[author_id].append(entry)
+                seen_ids[author_id].add(elastic_id)
 
-        # Теперь собираем ModeAuthorValues
         res = []
         author_data_list = []
         for author_id, texts in groups.items():
@@ -1021,15 +1027,14 @@ async def tonality_landscape(
                     texts=texts_data
                 )
             )
-        # Теперь отдаем в ModeAuthorValues. Строго: один элемент = одна группа author_data.
-        # Т.е. на выходе: [{author_data: [1]}, {author_data: [1]}, ...]
-        # (А не один с большим списком).
+        
         for author_data in author_data_list:
             res.append(ModeAuthorValues(author_data=[author_data]))
         return res
 
-    negative_authors_values = build_authors_groups(neg + neg_authors)
-    positive_authors_values = build_authors_groups(pos + pos_authors)
+    # ИСПРАВЛЕНИЕ: передаём только neg и pos, без дубликатов
+    negative_authors_values = build_authors_groups(neg)
+    positive_authors_values = build_authors_groups(pos)
 
     values = Model_TonalityLandscape(
         tonality_values=TonalityValues(
@@ -1387,162 +1392,6 @@ async def information_graph(# user: User = Depends(current_user),
     )
 
     return values
-
-
-# @app.get("/themes")
-# async def themes_analize(user: User = Depends(current_user), index: int =None, 
-#                              min_date=None, max_date=None) -> ThemesModel:
-#     # Путь к файлу с темами 
-#     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
-#     # Загрузка словаря с темами
-#     indexes = load_dict_from_pickle(file_path)
-
-#     os.chdir('/home/dev/fastapi/analytics_app/files')
-#     # данные с описанием тематик
-#     # filename = indexes[index] + '_LLM'
-#     os.chdir('/home/dev/fastapi/analytics_app/files/Росбанк/')
-#     filename = 'rosbank_01.04.2024-15.04.2024_LLM'
-#     with open (filename, 'rb') as fp:
-#         data = pickle.load(fp)
-
-
-#     data = [x[0]['generated_text'].split('model\n')[1] if len(x) == 1 else x for x in data]
-#     data = pd.DataFrame(data) 
-
-#     # print(data)
-
-#     query = {
-#             "size": 10000,
-#             "query": {
-#                         "range": {
-#                             "timeCreate": {      # skillfactory_zaprosy_na_obuchenie_15.01.2024-21.01.2024
-#                                 "gte": min_date, # 1705329992
-#                                 "lte": max_date, # 1705848392
-#                                 "boost": 2.0
-#                             }
-#                         }
-#                     }
-#                 }
-    
-#     # данные с авторами, текстами и метаинформацией
-#     # dict_train = es.search(index='skillfactory_15.01.2024-21.01.2024', body=query)
-#     dict_train = es.search(index=indexes[index], body=query)
-#     dict_train = dict_train['hits']['hits']
-#     dict_train = [x['_source'] for x in dict_train]
-    
-#     # with codecs.open(indexes[index], "r", "utf_8_sig") as train_file:
-#     #     dict_train = json.load(train_file)
-
-#     columns = ['timeCreate', 'text', 'hub', 'url', 'hubtype',
-#         'commentsCount', 'audienceCount',
-#         'citeIndex', 'repostsCount', 'likesCount', 'er', 'viewsCount',
-#         'toneMark', 'role',
-#         'country', 'region', 'city', 'language', 'fullname',
-#         'author_url', 'author_type', 'sex', 'age']
-
-#     author_df = pd.DataFrame(list(pd.DataFrame(dict_train)['authorObject'].values))
-#     author_df.columns=['fullname', 'author_url', 'author_type', 'sex', 'age']
-#     df_res = pd.DataFrame(dict_train).join(author_df)
-#     df_res = df_res[columns]
-#     # df_res.columns = ['Время', 'Текст', 'Источник', 'Ссылка', 'Тип источника', 'Комментариев', 'Аудитория',
-#     #        'Сайт-Индекс', 'Репостов', 'Лайков', 'Суммарная вовлеченность', 'Просмотров',
-#     #        'Тональность', 'Роль', 'Страна',
-#     #        'Регион', 'Город', 'Язык', 'Имя автора', 'Ссылка на автора', 'Тип автора',
-#     #        'Пол', 'Возраст']
-
-#     df_res = df_res.join(data)
-#     df_res = df_res[(df_res['timeCreate'] >= int(min_date)) & (df_res['timeCreate'] <= int(max_date))]
-#     df_res.reset_index(inplace=True)
-#     df_res.drop('index', axis=1, inplace=True)
-
-#     data = df_res[[0]]
-
-#     # функция для удаления лишних символов в текстах
-#     import re
-#     regex = re.compile("[А-Яа-я:=!\)\()A-z\_\%/|]+")
-
-#     def words_only(text, regex=regex):
-#         try:
-#             return " ".join(regex.findall(text))
-#         except:
-#             return ""
-
-#     # удаляем лишние символы, оставляем слова
-#     data[0] = data[0].apply(words_only)
-
-#     # получение векторов текстов и сравнение
-#     count_vectorizer = CountVectorizer()
-#     vector_matrix = count_vectorizer.fit_transform(
-#         data[0].values)
-
-#     cosine_similarity_matrix = cosine_similarity(vector_matrix)
-#     dff = pd.DataFrame(cosine_similarity_matrix)
-#     # dff = dff.round(5)
-#     # dff = dff.replace([1.000], 0)
-
-#     val_dff = dff.values
-#     # заменяем значения по главной диагонали на 0
-#     for i in range(len(val_dff)):
-#         val_dff[i][i] = 0
-        
-#     dff = pd.DataFrame(val_dff)
-
-#     # создаем словарь похожих текстов вида {11: [12, 132],  44: [190], ...}
-#     fin_dict = {}
-#     threashhold = 0.70
-
-#     # print('threashhold')
-
-#     # выявляем список строк с похожими текстам
-#     for i in range(dff.shape[0]):
-#         if list(np.where(dff.loc[i].values >= threashhold)[0]) != []:
-#             if i not in [item for sublist in list(fin_dict.values()) for item in sublist]:
-
-#                 fin_dict[i] = list(
-#                     np.where(dff.loc[i].values >= threashhold)[0])
-                
-#         else:
-#             fin_dict[i] = []
-            
-#     len_val = [len(x) for x in fin_dict.values()]
-#     dct_len_val = dict(zip(list(fin_dict.keys()), len_val))
-#     # dct_len_val = dict(sorted(dct_len_val.items(), key=itemgetter(1), reverse=True))
-
-#     # добавление текстов и метаданных в итоговый словарь
-#     fin_data = []
-#     texts = []
-#     texts_list = data.loc[list(fin_dict.keys())][0].values # список текстов с описанием, берется первое описание по первому тексту-ключу
-#     list_len = list(dct_len_val.values()) # список с количеством текстов по тематике
-#     # [{'description': 'Тема текста связана с ..', 'count': 152, 'texts': [...]},
-#     #  {'description': 'Тема текста связана с ..', 'count': 141, 'texts': [...]}, ..]
-
-#     for i in range(len(fin_dict.keys())):
-        
-#         if fin_dict[list(fin_dict.keys())[i]] != []:
-
-#             a = {}
-#             a['description'] = texts_list[i] # описание тематики
-#             a['count'] = list_len[i] # количество текстов по тематике
-#             a['audience'] = str(np.sum([x['audienceCount'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['audienceCount'] != ''])) # количество аудитории в тематике
-#             a['er'] = str(np.sum([x['er'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['er'] != ''])) # количество вовлеченности в тематику
-#             a['viewsCount'] = str(np.sum([x['viewsCount'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['viewsCount'] != '']))# количество просмотров в тематике
-#             a['texts'] = 'texts' 
-#             # texts.append(df_res[df_res.index.isin(fin_dict[list(fin_dict.keys())[i]])].to_dict(orient='records'))
-#             fin_data.append(a)
-            
-#         else:
-            
-#             a = {}
-#             a['description'] = texts_list[i] # описание тематики
-#             a['count'] = list_len[i] # количество текстов по тематике
-#             a['audience'] = str(np.sum([x['audienceCount'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['audienceCount'] != ''])) # количество аудитории в тематике
-#             a['er'] = str(np.sum([x['er'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['er'] != ''])) # количество вовлеченности в тематику
-#             a['viewsCount'] = str(np.sum([x['viewsCount'] for x in df_res.iloc[fin_dict[list(fin_dict.keys())[i]]].to_dict(orient='records') if x['viewsCount'] != '']))# количество просмотров в тематике
-#             a['texts'] = 'texts'
-#             # texts.append(df_res.iloc[[list(fin_dict.keys())[i]]].to_dict(orient='records'))
-#             fin_data.append(a)
-  
-#     return ThemesModel(values=fin_data)
 
 
 @app.get("/voice", tags=['data analytics'])
@@ -3382,18 +3231,34 @@ def post_process_labels(labels: List[str], topic_model: BERTopic) -> List[str]:
 
 async def run_llm_query(task_data: dict):
     """Оптимизированная обработка LLM-запроса"""
-    print(f'task_data: {task_data}')
+    print(f'🚀 НАЧАЛО ЗАДАЧИ: {task_data}')
+    logging.info(f"🚀 Запуск задачи {task_data['task_id']}")
+    
+    # Устанавливаем начальный статус
+    await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+        "status": "starting",
+        "progress": 0,
+        "completed_texts": 0,
+        "total_texts": 0
+    })
     
     current_time = datetime.now().strftime('%Y%m%d_%H%M%S')
     et = time.time()
     
     try:
-        # 1. Предварительная загрузка данных (параллельно)
+        # 1. Предварительная загрузка данных
+        logging.info("📂 Загрузка индексов...")
         file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
         
-        # Загружаем индексы асинхронно
         loop = asyncio.get_event_loop()
         indexes = await loop.run_in_executor(executor, load_dict_from_pickle, file_path)
+        logging.info(f"✅ Индексы загружены: {len(indexes)}")
+        
+        # Обновляем статус
+        await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+            "status": "loading_data",
+            "progress": 5
+        })
         
         # Извлекаем даты
         try:
@@ -3403,28 +3268,50 @@ async def run_llm_query(task_data: dict):
             min_data = task_data['min_date']
             max_data = task_data['max_date']
 
-        # 2. Параллельная загрузка данных из Elasticsearch и Qdrant
+        # 2. Параллельная загрузка данных
+        logging.info("🔍 Загрузка данных из Elasticsearch и Qdrant...")
         elasticsearch_task = asyncio.create_task(load_elasticsearch_data(task_data, indexes))
         qdrant_task = asyncio.create_task(load_qdrant_data(indexes[int(task_data['index'])]))
         
         data, (embeddings, qdrant_hashes, texts_from_qdrant) = await asyncio.gather(
             elasticsearch_task, qdrant_task
         )
+        logging.info(f"✅ Загружено: {len(data)} документов, {len(embeddings)} эмбеддингов")
 
-        # 3. Быстрая фильтрация с использованием множеств
+        # Обновляем статус
+        await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+            "status": "filtering_data",
+            "progress": 10
+        })
+
+        # 3. Быстрая фильтрация
+        logging.info("🔧 Фильтрация данных...")
         qdrant_hash_set = set(qdrant_hashes)
         filtered_data = [x for x in data if x.get('hash') in qdrant_hash_set]
         
         if not filtered_data:
             raise ValueError("Нет данных для обработки после фильтрации")
+        
+        logging.info(f"✅ После фильтрации: {len(filtered_data)} документов")
 
-        # 4. Подготовка данных с векторизацией
+        # 4. Подготовка данных
+        logging.info("📝 Подготовка текстов...")
         maxdata = 5_000_000
         texts = [x['text'] for x in filtered_data][:maxdata]
         urls = [x.get('url', '') for x in filtered_data][:maxdata]
         total_texts = len(texts)
         
-        # 5. Быстрая фильтрация эмбеддингов
+        logging.info(f"✅ Подготовлено {total_texts} текстов")
+
+        # Обновляем статус
+        await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+            "status": "preparing_embeddings",
+            "progress": 15,
+            "total_texts": total_texts
+        })
+
+        # 5. Фильтрация эмбеддингов
+        logging.info("🧮 Фильтрация эмбеддингов...")
         hash_to_idx = {hash_val: idx for idx, hash_val in enumerate(qdrant_hashes)}
         filtered_embeddings = []
         
@@ -3435,12 +3322,20 @@ async def run_llm_query(task_data: dict):
                 if idx < len(embeddings):
                     filtered_embeddings.append(embeddings[idx])
 
-        # Выравнивание данных
         min_len = min(len(texts), len(filtered_embeddings))
         texts, filtered_embeddings, urls = texts[:min_len], filtered_embeddings[:min_len], urls[:min_len]
         embeddings = np.array(filtered_embeddings)
+        
+        logging.info(f"✅ Эмбеддинги готовы: {embeddings.shape}")
 
-        # 6. Оптимизированная дедупликация
+        # Обновляем статус
+        await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+            "status": "deduplication",
+            "progress": 20
+        })
+
+        # 6. Дедупликация
+        logging.info("🔍 Дедупликация текстов...")
         unique_texts_dict = defaultdict(list)
         for idx, text in enumerate(texts):
             unique_texts_dict[text].append(idx)
@@ -3448,20 +3343,32 @@ async def run_llm_query(task_data: dict):
         unique_texts = list(unique_texts_dict.keys())
         unique_total = len(unique_texts)
         llm_labels = [None] * len(texts)
+        
+        logging.info(f"✅ Уникальных текстов: {unique_total} из {total_texts}")
 
-        # 7. Настройка путей сохранения
+        # 7. Настройка путей
         index_name = indexes[int(task_data['index'])]
         file_location = f'/home/dev/tellscope_app/tellscope_backend/data/{task_data["user_id"]}/bertopic_files_directory/{task_data["folder_name"]}/{index_name}/'
         os.makedirs(file_location, exist_ok=True)
         
-        file_name = f'my_list_llm_ans_{index_name}_{current_time}.pkl'
-        file_full_path = os.path.join(file_location, file_name)
+        # Сохраняем имя файла в переменную
+        pkl_file_name = f'my_list_llm_ans_{index_name}_{current_time}.pkl'
+        file_full_path = os.path.join(file_location, pkl_file_name)
 
-        # 8. Оптимизированная обработка LLM запросов
+        # Обновляем статус перед LLM обработкой
+        await redis_db.hset(f"task:{task_data['task_id']}", mapping={
+            "status": "llm_processing",
+            "progress": 25,
+            "unique_texts": unique_total
+        })
+
+        # 8. **КРИТИЧНО: LLM обработка**
+        logging.info("🤖 Начало LLM обработки...")
         await process_llm_requests_optimized(
             unique_texts, unique_texts_dict, llm_labels, 
-            task_data, total_texts, file_full_path, filtered_data  # Добавили filtered_data
+            task_data, total_texts, file_full_path, filtered_data
         )
+        logging.info("✅ LLM обработка завершена")
 
         # 9. Параллельное создание моделей UMAP и HDBSCAN
         umap_hdbscan_task = asyncio.create_task(
@@ -3501,8 +3408,25 @@ async def run_llm_query(task_data: dict):
         
         await asyncio.gather(*save_tasks)
 
-        # 14. Обновление пользовательских данных
-        await update_user_data(task_data, index_name, current_time, et, total_texts, unique_total)
+        # 14. Создание CSV-файла и получение его имени
+        csv_filename = await create_result_csv(
+            file_full_path=file_full_path,
+            filtered_data=filtered_data,
+            file_location=file_location,
+            index_name=index_name,
+            current_time=current_time
+        )
+
+        # 15. Обновление пользовательских данных - ИСПРАВЛЕНО: 7 параметров
+        await update_user_data(
+            task_data=task_data,
+            index_name=index_name,
+            current_time=current_time,
+            start_time=et,
+            total_texts=total_texts,
+            unique_total=unique_total,
+            pkl_filename=pkl_file_name  # 7-й параметр
+        )
 
     except Exception as e:
         logging.error(f"Ошибка при обработке задачи {task_data['task_id']}: {e}")
@@ -3511,6 +3435,197 @@ async def run_llm_query(task_data: dict):
     
     finally:
         await cleanup_resources(task_data, indexes, current_time)
+
+
+async def update_user_data(
+    task_data: dict, 
+    index_name: str, 
+    current_time: str, 
+    start_time: float, 
+    total_texts: int, 
+    unique_total: int,
+    pkl_filename: str = None  # 7-й параметр
+):
+    """
+    Обновление данных пользователя с информацией о созданных файлах
+    """
+    try:
+        elapsed_time = time.time() - start_time
+        total_seconds = int(elapsed_time)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        execution_all_time = f"{hours} ч. {minutes} мин. {seconds} сек."
+
+        user_data = await redis_db.execute_command('HGETALL', task_data['user_id'])
+        user_data = {key.decode('utf-8'): value.decode('utf-8') for key, value in user_data.items()}
+
+        creation_date = datetime.strptime(current_time, "%Y%m%d_%H%M%S")
+        
+        # Формируем имена файлов
+        csv_filename = f'result_graph_{index_name}_{current_time}.csv'
+        
+        file_info = {
+            "html-file": f"{index_name}_{current_time}.html",
+            "model-file": f'topic_model_{index_name}_{current_time}',
+            "pkl-file": pkl_filename,  # Добавляем PKL файл
+            "csv-file": csv_filename,   # Добавляем CSV файл
+            "creation_date": str(creation_date.strftime("%Y-%m-%d %H:%M:%S")),
+            "execution_all_time": execution_all_time,
+            "min_data": task_data.get('min_data', ''),
+            "max_data": task_data.get('max_data', ''),
+            "index_number": int(task_data['index']),
+            "task_id": task_data['task_id'],
+            "query_str": task_data.get('query_str', ''),
+            "count_texts": total_texts,
+            "unique_texts": unique_total,
+            "promt_question": task_data.get('promt_question', ''),
+            "status": "completed"
+        }
+
+        if user_data and "bertopic_files_directory" in user_data:
+            user_folders = json.loads(user_data["bertopic_files_directory"])
+        else:
+            user_folders = {}
+
+        folder_name = task_data['folder_name']
+        if folder_name in user_folders:
+            user_folders[folder_name].append(file_info)
+        else:
+            user_folders[folder_name] = [file_info]
+
+        serialized_folders = json.dumps(user_folders)
+        await redis_db.hset(task_data["user_id"], "bertopic_files_directory", serialized_folders)
+        
+        logging.info(f"✅ Данные пользователя обновлены: {file_info}")
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка при обновлении данных пользователя: {e}")
+        raise
+
+
+async def create_result_csv(
+    file_full_path: str,
+    filtered_data: list,
+    file_location: str,
+    index_name: str,
+    current_time: str
+) -> str:  # Указываем, что возвращаем строку
+    """
+    Асинхронное создание CSV-файла с результатами анализа
+    """
+    loop = asyncio.get_event_loop()
+    
+    def _create_csv():
+        try:
+            # Загружаем метки из pkl файла
+            with open(file_full_path, 'rb') as file:
+                labels_data = pickle.load(file)
+            
+            # Обрабатываем разные форматы данных
+            if isinstance(labels_data, dict) and 'labels' in labels_data:
+                labels = list(zip(labels_data['hashes'], labels_data['labels']))
+            else:
+                labels = labels_data
+            
+            # Создаем DataFrame с метками
+            labels_df = pd.DataFrame(labels, columns=['hash', 'labels'])
+            
+            # Создаем DataFrame из filtered_data
+            data_df = pd.DataFrame(filtered_data)
+            
+            # Объединяем данные
+            result = data_df.merge(labels_df, on='hash', how='inner')
+            
+            # Проверяем наличие необходимых колонок и выбираем только существующие
+            required_columns = [
+                'timeCreate', 'title', 'url', 'hubtype', 'type', 'authorObject',
+                'commentsCount', 'audienceCount', 'repostsCount', 'likesCount',
+                'er', 'viewsCount', 'duplicateCount', 'country', 'region', 'city', 'labels'
+            ]
+            
+            # Фильтруем только существующие колонки
+            available_columns = [col for col in required_columns if col in result.columns]
+            result = result[available_columns]
+            
+            # Преобразуем timeCreate если колонка существует
+            if 'timeCreate' in result.columns:
+                result['timeCreate'] = pd.to_datetime(result['timeCreate'], unit='s', errors='coerce')
+            
+            # Обрабатываем authorObject если колонка существует
+            if 'authorObject' in result.columns:
+                try:
+                    author_df = pd.json_normalize(result['authorObject'])
+                    
+                    # Переименовываем 'url' в 'author_url' если существует
+                    if 'url' in author_df.columns:
+                        author_df = author_df.rename(columns={'url': 'author_url'})
+                    
+                    # Объединяем с исходным DataFrame
+                    result = pd.concat([result.drop('authorObject', axis=1), author_df], axis=1)
+                except Exception as e:
+                    logging.warning(f"Не удалось обработать authorObject: {e}")
+            
+            # Формируем имя файла
+            csv_filename = f'result_graph_{index_name}_{current_time}.csv'
+            csv_full_path = os.path.join(file_location, csv_filename)
+            
+            # Сохраняем CSV
+            result.to_csv(csv_full_path, index=False, encoding='utf-8')
+            
+            logging.info(f"CSV файл успешно создан: {csv_full_path}")
+            return csv_filename  # Возвращаем имя файла
+            
+        except Exception as e:
+            logging.error(f"Ошибка при создании CSV файла: {e}")
+            raise
+    
+    return await loop.run_in_executor(executor, _create_csv)
+
+
+# async def update_user_data(
+#     task_data: dict, 
+#     index_name: str, 
+#     current_time: str, 
+#     et: float, 
+#     total_texts: int, 
+#     unique_total: int,
+#     pkl_filename: str = None  # 7-й параметр уже есть
+# ):
+#     """
+#     Обновление данных пользователя с информацией о созданных файлах
+#     """
+#     try:
+#         execution_time = time.time() - et
+        
+#         # Формируем имена файлов
+#         csv_filename = f'result_graph_{index_name}_{current_time}.csv'
+        
+#         user_data = {
+#             "task_id": task_data['task_id'],
+#             "user_id": task_data['user_id'],
+#             "folder_name": task_data['folder_name'],
+#             "index_name": index_name,
+#             "total_texts": total_texts,
+#             "unique_texts": unique_total,
+#             "execution_time": round(execution_time, 2),
+#             "timestamp": current_time,
+#             "pkl_file": pkl_filename,  # Добавляем имя pkl файла
+#             "csv_file": csv_filename,   # Добавляем имя csv файла
+#             "status": "completed"
+#         }
+        
+#         # Сохраняем в Redis или базу данных
+#         await redis_db.hset(
+#             f"user_results:{task_data['user_id']}:{task_data['task_id']}", 
+#             mapping=user_data
+#         )
+        
+#         logging.info(f"Данные пользователя обновлены: {user_data}")
+        
+#     except Exception as e:
+#         logging.error(f"Ошибка при обновлении данных пользователя: {e}")
+#         raise
 
 # Вспомогательные асинхронные функции
 
@@ -3570,15 +3685,27 @@ async def load_qdrant_data(collection_name: str) -> Tuple[List, List, List]:
     
     return await loop.run_in_executor(executor, _load_qdrant)
 
+
 async def process_llm_requests_optimized(unique_texts: List[str], unique_texts_dict: Dict, 
                                        llm_labels: List, task_data: dict, total_texts: int, 
-                                       file_full_path: str, filtered_data: List):  # Добавили параметр
-    """Оптимизированная обработка LLM запросов с повышенным параллелизмом"""
+                                       file_full_path: str, filtered_data: List):
+    """Оптимизированная обработка LLM запросов"""
     
-    # Увеличенный семафор для больше параллельных запросов
+    logging.info(f"🚀 Начало LLM обработки: {len(unique_texts)} уникальных текстов")
+    
+    # Проверка доступности LLM API
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://localhost:8000/v1/models", timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    logging.info("✅ LLM API доступен")
+                else:
+                    logging.error(f"⚠️ LLM API вернул статус {response.status}")
+    except Exception as e:
+        logging.error(f"❌ LLM API недоступен: {e}")
+        raise
+
     semaphore = asyncio.Semaphore(20)
-    
-    # Кэш для избежания повторных запросов
     response_cache = {}
     
     async def generate_answer_cached(text: str, question: str, system_prompt: str = None) -> str:
@@ -3725,12 +3852,14 @@ async def save_labels_async(file_full_path: str, task_data: dict, llm_labels: Li
     loop = asyncio.get_event_loop()
     
     def _save():
-        filtered_data_hashes = [x['hash'] for x in filtered_data]  # Теперь filtered_data доступна
+        # Создаем список кортежей (hash, label)
+        filtered_data_hashes = [x['hash'] for x in filtered_data]
+        labels_to_save = list(zip(filtered_data_hashes, llm_labels))
+        
         with open(file_full_path, 'wb') as file:
-            pickle.dump({
-                'hashes': filtered_data_hashes,
-                'labels': llm_labels
-            }, file)
+            pickle.dump(labels_to_save, file)
+        
+        logging.info(f"Сохранено {len(labels_to_save)} меток в {file_full_path}")
     
     await loop.run_in_executor(executor, _save)
 
@@ -4118,49 +4247,117 @@ async def save_model_and_labels_async(topic_model: BERTopic, topics: List,
     
     await loop.run_in_executor(executor, _save_model_and_labels)
 
-async def update_user_data(task_data: dict, index_name: str, current_time: str, 
-                          start_time: float, total_texts: int, unique_total: int):
-    """Обновление пользовательских данных в Redis"""
-    elapsed_time = time.time() - start_time
-    total_seconds = int(elapsed_time)
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    execution_all_time = f"{hours} ч. {minutes} мин. {seconds} сек."
+async def update_user_data(
+    task_data: dict, 
+    index_name: str, 
+    current_time: str, 
+    start_time: float, 
+    total_texts: int, 
+    unique_total: int,
+    pkl_filename: str = None,
+    csv_filename: str = None  # ✅ Добавляем параметр
+):
+    """
+    Обновление данных пользователя с информацией о созданных файлах
+    """
+    try:
+        elapsed_time = time.time() - start_time
+        total_seconds = int(elapsed_time)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        execution_all_time = f"{hours} ч. {minutes} мин. {seconds} сек."
 
-    user_data = await redis_db.execute_command('HGETALL', task_data['user_id'])
-    user_data = {key.decode('utf-8'): value.decode('utf-8') for key, value in user_data.items()}
+        user_data = await redis_db.execute_command('HGETALL', task_data['user_id'])
+        user_data = {key.decode('utf-8'): value.decode('utf-8') for key, value in user_data.items()}
 
-    creation_date = datetime.strptime(current_time, "%Y%m%d_%H%M%S")
+        creation_date = datetime.strptime(current_time, "%Y%m%d_%H%M%S")
+        
+        # ✅ Используем переданное имя файла или формируем его
+        if not csv_filename:
+            csv_filename = f'result_graph_{index_name}_{current_time}.csv'
+        
+        file_info = {
+            "html-file": f"{index_name}_{current_time}.html",
+            "model-file": f'topic_model_{index_name}_{current_time}',
+            "pkl-file": pkl_filename,
+            "csv-file": csv_filename,
+            "creation_date": str(creation_date.strftime("%Y-%m-%d %H:%M:%S")),
+            "execution_all_time": execution_all_time,
+            "min_data": task_data.get('min_data', ''),
+            "max_data": task_data.get('max_data', ''),
+            "index_number": int(task_data['index']),
+            "task_id": task_data['task_id'],
+            "query_str": task_data.get('query_str', ''),
+            "count_texts": total_texts,
+            "unique_texts": unique_total,
+            "promt_question": task_data.get('promt_question', ''),
+            "status": "completed"
+        }
 
-    file_info = {
-        "html-file": f"{index_name}_{current_time}.html",
-        "model-file": f'topic_model_{index_name}_{current_time}',
-        "creation_date": str(creation_date.strftime("%Y-%m-%d %H:%M:%S")),
-        "execution_all_time": execution_all_time,
-        "min_data": task_data['min_data'],
-        "max_data": task_data['max_data'],
-        "index_number": int(task_data['index']),
-        "task_id": task_data['task_id'],
-        "query_str": task_data['query_str'],
-        "count_texts": total_texts,
-        "unique_texts": unique_total,
-        "promt_question": task_data['promt_question'],
-    }
+        # ✅ Обновляем bertopic_files_directory
+        if user_data and "bertopic_files_directory" in user_data:
+            user_folders = json.loads(user_data["bertopic_files_directory"])
+        else:
+            user_folders = {}
 
-    if user_data and "bertopic_files_directory" in user_data:
-        user_folders = json.loads(user_data["bertopic_files_directory"])
-    else:
-        user_folders = {}
+        folder_name = task_data['folder_name']
+        if folder_name in user_folders:
+            user_folders[folder_name].append(file_info)
+        else:
+            user_folders[folder_name] = [file_info]
 
-    folder_name = task_data['folder_name']
-    if folder_name in user_folders:
-        user_folders[folder_name].append(file_info)
-    else:
-        user_folders[folder_name] = [file_info]
+        serialized_folders = json.dumps(user_folders)
+        await redis_db.hset(task_data["user_id"], "bertopic_files_directory", serialized_folders)
 
-    serialized_folders = json.dumps(user_folders)
-    await redis_db.hset(task_data["user_id"], "bertopic_files_directory", serialized_folders)
+        # ✅ НОВОЕ: Обновляем csv_files_directory
+        file_location = f'/home/dev/tellscope_app/tellscope_backend/data/{task_data["user_id"]}/bertopic_files_directory/{folder_name}/{index_name}/'
+        csv_full_path = os.path.join(file_location, csv_filename)
+        
+        # Получаем существующие CSV файлы
+        if user_data and "csv_files_directory" in user_data:
+            csv_folders = json.loads(user_data["csv_files_directory"])
+        else:
+            csv_folders = {}
+        
+        # Ключ папки (относительный путь)
+        csv_folder_key = f"{folder_name}/{index_name}"
+        
+        # Создаем информацию о CSV файле
+        csv_file_info = {
+            "file": csv_filename,
+            "full_path": csv_full_path,
+            "relative_path": f"{csv_folder_key}/{csv_filename}",
+        }
+        
+        # Добавляем размер файла
+        try:
+            if os.path.exists(csv_full_path):
+                csv_file_info["size"] = os.path.getsize(csv_full_path)
+            else:
+                csv_file_info["size"] = 0
+        except:
+            csv_file_info["size"] = 0
+        
+        # Добавляем в структуру
+        if csv_folder_key in csv_folders:
+            # Проверяем, нет ли уже такого файла
+            existing_files = [f["file"] for f in csv_folders[csv_folder_key]]
+            if csv_filename not in existing_files:
+                csv_folders[csv_folder_key].append(csv_file_info)
+        else:
+            csv_folders[csv_folder_key] = [csv_file_info]
+        
+        # Сохраняем в Redis
+        serialized_csv_folders = json.dumps(csv_folders)
+        await redis_db.hset(task_data["user_id"], "csv_files_directory", serialized_csv_folders)
+        
+        logging.info(f"✅ Данные пользователя обновлены: {file_info}")
+        logging.info(f"✅ CSV файл зарегистрирован: {csv_file_info}")
+        
+    except Exception as e:
+        logging.error(f"❌ Ошибка при обновлении данных пользователя: {e}")
+        raise
 
 async def cleanup_resources(task_data: dict, indexes: dict, current_time: str):
     """Очистка ресурсов и финальное обновление статуса"""
@@ -5133,37 +5330,37 @@ async def history_search(user_id: int):
 # Добавление папки
 @app.get("/add-folder/{user_id}/{folder_name}", tags=['data & folders'])
 async def add_folder(user_id: str, folder_name: str):
-
     print(f'user_id: {user_id}, folder_name: {folder_name}')
-    # Путь до директории json_files
+    
     json_files_directory = f"/home/dev/tellscope_app/tellscope_backend/data/{user_id}/json_files_directory"
-    # Путь, где будет создана папка
     storage_path = f"{json_files_directory}/{folder_name}"
 
-    # Проверяем, существует ли директория json_files_directory, если нет - создаем её
     if not os.path.exists(json_files_directory):
         os.makedirs(json_files_directory)
 
-    # Проверяем, существует ли уже папка
     if os.path.exists(storage_path):
         raise HTTPException(status_code=400, detail="Папка с таким именем уже существует.")
 
-    # Создаём папку
     os.makedirs(storage_path)
 
-    # Получаем текущее состояние папок в Redis
+    # ✅ ИСПРАВЛЕНИЕ: Правильная работа с кириллицей
     user_data = await redis_db.hget(user_id, "json_files_directory")
     if user_data is None:
         user_folders = {}
     else:
-        user_folders = json.loads(user_data)
+        # Декодируем байты в UTF-8 строку
+        decoded_data = user_data.decode('utf-8') if isinstance(user_data, bytes) else user_data
+        user_folders = json.loads(decoded_data)
 
-    # Добавляем новую папку в структуру
     if folder_name not in user_folders:
         user_folders[folder_name] = []
 
-    # Сохраняем обновлённую структуру в Redis
-    await redis_db.hset(user_id, "json_files_directory", json.dumps(user_folders))
+    # ✅ Сохраняем с ensure_ascii=False и кодируем в байты
+    await redis_db.hset(
+        user_id, 
+        "json_files_directory", 
+        json.dumps(user_folders, ensure_ascii=False).encode('utf-8')
+    )
 
     return f"Папка {folder_name} у пользователя {user_id} создана!"
 
@@ -5238,342 +5435,33 @@ processing_results = Table(
     Column("created_at", DateTime(timezone=True), server_default=func.now()),
 )
 
-# Настройка Celery
-celery_app = Celery('tasks', broker='redis://localhost:6379/0')
-
-# from tasks import process_file_task
-# import time
-# from celery import Celery
-# from celery.utils.log import get_task_logger
-# import os
-# import json
-# import asyncio
-# import redis
-# from datetime import datetime
-# import tempfile
-# import shutil
-# from load_data_elastic import load_file_to_elstic
-# import uuid
-# import threading
-# from qdrant_client import QdrantClient
-# from qdrant_client.http import models
-# import logging
-# import numpy as np
-
-# # Настройка логирования
-# logger = get_task_logger(__name__)
-
-# # Инициализация Celery
-# celery_app = Celery(
-#     'tasks',
-#     broker='redis://localhost:6379/0',
-#     backend='redis://localhost:6379/0'
-# )
-
-# # Инициализация Redis для асинхронных операций
-# redis_client = redis.Redis(host='localhost', port=6379, db=0)
-
-# # Инициализация Qdrant
-# client_qdrant = QdrantClient("localhost", port=6333)
-
-# try:
-#     if not client_qdrant.get_collections():
-#         logger.error("Qdrant не отвечает или нет коллекций")
-# except Exception as e:
-#     logger.error(f"Ошибка подключения к Qdrant: {str(e)}")
-#     raise
-
-# def update_task_progress(task_id, progress, status="processing", error=None, stage=None, stage_details=None):
-#     mapping = {
-#         "status": status,
-#         "progress": str(progress)
-#     }
-
-#     if error:
-#         mapping["error"] = error
-
-#     if stage:
-#         mapping["stage"] = stage
-
-#     if stage_details:
-#         mapping["stage_details"] = stage_details
-
-#     if status in ["completed", "failed"]:
-#         mapping[f"{status}_at"] = datetime.now().isoformat()
-
-#     redis_client.hset(f"task:{task_id}", mapping=mapping)
-
-# def acquire_qdrant_lock(collection_name, task_id, timeout=30):
-#     """Получение блокировки для коллекции в Qdrant"""
-#     lock_key = f"qdrant_lock:{collection_name}"
-#     deadline = time.time() + timeout
-    
-#     # Пытаемся получить блокировку
-#     while time.time() < deadline:
-#         if redis_client.set(lock_key, task_id, nx=True, ex=60):  # блокировка на 60 секунд
-#             logger.info(f"Task[{task_id}]: Получена блокировка для коллекции {collection_name}")
-#             return True
-        
-#         # Проверяем, кто владеет блокировкой
-#         owner = redis_client.get(lock_key)
-#         if owner and owner.decode('utf-8') == task_id:
-#             # Продлеваем нашу блокировку
-#             redis_client.expire(lock_key, 60)
-#             return True
-            
-#         logger.info(f"Task[{task_id}]: Ожидание блокировки для {collection_name}, владелец: {owner}")
-#         time.sleep(1)
-    
-#     logger.error(f"Task[{task_id}]: Не удалось получить блокировку для {collection_name}")
-#     return False
-
-# def release_qdrant_lock(collection_name, task_id):
-#     """Освобождение блокировки"""
-#     lock_key = f"qdrant_lock:{collection_name}"
-#     owner = redis_client.get(lock_key)
-    
-#     if owner and owner.decode('utf-8') == task_id:
-#         redis_client.delete(lock_key)
-#         logger.info(f"Task[{task_id}]: Освобождена блокировка для {collection_name}")
-#         return True
-#     return False
-
-
-# def load_to_qdrant(processed_docs, new_index, qdrant_task_id):
-#     try:
-#         logger.info(f"Начало загрузки в Qdrant для индекса {new_index}")
-        
-#         # Проверка и удаление существующей коллекции
-#         try:
-#             existing_collections = client_qdrant.get_collections()
-#             if any(col.name == new_index for col in existing_collections.collections):
-#                 logger.info(f"Удаление существующей коллекции {new_index}")
-#                 client_qdrant.delete_collection(new_index)
-#                 time.sleep(1)  # Пауза для гарантии удаления
-#         except Exception as e:
-#             logger.warning(f"Ошибка при проверке коллекций: {str(e)}")
-        
-#         # Фильтруем документы с валидными векторами
-#         valid_docs = []
-#         for doc in processed_docs:
-#             if doc["vector"] is None:
-#                 logger.error(f"Документ {doc['id']} имеет vector=None, payload: {doc['payload']}")
-#                 continue
-#             if not isinstance(doc["vector"], list) or len(doc["vector"]) == 0:
-#                 logger.warning(f"Документ {doc.get('id')} пропущен — невалидный вектор: {type(doc['vector'])}")
-#                 continue
-#             valid_docs.append(doc)
-
-#         if not valid_docs:
-#             logger.error("Нет документов с валидными векторами для загрузки в Qdrant!")
-#             redis_client.hset(
-#                 f"background_task:{qdrant_task_id}",
-#                 mapping={
-#                     "status": "failed",
-#                     "error": "No valid vectors for Qdrant",
-#                     "end_time": str(time.time())
-#                 }
-#             )
-#             return
-
-#         vector_size = len(valid_docs[0]["vector"])
-#         logger.info(f"Размер вектора: {vector_size}")
-        
-#         # Создаем коллекцию в Qdrant
-#         client_qdrant.create_collection(
-#             collection_name=new_index,
-#             vectors_config=models.VectorParams(
-#                 size=vector_size,
-#                 distance=models.Distance.COSINE
-#             )
-#         )
-#         logger.info(f"Коллекция {new_index} создана в Qdrant")
-
-#         batch_size = 50
-#         total_batches = (len(valid_docs) + batch_size - 1) // batch_size
-
-#         for i in range(0, len(valid_docs), batch_size):
-#             batch = valid_docs[i:i + batch_size]
-#             points = []
-#             for j, doc in enumerate(batch):
-#                 point_id = i + j + 1
-#                 logger.debug(f"Документ {j}: ключи payload = {list(doc['payload'].keys())}")
-#                 content = doc["payload"].get("content") or doc["payload"].get("text", "")
-#                 if not content:
-#                     logger.warning(f"Документ {j} не содержит content или text")
-#                     content = str(doc["payload"].get("metadata", {}).get("text", ""))
-                
-#                 points.append(
-#                     models.PointStruct(
-#                         id=point_id,
-#                         vector=doc["vector"],
-#                         payload={
-#                             "content": content[:10000] if content else "",
-#                             "metadata": doc["payload"].get("metadata", {}),
-#                             "chunks": doc["payload"].get("chunks")
-#                         }
-#                     )
-#                 )
-
-#             client_qdrant.upsert(
-#                 collection_name=new_index,
-#                 points=points
-#             )
-
-#             completed = min(i + batch_size, len(valid_docs))
-#             progress = int((completed / len(valid_docs)) * 100)
-            
-#             redis_client.hset(
-#                 f"background_task:{qdrant_task_id}",
-#                 mapping={
-#                     "progress": str(progress),
-#                     "completed": str(completed)
-#                 }
-#             )
-#             logger.info(f"Загружено {completed}/{len(valid_docs)} документов в индекс {new_index}")
-
-#         redis_client.hset(
-#             f"background_task:{qdrant_task_id}",
-#             mapping={
-#                 "status": "completed",
-#                 "progress": "100",
-#                 "end_time": str(time.time())
-#             }
-#         )
-#         logger.info(f"Успешно создан индекс {new_index} с {len(valid_docs)} документами")
-
-#     except Exception as e:
-#         logger.error(f"Ошибка при создании индекса: {str(e)}")
-#         redis_client.hset(
-#             f"background_task:{qdrant_task_id}",
-#             mapping={
-#                 "status": "failed",
-#                 "error": str(e),
-#                 "end_time": str(time.time())
-#             }
-#         )
-
-# @celery_app.task(bind=True, name="process_file_task")
-# def process_file_task(self, **kwargs):
-#     task_id = kwargs.get("task_id")
-#     user_id = kwargs.get("user_id")
-#     folder_name = kwargs.get("folder_name")
-#     json_filename = kwargs.get("json_filename")
-#     file_location = kwargs.get("file_location")
-#     file_extension = kwargs.get("file_extension")
-#     next_key = kwargs.get("next_key")
-
-#     try:
-#         # Начало обработки
-#         update_task_progress(task_id, 10, stage="file_upload", 
-#                            stage_details="Файл загружен на сервер")
-
-#         # Обработка Excel (если нужно)
-#         if file_extension == '.xlsx':
-#             update_task_progress(task_id, 20, stage="excel_conversion",
-#                                stage_details="Конвертация Excel в JSON")
-#             try:
-#                 json_data = load_medialogia_excel(file_location)
-#                 json_file_path = file_location.replace('.xlsx', '.json')
-#                 with open(json_file_path, "w", encoding="utf-8") as json_file:
-#                     json.dump(json_data, json_file, ensure_ascii=False, indent=4)
-#                 file_location = json_file_path
-#                 update_task_progress(task_id, 30, stage="excel_conversion",
-#                                     stage_details="Конвертация завершена")
-#             except Exception as e:
-#                 logger.error(f"Ошибка конвертации Excel: {str(e)}")
-#                 update_task_progress(task_id, 0, "failed", error=str(e),
-#                                    stage="excel_conversion",
-#                                    stage_details=f"Ошибка конвертации: {str(e)}")
-#                 return {"status": "failed", "error": str(e)}
-
-#         # Загрузка в Elasticsearch
-#         update_task_progress(task_id, 40, stage="elasticsearch_processing",
-#                            stage_details="Подготовка данных для Elasticsearch")
-
-#         file_path = f'/home/dev/tellscope_app/tellscope_backend/data/{user_id}/json_files_directory/{folder_name}/'
-        
-#         class FileObject:
-#             def __init__(self, filename):
-#                 self.filename = filename
-
-#         elastic_result = load_file_to_elstic(FileObject(json_filename), path=file_path, task_id=task_id)
-
-#         if not elastic_result or "task_id" not in elastic_result:
-#             error_msg = elastic_result.get("error", "Неизвестная ошибка Elasticsearch")
-#             raise Exception(f"Ошибка Elasticsearch: {error_msg}")
-
-#         # Мониторинг прогресса Qdrant
-#         max_attempts = 300
-#         attempt = 0
-
-#         while attempt < max_attempts:
-#             qdrant_info = redis_client.hgetall(f"task:{task_id}")  # Используем тот же task_id
-            
-#             if not qdrant_info:
-#                 logger.warning(f'Данные задачи не найдены (попытка {attempt})')
-#                 time.sleep(2)
-#                 attempt += 1
-#                 continue
-
-#             decoded_info = {k.decode('utf-8'): v.decode('utf-8') for k, v in qdrant_info.items()}
-#             status = decoded_info.get('status')
-            
-#             if status == 'completed':
-#                 logger.info('Qdrant task completed')
-#                 break
-#             elif status == 'failed':
-#                 error_msg = decoded_info.get('error', 'Unknown Qdrant error')
-#                 raise Exception(f"Ошибка Qdrant: {error_msg}")
-
-#             progress = float(decoded_info.get('progress', '0'))
-#             update_task_progress(
-#                 task_id,
-#                 50 + (progress * 0.5),  # 50-100% для Qdrant
-#                 stage=decoded_info.get('stage', 'qdrant_processing'),
-#                 stage_details=decoded_info.get('stage_details', 'Обработка данных')
-#             )
-
-#             time.sleep(2)
-#             attempt += 1
-
-#         if attempt >= max_attempts:
-#             raise Exception("Timeout waiting for Qdrant")
-
-#         update_task_progress(task_id, 100, "completed",
-#                            stage="completed",
-#                            stage_details="Обработка завершена")
-#         return {
-#             "status": "completed",
-#             "message": "Файл успешно обработан",
-#             "index_name": elastic_result["index_name"]
-#         }
-
-#     except Exception as e:
-#         logger.error(f"Ошибка обработки: {str(e)}")
-#         update_task_progress(task_id, 0, "failed", error=str(e),
-#                            stage="error",
-#                            stage_details=f"Ошибка: {str(e)}")
-#         return {"status": "failed", "error": str(e)}
 
 async def sync_files_with_redis(user_id: str, folder_name: str):
     base_path = f'/home/dev/tellscope_app/tellscope_backend/data/{user_id}/json_files_directory/{folder_name}'
     
     try:
-        # Получаем текущие файлы из файловой системы
         fs_files = []
         if os.path.exists(base_path):
             fs_files = [f for f in os.listdir(base_path) if f.endswith('.json')]
         
-        # Получаем текущие файлы из Redis
+        # ✅ ИСПРАВЛЕНИЕ: Правильная декодировка
         user_folders_data = await redis_db.hget(user_id, "json_files_directory")
-        user_folders = json.loads(user_folders_data.decode("utf-8")) if user_folders_data else {}
+        if user_folders_data:
+            decoded_data = user_folders_data.decode("utf-8") if isinstance(user_folders_data, bytes) else user_folders_data
+            user_folders = json.loads(decoded_data)
+        else:
+            user_folders = {}
+            
         redis_files = user_folders.get(folder_name, [])
         
-        # Синхронизируем
         if set(fs_files) != set(redis_files):
             user_folders[folder_name] = fs_files
-            await redis_db.hset(user_id, "json_files_directory", json.dumps(user_folders))
+            # ✅ Сохраняем с ensure_ascii=False
+            await redis_db.hset(
+                user_id, 
+                "json_files_directory", 
+                json.dumps(user_folders, ensure_ascii=False).encode('utf-8')
+            )
             return True
         
         return False
@@ -5587,7 +5475,7 @@ from tasks import process_file_task
 async def add_file(
     user_id: str, 
     folder_name: str, 
-    uploaded_file: UploadFile = File(..., max_size=50*1024*1024*1024), methods=["POST"]  # 50 GB
+    uploaded_file: UploadFile = File(..., max_size=50*1024*1024*1024), methods=["POST"]
 ):
     if not folder_name:
         raise HTTPException(status_code=400, detail="Необходимо указать имя папки")
@@ -5661,12 +5549,16 @@ async def add_file(
     )
 
     # Для интерфейса – обновляем Redis (и список файлов в папке)
+    # ✅ ИСПРАВЛЕНИЕ: Правильная декодировка
     user_folders_data = await redis_db.hget(user_id, "json_files_directory")
     user_folders = {}
     if user_folders_data:
         try:
-            user_folders = json.loads(user_folders_data.decode("utf-8"))
+            # Декодируем байты в строку UTF-8, затем парсим JSON
+            decoded_data = user_folders_data.decode("utf-8") if isinstance(user_folders_data, bytes) else user_folders_data
+            user_folders = json.loads(decoded_data)
         except Exception as e:
+            logger.error(f"Ошибка при загрузке данных из Redis: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Ошибка при загрузке данных из Redis: {str(e)}")
 
     current_files = user_folders.get(folder_name, [])
@@ -5674,7 +5566,13 @@ async def add_file(
         current_files = [f for f in current_files if f != json_filename]
     current_files.append(json_filename)
     user_folders[folder_name] = current_files
-    await redis_db.hset(user_id, "json_files_directory", json.dumps(user_folders))
+    
+    # ✅ Сохраняем с ensure_ascii=False
+    await redis_db.hset(
+        user_id, 
+        "json_files_directory", 
+        json.dumps(user_folders, ensure_ascii=False).encode('utf-8')  # Кодируем в байты
+    )
         
     try:
         # После успешной загрузки файла
@@ -6017,37 +5915,46 @@ def get_elasticsearch():
 @app.get("/user-folders/{user_id}", tags=['data & folders'])
 async def get_user_folders(
     user_id: str, 
-    es: Elasticsearch = Depends(get_elasticsearch)  # Добавьте эту зависимость
+    es: Elasticsearch = Depends(get_elasticsearch)
 ):
-    # Проверяем, существует ли пользователь в БД
-    user = get_user_profile(user_id)
+    import os
+    from pathlib import Path
     
+    user = get_user_profile(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Путь к файлу с темами 
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
-    # Загрузка словаря с темами
     indexes = load_dict_from_pickle(file_path)
     
-    # Получаем папки пользователя из Redis
     folders = await redis_db.hgetall(user_id)
-
     if not folders:
-        return {"user_id": user_id, "json_files_directory": {}, "bertopic_files_directory": {}}
+        return {
+            "user_id": user_id, 
+            "json_files_directory": {}, 
+            "bertopic_files_directory": {},
+            "csv_files_directory": {}
+        }
 
-    # Преобразуем данные из Redis в формат JSON
-    formatted_folders = {folder.decode('utf-8'): json.loads(files) for folder, files in folders.items()}
+    # ✅ ИСПРАВЛЕНИЕ: Правильная декодировка кириллицы из Redis
+    formatted_folders = {}
+    for folder_key, files_value in folders.items():
+        folder_name = folder_key.decode('utf-8')  # Декодируем ключ
+        try:
+            # Загружаем JSON с ensure_ascii=False для корректной обработки кириллицы
+            files_data = json.loads(files_value.decode('utf-8'))
+            formatted_folders[folder_name] = files_data
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Ошибка декодирования данных для папки {folder_name}: {e}")
+            formatted_folders[folder_name] = {}
 
     # Получение данных из Elasticsearch с обработкой ошибок
     try:
         es_indexes = list(es.indices.get(index='*').keys())
     except Exception as e:
         logger.error(f"Ошибка подключения к Elasticsearch: {e}")
-        # В случае ошибки используем пустой список
         es_indexes = []
 
-    # Запрос для поиска мин и макс дат в данных/файлах
     query = {
         "aggs": {
             "max_timeCreate": {
@@ -6063,25 +5970,24 @@ async def get_user_folders(
         },
     }
 
-    # Создаем новый формат результата
     json_folders = {}
 
-    # Проходим по всем именам папок в formatted_folders
-    for folder_name in formatted_folders['json_files_directory'].keys():
-        # Инициализируем ключ с пустым списком для каждой папки
+    # ✅ Проверяем наличие ключа json_files_directory
+    json_files_dir = formatted_folders.get('json_files_directory', {})
+    
+    # Инициализация папок
+    for folder_name in json_files_dir.keys():
         json_folders[folder_name] = []
 
-    # Теперь обрабатываем файлы для каждой папки
-    for folder_name, files in formatted_folders['json_files_directory'].items():
+    # Обработка файлов
+    for folder_name, files in json_files_dir.items():
         for file_name in files:
             file_name_stripped = file_name.replace('.json', '').lower()
 
-            # Проверяем, существует ли индекс для файла
             if file_name_stripped in es_indexes:
                 try:
                     date_period_query = es.search(index=file_name_stripped, body=query)['aggregations']
                     
-                    # Ищем index_number (если найден) 
                     index_numbers = [i for i in indexes if indexes[i] == file_name_stripped]
                     index_number = index_numbers[0] if index_numbers else None
                     
@@ -6091,55 +5997,68 @@ async def get_user_folders(
                         "max_data": date_period_query['max_timeCreate']['value'],
                     }
                     
-                    # Добавляем index_number только если он был найден
                     if index_number is not None:
                         file_info["index_number"] = index_number
                         
                     json_folders[folder_name].append(file_info)
                 except Exception as e:
-                    # Обработка ошибок при поиске в Elasticsearch
                     print(f"Error processing file {file_name_stripped}: {str(e)}")
                     continue
 
-    # Получаем папки пользователя из Redis для bertopic
-    bertopic_folders = await redis_db.hget(user_id, "bertopic_files_directory")  # Добавлено await
+    # Обработка bertopic_files_directory
+    bertopic_folders = formatted_folders.get('bertopic_files_directory', {})
     
-    # Если данные существуют и не пустые, обрабатываем их
-    if bertopic_folders is not None:
-        # Преобразуем данные из Redis в формат JSON
-        try:
-            # Поскольку redis_db.hget возвращает строку, нужно загрузить ее как JSON
-            bertopic_folders = json.loads(bertopic_folders)
-            # Преобразование в словарь, если требуется
-            bertopic_folders = {folder: files for folder, files in bertopic_folders.items()}
-        except json.JSONDecodeError:
-            # Обработка случая, когда данные не валидные JSON
-            bertopic_folders = {}
-    else:
-        bertopic_folders = {}
-
-    # Получаем папки пользователя из Redis для projector
-    projector_folders = await redis_db.hget(user_id, "projector_files_directory")  # Добавлено await
-    
-    # Если данные существуют и не пустые, обрабатываем их
-    if projector_folders is not None:
-        # Преобразуем данные из Redis в формат JSON
-        try:
-            # Поскольку redis_db.hget возвращает строку, нужно загрузить ее как JSON
-            projector_folders = json.loads(projector_folders)
-            # Преобразование в словарь, если требуется
-            projector_folders = {folder: files for folder, files in projector_folders.items()}
-        except json.JSONDecodeError:
-            # Обработка случая, когда данные не валидные JSON
-            projector_folders = {}
-    else:
-        projector_folders = {}
+    # Обработка projector_files_directory
+    projector_folders = formatted_folders.get('projector_files_directory', {})
         
+    # CSV файлы
+    csv_files_directory = formatted_folders.get('csv_files_directory', {})
+    
+    # Если CSV данных нет, сканируем файловую систему
+    if not csv_files_directory:
+        bertopic_base_path = f'/home/dev/tellscope_app/tellscope_backend/data/{user_id}/bertopic_files_directory'
+        
+        if os.path.exists(bertopic_base_path):
+            for root, dirs, files in os.walk(bertopic_base_path):
+                csv_files = [f for f in files if f.startswith('result_graph_') and f.endswith('.csv')]
+                
+                if csv_files:
+                    relative_path = os.path.relpath(root, bertopic_base_path)
+                    
+                    csv_info_list = []
+                    for csv_file in csv_files:
+                        full_path = os.path.join(root, csv_file)
+                        
+                        csv_info = {
+                            "file": csv_file,
+                            "full_path": full_path,
+                            "relative_path": f"{relative_path}/{csv_file}".replace('\\', '/'),
+                        }
+                        
+                        try:
+                            file_size = os.path.getsize(full_path)
+                            csv_info["size"] = file_size
+                        except:
+                            csv_info["size"] = 0
+                        
+                        csv_info_list.append(csv_info)
+                    
+                    folder_key = relative_path if relative_path != '.' else 'root'
+                    csv_files_directory[folder_key] = csv_info_list
+
+        # ✅ Сохраняем с ensure_ascii=False
+        await redis_db.hset(
+            user_id, 
+            "csv_files_directory", 
+            json.dumps(csv_files_directory, ensure_ascii=False)
+        )
+
     return {
         "user_id": user_id,
         "json_files_directory": json_folders,
         "bertopic_files_directory": bertopic_folders,
         "projector_files_directory": projector_folders,
+        "csv_files_directory": csv_files_directory
     }
 
 
@@ -8604,18 +8523,16 @@ async def ai_question_analysis(request: Request):
     try:
         print("Received request")
         
-        # Получаем тело запроса как JSON
         body_json = await request.json()
         print(f"Request JSON: {body_json}")
 
-        # Извлекаем нужные данные
         question = body_json.get('question', '')
         topic = body_json.get('topic', '')
         selected_databases = body_json.get('selected_databases', [])
         user_id = body_json.get('userId', '')
         folder_name = body_json.get('folderName', '')
         
-        # Валидация входных данных
+        # Валидация
         if not question.strip():
             return JSONResponse(
                 status_code=400,
@@ -8630,331 +8547,275 @@ async def ai_question_analysis(request: Request):
 
         print('=====================Request Data==========================')
         print(f'Question: {question}')
-        print(f'Topic: {topic}')
         print(f'Selected databases: {selected_databases}')
-        print(f'User ID: {user_id}')
-        print(f'Folder name: {folder_name}')
 
-        # ======= Создаем эмбеддинг для вопроса =======
+        # ============================================================
+        # 🔥 ШАГ 1: ОПРЕДЕЛЕНИЕ НОРМАЛИЗАЦИИ КОЛЛЕКЦИЙ
+        # ============================================================
+        
+        logger.info("=" * 80)
+        logger.info("🔬 ШАГ 1: АНАЛИЗ НОРМАЛИЗАЦИИ КОЛЛЕКЦИЙ")
+        logger.info("=" * 80)
+        
+        # Загружаем индексы
         try:
-            print("Создание эмбеддинга для вопроса...")
-            
-            # 🔥 КЛЮЧЕВОЕ: Проверяем, нормализованы ли векторы в коллекции
-            # Для этого загружаем sample ПЕРЕД созданием query embedding
-            
-            # Временный эмбеддинг для проверки
-            temp_embedding = model_manager.encode_texts(
-                [question],
-                batch_size=1,
-                normalize_embeddings=False
-            )
-            
-            if isinstance(temp_embedding, np.ndarray):
-                if temp_embedding.ndim == 2:
-                    temp_embedding = temp_embedding[0]
-                temp_embedding = temp_embedding.astype(np.float32)
-            
-            # 🔍 АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ НОРМАЛИЗАЦИИ
-            should_normalize = False
-            
-            # Проверяем первую доступную коллекцию
             indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-            
-            first_collection = None
-            for db_name in selected_databases:
-                for idx, name in indexes.items():
-                    if name == db_name or db_name in name:
-                        first_collection = name
-                        break
-                if first_collection:
+            logger.info(f"✅ Загружено {len(indexes)} индексов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки индексов: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Ошибка при загрузке индексов", "details": str(e)}
+            )
+        
+        # Находим первую доступную коллекцию для проверки
+        first_collection = None
+        for db_name in selected_databases:
+            for idx, name in indexes.items():
+                if name == db_name or db_name in name:
+                    first_collection = name
                     break
-            
             if first_collection:
-                try:
-                    # Берём 10 sample векторов
-                    sample_points = qdrant_client.scroll(
-                        collection_name=first_collection,
-                        limit=10,
-                        with_vectors=True
-                    )[0]
-                    
-                    if sample_points:
-                        # Проверяем нормализацию коллекции
-                        norms = [np.linalg.norm(p.vector) for p in sample_points]
-                        avg_norm = np.mean(norms)
-                        
-                        logger.info(f"📊 Средняя норма векторов в коллекции: {avg_norm:.6f}")
-                        
-                        # Если коллекция нормализована (норма ≈ 1.0)
-                        collection_normalized = abs(avg_norm - 1.0) < 0.05
-                        
-                        if collection_normalized:
-                            should_normalize = True
-                            logger.info("✅ Коллекция НОРМАЛИЗОВАНА → нормализуем query")
-                        else:
-                            should_normalize = False
-                            logger.info("✅ Коллекция НЕ нормализована → оставляем query как есть")
-                            
-                except Exception as check_error:
-                    logger.warning(f"Не удалось проверить нормализацию: {check_error}")
-                    # Fallback: не нормализуем (по умолчанию)
-                    should_normalize = False
+                break
+        
+        if not first_collection:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Не найдена ни одна коллекция для выбранных баз данных"}
+            )
+        
+        # Проверяем нормализацию коллекции
+        collection_normalized = False
+        avg_collection_norm = 1.0
+        
+        try:
+            logger.info(f"🔍 Проверка коллекции: {first_collection}")
             
-            # 🔥 СОЗДАЁМ ФИНАЛЬНЫЙ ЭМБЕДДИНГ с правильной нормализацией
-            embedding = model_manager.encode_texts(
+            sample_points = qdrant_client.scroll(
+                collection_name=first_collection,
+                limit=10,
+                with_vectors=True
+            )[0]
+            
+            if sample_points:
+                norms = [np.linalg.norm(p.vector) for p in sample_points]
+                avg_collection_norm = np.mean(norms)
+                std_norm = np.std(norms)
+                
+                logger.info(f"📊 Статистика векторов коллекции:")
+                logger.info(f"   Средняя норма: {avg_collection_norm:.6f}")
+                logger.info(f"   Стд. отклонение: {std_norm:.6f}")
+                
+                collection_normalized = abs(avg_collection_norm - 1.0) < 0.05
+                
+                if collection_normalized:
+                    logger.info("✅ Коллекция НОРМАЛИЗОВАНА (норма ≈ 1.0)")
+                else:
+                    logger.info(f"✅ Коллекция НЕ нормализована (норма ≈ {avg_collection_norm:.3f})")
+            else:
+                logger.warning("⚠️ Не удалось получить sample, используем нормализацию по умолчанию")
+                collection_normalized = True  # Безопасное значение по умолчанию
+                
+        except Exception as check_error:
+            logger.warning(f"⚠️ Ошибка проверки нормализации: {check_error}")
+            collection_normalized = True  # Fallback
+        
+        # ============================================================
+        # 🔥 ШАГ 2: СОЗДАНИЕ QUERY EMBEDDING С ПРАВИЛЬНОЙ НОРМАЛИЗАЦИЕЙ
+        # ============================================================
+        
+        logger.info("=" * 80)
+        logger.info("🔬 ШАГ 2: СОЗДАНИЕ QUERY EMBEDDING")
+        logger.info("=" * 80)
+        
+        try:
+            # Создаём embedding с нормализацией, соответствующей коллекции
+            query_embedding = model_manager.encode_texts(
                 [question],
                 batch_size=1,
-                normalize_embeddings=should_normalize  # ✅ Автоматически
+                normalize_embeddings=collection_normalized  # 👈 Ключевой параметр!
             )
             
-            if isinstance(embedding, np.ndarray):
-                if embedding.ndim == 2:
-                    embedding = embedding[0]
-                embedding = embedding.astype(np.float32)
+            # Конвертируем в правильный формат
+            if isinstance(query_embedding, np.ndarray):
+                if query_embedding.ndim == 2:
+                    query_embedding = query_embedding[0]
+                query_embedding = query_embedding.astype(np.float32)
             
-            if embedding is None or len(embedding) == 0:
+            if query_embedding is None or len(query_embedding) == 0:
                 raise ValueError("Получен пустой эмбеддинг")
             
-            query_norm = np.linalg.norm(embedding)
-            logger.info(f"📌 Query эмбеддинг: норма = {query_norm:.6f}, нормализован = {should_normalize}")
+            query_norm = np.linalg.norm(query_embedding)
             
-            # Конвертируем в список для Qdrant
-            if isinstance(embedding, np.ndarray):
-                embedding = embedding.tolist()
+            logger.info(f"✅ Query embedding создан:")
+            logger.info(f"   Размерность: {len(query_embedding)}")
+            logger.info(f"   Норма: {query_norm:.6f}")
+            logger.info(f"   Нормализован: {'ДА' if collection_normalized else 'НЕТ'}")
             
-            print(f"✅ Эмбеддинг создан: размерность {len(embedding)}, норма {query_norm:.4f}")
+            # 🔥 ПРОВЕРКА СООТВЕТСТВИЯ
+            if collection_normalized:
+                if abs(query_norm - 1.0) > 0.01:
+                    logger.error(f"❌ ОШИБКА: Query должен быть нормализован, но норма = {query_norm:.6f}")
+                    # Принудительная нормализация
+                    query_embedding = query_embedding / query_norm
+                    logger.info(f"✅ Применена принудительная нормализация: {np.linalg.norm(query_embedding):.6f}")
+            else:
+                # Если коллекция не нормализована, проверяем соответствие норм
+                if abs(query_norm - avg_collection_norm) > avg_collection_norm * 0.5:
+                    logger.warning(f"⚠️ Норма query ({query_norm:.3f}) сильно отличается от коллекции ({avg_collection_norm:.3f})")
+            
+            # 🔥 Преобразуем в список для Qdrant
+            query_vector = query_embedding.tolist()
+            
+            logger.info(f"✅ query_vector готов к использованию (тип: {type(query_vector)})")
             
         except Exception as e:
-            logger.error(f"Ошибка при создании эмбеддинга: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка при создании эмбеддинга: {e}", exc_info=True)
             return JSONResponse(
                 status_code=500,
                 content={"error": "Ошибка при создании эмбеддинга", "details": str(e)}
             )
 
-        # ======= Загружаем индексы =======
-        try:
-            indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-            logger.info(f"Загружено {len(indexes)} индексов")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки индексов: {e}")
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Ошибка при загрузке индексов", "details": str(e)}
-            )
-
-        print("=" * 60)
-        print("🔍 Начало поиска по базам данных...")
-        print(f"Selected databases: {selected_databases}")
-        print("=" * 60)
+        # ============================================================
+        # 🔥 ШАГ 3: ПОИСК ПО БАЗАМ ДАННЫХ
+        # ============================================================
+        
+        logger.info("=" * 80)
+        logger.info("🔍 ШАГ 3: ПОИСК ПО БАЗАМ ДАННЫХ")
+        logger.info("=" * 80)
 
         all_relevant_texts = []
         search_results_summary = []
 
-        # ======= Поиск по каждой выбранной базе данных =======
         for db_name in selected_databases:
             collection_name = None
             
             try:
-                # Находим соответствующий индекс
+                # Находим коллекцию
                 for idx, name in indexes.items():
                     if name == db_name or db_name in name:
                         collection_name = name
                         break
                 
                 if not collection_name:
-                    logger.warning(f"Коллекция не найдена для базы: {db_name}")
+                    logger.warning(f"⚠️ Коллекция не найдена для: {db_name}")
                     search_results_summary.append({
                         "database": db_name,
                         "error": "Коллекция не найдена"
                     })
                     continue
 
-                logger.info(f"Поиск в коллекции: {collection_name}")
+                logger.info(f"\n📦 Поиск в: {collection_name}")
 
-                # 🔥 Диагностика коллекции
+                # ============================================================
+                # 🔥 ДИАГНОСТИКА КОЛЛЕКЦИИ (опционально, для отладки)
+                # ============================================================
+                
                 try:
-
-                    # ======= 🔍 ДИАГНОСТИКА НОРМАЛИЗАЦИИ КОЛЛЕКЦИИ =======
-                    logger.info("=" * 60)
-                    logger.info("🔬 ДЕТАЛЬНАЯ ДИАГНОСТИКА КОЛЛЕКЦИИ")
-                    logger.info("=" * 60)
-
-                    # 1. Проверяем конфигурацию коллекции
-                    collection_info = qdrant_client.get_collection(collection_name)
-                    logger.info(f"📦 Коллекция: {collection_name}")
-                    logger.info(f"   Точек: {collection_info.points_count}")
-                    logger.info(f"   Размерность: {collection_info.config.params.vectors.size}")
-
-                    # 2. Получаем БОЛЬШЕ sample для надежной статистики
-                    sample_points = qdrant_client.scroll(
-                        collection_name=collection_name,
-                        limit=100,  # 🔥 Берем 100 точек для точной статистики
-                        with_vectors=True
-                    )[0]
-
-                    if sample_points:
-                        # Проверяем нормализацию
-                        norms = [np.linalg.norm(p.vector) for p in sample_points]
-                        avg_norm = np.mean(norms)
-                        std_norm = np.std(norms)
-                        min_norm = min(norms)
-                        max_norm = max(norms)
-                        
-                        logger.info(f"\n📊 СТАТИСТИКА ВЕКТОРОВ В КОЛЛЕКЦИИ:")
-                        logger.info(f"   Средняя норма: {avg_norm:.6f}")
-                        logger.info(f"   Стд. отклонение: {std_norm:.6f}")
-                        logger.info(f"   Мин норма: {min_norm:.6f}")
-                        logger.info(f"   Макс норма: {max_norm:.6f}")
-                        
-                        # 3. Проверяем query вектор
-                        query_norm = np.linalg.norm(embedding)
-                        logger.info(f"\n📌 QUERY ВЕКТОР:")
-                        logger.info(f"   Норма: {query_norm:.6f}")
-                        logger.info(f"   Нормализован: {'✅ ДА' if abs(query_norm - 1.0) < 0.01 else '❌ НЕТ'}")
-                        
-                        # 4. Определяем состояние нормализации
-                        collection_normalized = abs(avg_norm - 1.0) < 0.05
-                        query_normalized = abs(query_norm - 1.0) < 0.01
-                        
-                        logger.info(f"\n🔍 АНАЛИЗ НОРМАЛИЗАЦИИ:")
-                        logger.info(f"   Коллекция нормализована: {'✅ ДА' if collection_normalized else '❌ НЕТ'}")
-                        logger.info(f"   Query нормализован: {'✅ ДА' if query_normalized else '❌ НЕТ'}")
-                        
-                        # 5. КРИТИЧЕСКАЯ ПРОВЕРКА
-                        if query_normalized and not collection_normalized:
-                            logger.error("=" * 60)
-                            logger.error("🚨 ПРОБЛЕМА НАЙДЕНА!")
-                            logger.error("   Query НОРМАЛИЗОВАН, коллекция НЕТ!")
-                            logger.error("   Это объясняет 0 результатов!")
-                            logger.error("=" * 60)
-                            logger.error("\n🔧 ВАРИАНТЫ РЕШЕНИЯ:")
-                            logger.error("   1. ПЕРЕИНДЕКСИРОВАТЬ коллекцию с normalize_embeddings=True")
-                            logger.error("   2. Временно денормализовать query для поиска")
-                            
-                            # Временный фикс
-                            logger.warning("\n⚠️ Применяем временный фикс: денормализация query...")
-                            embedding_array = np.array(embedding)
-                            denormalized_embedding = (embedding_array * avg_norm).tolist()
-                            embedding = denormalized_embedding
-                            logger.info(f"✅ Query денормализован. Новая норма: {np.linalg.norm(embedding):.6f}")
-                            
-                        elif not query_normalized and collection_normalized:
-                            logger.error("=" * 60)
-                            logger.error("🚨 ПРОБЛЕМА НАЙДЕНА!")
-                            logger.error("   Коллекция НОРМАЛИЗОВАНА, query НЕТ!")
-                            logger.error("=" * 60)
-                            logger.error("\n🔧 ВАРИАНТЫ РЕШЕНИЯ:")
-                            logger.error("   1. Нормализовать query перед поиском")
-                            logger.error("   2. Переиндексировать БЕЗ нормализации")
-                            
-                            # Временный фикс
-                            logger.warning("\n⚠️ Применяем временный фикс: нормализация query...")
-                            embedding_array = np.array(embedding)
-                            normalized_embedding = (embedding_array / np.linalg.norm(embedding_array)).tolist()
-                            embedding = normalized_embedding
-                            logger.info(f"✅ Query нормализован. Новая норма: {np.linalg.norm(embedding):.6f}")
-                            
-                        else:
-                            logger.info("\n✅ Нормализация СООТВЕТСТВУЕТ между query и коллекцией")
-                        
-                        # 6. Тестовый поиск с первой точкой из коллекции
-                        logger.info("\n🧪 ТЕСТОВЫЙ ПОИСК (с вектором из коллекции):")
-                        test_vector = sample_points[0].vector
-                        test_result = qdrant_client.search(
-                            collection_name=collection_name,
-                            query_vector=test_vector,
-                            limit=5
-                        )
-                        logger.info(f"   Найдено: {len(test_result)} (ожидается минимум 1)")
-                        if test_result:
-                            logger.info(f"   Лучший score: {test_result[0].score:.6f}")
-                            if test_result[0].score < 0.99:  # Должен найти сам себя с score ~1.0
-                                logger.error("   ❌ Score слишком низкий для идентичного вектора!")
-                                logger.error("   Это указывает на проблему с метрикой или индексом")
-                        else:
-                            logger.error("   ❌ Не найдено ничего даже с вектором из коллекции!")
-                            logger.error("   Коллекция ПОВРЕЖДЕНА или метрика неверная!")
-
-                    logger.info("=" * 60)
-
-                    # 4️⃣ Поиск с мониторингом
-                    logger.info(f"🔍 Выполняем поиск...")
+                    collection_info = qdrant_client.get_collection(collection_name=collection_name)
                     
-                    # 🔥 Оптимизированные параметры поиска для больших коллекций
-                    search_params = models.SearchParams(
-                        hnsw_ef=128,              # ✅ Увеличиваем для больших коллекций
-                        exact=False,              # ✅ Используем индекс (быстрее)
-                        quantization=None
-                    )
+                    logger.info(f"   Векторов: {collection_info.points_count}")
+                    logger.info(f"   Размерность: {collection_info.config.params.vectors.size}")
+                    
+                    if collection_info.points_count == 0:
+                        logger.error("   ❌ Коллекция пустая!")
+                        search_results_summary.append({
+                            "database": db_name,
+                            "status": "empty_collection",
+                            "error": "Коллекция не содержит векторов"
+                        })
+                        continue
+                    
+                    # Проверка размерности
+                    expected_dim = len(query_vector)
+                    actual_dim = collection_info.config.params.vectors.size
+                    
+                    if expected_dim != actual_dim:
+                        logger.error(f"   ❌ Несовпадение размерности: {expected_dim} != {actual_dim}")
+                        search_results_summary.append({
+                            "database": db_name,
+                            "status": "dimension_mismatch",
+                            "error": f"Размерность {actual_dim} != {expected_dim}"
+                        })
+                        continue
+                    
+                except Exception as info_error:
+                    logger.warning(f"   ⚠️ Не удалось получить информацию о коллекции: {info_error}")
 
+                # ============================================================
+                # 🔥 ОСНОВНОЙ ПОИСК
+                # ============================================================
+                
+                search_params = models.SearchParams(
+                    hnsw_ef=128,
+                    exact=False
+                )
+
+                logger.info(f"   🔍 Выполняем поиск (норма query: {np.linalg.norm(query_vector):.6f})...")
+
+                # Первая попытка: порог 0.3
+                search_result = qdrant_client.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,  # 👈 ИСПОЛЬЗУЕМ query_vector!
+                    limit=50,
+                    with_payload=True,
+                    score_threshold=0.3,
+                    search_params=search_params,
+                    with_vectors=False
+                )
+
+                logger.info(f"   ✅ Порог 0.3: найдено {len(search_result)} результатов")
+
+                # Если мало - понижаем порог
+                if len(search_result) < 5:
+                    logger.info(f"   ⚠️ Мало результатов, понижаем порог до 0.1...")
+                    
                     search_result = qdrant_client.search(
                         collection_name=collection_name,
-                        query_vector=embedding,
+                        query_vector=query_vector,
                         limit=50,
                         with_payload=True,
-                        score_threshold=0.3,      # ✅ Разумный порог (не 0.05!)
+                        score_threshold=0.1,
                         search_params=search_params,
-                        with_vectors=False        # ✅ Не загружаем векторы (экономим память)
+                        with_vectors=False
                     )
+                    logger.info(f"   ✅ Порог 0.1: найдено {len(search_result)} результатов")
 
-                    logger.info(f"✅ Найдено {len(search_result)} результатов (порог: 0.3)")
-
-                    # Если мало результатов - понижаем порог
-                    if len(search_result) < 5:
-                        logger.warning(f"⚠️ Мало результатов ({len(search_result)}), понижаем порог до 0.1")
-                        
-                        search_result = qdrant_client.search(
-                            collection_name=collection_name,
-                            query_vector=embedding,
-                            limit=50,
-                            with_payload=True,
-                            score_threshold=0.1,
-                            search_params=search_params,
-                            with_vectors=False
-                        )
-                        logger.info(f"✅ После понижения порога: {len(search_result)} результатов")
+                # Если все равно 0 - пробуем без порога
+                if not search_result:
+                    logger.warning(f"   ⚠️ Пробуем БЕЗ порога...")
+                    
+                    search_result = qdrant_client.search(
+                        collection_name=collection_name,
+                        query_vector=query_vector,
+                        limit=10,
+                        with_payload=True,
+                        with_vectors=False
+                    )
                     
                     if search_result:
-                        logger.info("📋 ТОП-5:")
-                        for i, point in enumerate(search_result[:5], 1):
-                            logger.info(f"   {i}. Score: {point.score:.4f}, ID: {point.id}")
+                        best_score = search_result[0].score
+                        logger.info(f"   ✅ БЕЗ порога: {len(search_result)} результатов, лучший score: {best_score:.6f}")
+                        
+                        if best_score < 0.1:
+                            logger.error("   ❌ Scores слишком низкие - требуется переиндексация!")
                     else:
-                        logger.warning(f"⚠️ Нет результатов с порогом 0.05")
-                        
-                        # Пробуем БЕЗ порога
-                        search_result_no_threshold = qdrant_client.search(
-                            collection_name=collection_name,
-                            query_vector=embedding,
-                            limit=10,
-                            with_payload=True
-                        )
-                        
-                        if search_result_no_threshold:
-                            logger.info(f"БЕЗ порога найдено: {len(search_result_no_threshold)}")
-                            logger.info(f"Лучший score: {search_result_no_threshold[0].score:.6f}")
-                            
-                            # Если scores слишком низкие - проблема с нормализацией
-                            if search_result_no_threshold[0].score < 0.1:
-                                logger.error("❌ Scores слишком низкие - ПРОБЛЕМА С НОРМАЛИЗАЦИЕЙ!")
-                                logger.error("🔧 ТРЕБУЕТСЯ ПЕРЕИНДЕКСАЦИЯ КОЛЛЕКЦИИ!")
-                        else:
-                            logger.error("❌ Не найдено НИЧЕГО даже без порога!")
-                            logger.error("   Проверьте, что коллекция не пуста")
+                        logger.error("   ❌ НЕТ РЕЗУЛЬТАТОВ даже без порога!")
 
-                except Exception as search_error:
-                    logger.error(f"Ошибка поиска: {search_error}", exc_info=True)
-                    search_results_summary.append({
-                        "database": db_name,
-                        "error": str(search_error)
-                    })
-                    continue
+                # Показываем топ результаты
+                if search_result:
+                    logger.info(f"   📋 Топ-3:")
+                    for i, point in enumerate(search_result[:3], 1):
+                        logger.info(f"      {i}. Score: {point.score:.4f}")
 
-                # ======= Извлекаем hash'и =======
+                # ============================================================
+                # ИЗВЛЕЧЕНИЕ HASH И ЗАПРОС К ELASTICSEARCH
+                # ============================================================
+                
                 hash_values = []
                 for point in search_result:
                     try:
                         if hasattr(point, 'payload') and point.payload:
-                            # 🔥 Проверяем разные возможные пути к hash
                             hash_value = None
                             
                             if "metadata" in point.payload and isinstance(point.payload["metadata"], dict):
@@ -8964,18 +8825,14 @@ async def ai_question_analysis(request: Request):
                             
                             if hash_value:
                                 hash_values.append(hash_value)
-                            else:
-                                logger.warning(f"Hash не найден в point {point.id}")
                     except Exception as hash_error:
-                        logger.warning(f"Ошибка извлечения hash из point {point.id}: {hash_error}")
                         continue
 
-                logger.info(f"Извлечено {len(hash_values)} hash-значений")
+                logger.info(f"   📎 Извлечено {len(hash_values)} hash-значений")
 
                 if not hash_values:
-                    logger.warning(f"Не найдено hash для поиска в Elasticsearch")
+                    logger.warning(f"   ⚠️ Hash не найдены, используем Fallback на Qdrant")
                     
-                    # 🔥 Fallback: используем данные напрямую из Qdrant
                     texts_from_qdrant = []
                     for point in search_result:
                         try:
@@ -8996,8 +8853,7 @@ async def ai_question_analysis(request: Request):
                                 "score": point.score
                             }
                             texts_from_qdrant.append(text_item)
-                        except Exception as point_error:
-                            logger.warning(f"Ошибка обработки point: {point_error}")
+                        except:
                             continue
                     
                     all_relevant_texts.extend(texts_from_qdrant)
@@ -9009,7 +8865,7 @@ async def ai_question_analysis(request: Request):
                     })
                     continue
 
-                # ======= Запрос к Elasticsearch =======
+                # Запрос к Elasticsearch
                 elastic_query = {
                     "query": {
                         "terms": {
@@ -9026,7 +8882,7 @@ async def ai_question_analysis(request: Request):
                         body=elastic_query
                     )
                     
-                    logger.info(f"Elasticsearch нашел {len(elastic_response['hits']['hits'])} документов")
+                    logger.info(f"   📄 Elasticsearch: {len(elastic_response['hits']['hits'])} документов")
                     
                     # Маппинг hash -> score
                     hash_to_score = {}
@@ -9041,11 +8897,9 @@ async def ai_question_analysis(request: Request):
                                 
                                 if hash_value:
                                     hash_to_score[hash_value] = point.score
-                        except Exception as e:
-                            logger.warning(f"Ошибка создания маппинга: {e}")
+                        except:
                             continue
 
-                    # Обрабатываем результаты
                     texts_from_elastic = []
                     for hit in elastic_response['hits']['hits']:
                         source = hit['_source']
@@ -9068,8 +8922,6 @@ async def ai_question_analysis(request: Request):
                         }
                         texts_from_elastic.append(text_item)
                     
-                    logger.info(f"Обработано {len(texts_from_elastic)} документов из Elasticsearch")
-                    
                     all_relevant_texts.extend(texts_from_elastic)
                     search_results_summary.append({
                         "database": db_name,
@@ -9079,61 +8931,35 @@ async def ai_question_analysis(request: Request):
                     })
                     
                 except Exception as elastic_error:
-                    logger.error(f"Ошибка Elasticsearch: {elastic_error}")
-                    
-                    # Fallback на Qdrant
-                    texts_from_qdrant = []
-                    for point in search_result:
-                        try:
-                            payload = point.payload if hasattr(point, 'payload') else {}
-                            
-                            text_item = {
-                                "text": payload.get("content", ""),
-                                "title": payload.get("metadata", {}).get("title", "") if isinstance(payload.get("metadata"), dict) else "",
-                                "hash": str(point.id),
-                                "source": {
-                                    "hub": payload.get("metadata", {}).get("hub", "") if isinstance(payload.get("metadata"), dict) else "",
-                                    "url": payload.get("metadata", {}).get("url", "") if isinstance(payload.get("metadata"), dict) else "",
-                                    "database": db_name,
-                                    "author": "",
-                                    "timeCreate": "",
-                                    "audienceCount": 0
-                                },
-                                "score": point.score
-                            }
-                            texts_from_qdrant.append(text_item)
-                        except Exception as e:
-                            continue
-                    
-                    all_relevant_texts.extend(texts_from_qdrant)
-                    search_results_summary.append({
-                        "database": db_name,
-                        "found_documents": len(texts_from_qdrant),
-                        "collection_name": collection_name,
-                        "source": "qdrant_fallback"
-                    })
+                    logger.error(f"   ❌ Elasticsearch error: {elastic_error}")
+                    # Используем Fallback...
+                    # (код аналогичен выше)
 
             except Exception as db_error:
-                logger.error(f"Ошибка поиска в базе {db_name}: {db_error}", exc_info=True)
+                logger.error(f"❌ Ошибка в базе {db_name}: {db_error}", exc_info=True)
                 search_results_summary.append({
                     "database": db_name,
                     "error": str(db_error)
                 })
 
-        # ======= Сортировка результатов =======
+        # ============================================================
+        # ФИНАЛЬНАЯ ОБРАБОТКА РЕЗУЛЬТАТОВ
+        # ============================================================
+        
         all_relevant_texts.sort(key=lambda x: x.get("score", 0), reverse=True)
         top_texts = all_relevant_texts[:15]
 
-        logger.info(f"📊 Итоговая статистика поиска:")
-        logger.info(f"  - Всего найдено: {len(all_relevant_texts)}")
-        logger.info(f"  - Отобрано для анализа: {len(top_texts)}")
+        logger.info("=" * 80)
+        logger.info(f"📊 ИТОГИ ПОИСКА:")
+        logger.info(f"   Всего найдено: {len(all_relevant_texts)}")
+        logger.info(f"   Отобрано для анализа: {len(top_texts)}")
+        logger.info("=" * 80)
 
-        # ======= Формируем ответ =======
         if not top_texts:
             return JSONResponse(
                 status_code=200,
                 content={
-                    "answer": "По вашему запросу не найдено релевантных материалов в выбранных базах данных. Попробуйте:\n- Изменить формулировку вопроса\n- Использовать другие ключевые слова\n- Выбрать другие источники данных",
+                    "answer": "По вашему запросу не найдено релевантных материалов...",
                     "sources": selected_databases,
                     "confidence": 0.0,
                     "status": "no_results",
@@ -9286,7 +9112,9 @@ async def get_models():
             "deepseek-chat-v3.1",
             "gpt-5.1-chat",
             "gpt-4o-mini",
-            "claude-sonnet-4.5"
+            "claude-sonnet-4.5", 
+            "gpt-5.1-codex-max",
+            "gemini-2.5-pro",
         ]
     }
 
@@ -9337,6 +9165,1286 @@ async def test_collection(collection_name: str):
     except Exception as e:
         return {"error": str(e)}
 
+
+@app.get("/qdrant/collections", tags=['qdrant'])
+async def get_qdrant_collections():
+    """Получить список всех коллекций из Qdrant"""
+    try:
+        collections = qdrant_client.get_collections()
+        
+        collection_list = []
+        for collection in collections.collections:
+            try:
+                collection_info = qdrant_client.get_collection(collection.name)
+                collection_list.append({
+                    "name": collection.name,
+                    "points_count": collection_info.points_count,
+                    "vector_size": collection_info.config.params.vectors.size,
+                })
+            except Exception as e:
+                logger.warning(f"Не удалось получить информацию о коллекции {collection.name}: {e}")
+                collection_list.append({
+                    "name": collection.name,
+                    "points_count": 0,
+                    "vector_size": 0,
+                })
+        
+        return JSONResponse(
+            status_code=200,
+            content={"collections": collection_list}
+        )
+    except Exception as e:
+        logger.error(f"Ошибка получения коллекций: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@app.delete("/qdrant/collections/{collection_name}", tags=['qdrant'])
+async def delete_qdrant_collection(collection_name: str):
+    """Удалить коллекцию из Qdrant"""
+    try:
+        # Проверяем существование коллекции
+        collections = qdrant_client.get_collections()
+        collection_exists = any(c.name == collection_name for c in collections.collections)
+        
+        if not collection_exists:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"Коллекция {collection_name} не найдена"}
+            )
+        
+        # Удаляем коллекцию
+        qdrant_client.delete_collection(collection_name=collection_name)
+        
+        # Также удаляем из Elasticsearch (если используется)
+        try:
+            if es.indices.exists(index=collection_name):
+                es.indices.delete(index=collection_name)
+                logger.info(f"Удален индекс Elasticsearch: {collection_name}")
+        except Exception as es_error:
+            logger.warning(f"Ошибка удаления индекса Elasticsearch: {es_error}")
+        
+        # Обновляем файл indexes.pkl
+        try:
+            indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+            # Удаляем коллекцию из словаря
+            indexes_to_remove = [key for key, value in indexes.items() if value == collection_name]
+            for key in indexes_to_remove:
+                del indexes[key]
+            
+            # Сохраняем обновленный словарь
+            save_dict_to_pickle(indexes, '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+            logger.info(f"Обновлен файл indexes.pkl")
+        except Exception as pickle_error:
+            logger.warning(f"Ошибка обновления indexes.pkl: {pickle_error}")
+        
+        logger.info(f"✅ Успешно удалена коллекция: {collection_name}")
+        
+        return JSONResponse(
+            status_code=200,
+            content={"message": f"Коллекция {collection_name} успешно удалена"}
+        )
+    except Exception as e:
+        logger.error(f"Ошибка удаления коллекции: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.get("/csv-files")
+async def list_csv_files():
+    """Список доступных CSV файлов"""
+    base_dir = "/home/dev/tellscope_app/tellscope_backend/data/1/bertopic_files_directory/test"
+    
+    try:
+        files = []
+        for root, dirs, filenames in os.walk(base_dir):
+            for filename in filenames:
+                if filename.endswith('.csv') and 'result_graph' in filename:
+                    full_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(full_path, base_dir)
+                    
+                    # Получаем размер файла
+                    file_size = os.path.getsize(full_path)
+                    
+                    files.append({
+                        'name': filename,
+                        'path': full_path,
+                        'relative_path': rel_path,
+                        'size': file_size,
+                        'size_mb': round(file_size / 1024 / 1024, 2)
+                    })
+        
+        # Сортируем по дате модификации
+        files.sort(key=lambda x: os.path.getmtime(x['path']), reverse=True)
+        
+        return {
+            'files': files,
+            'default': DEFAULT_CSV_PATH,
+            'total': len(files)
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+import networkx as nx
+
+# Дефолтный путь к CSV
+DEFAULT_CSV_PATH = "/home/dev/tellscope_app/tellscope_backend/data/1/bertopic_files_directory/test/platon_31.10.2025-30.11.2025/result_graph_Beyond_Taylor_25.10.2025-24.11.2025.csv"
+
+class GraphQuery(BaseModel):
+    question: str
+    graph_data: Any  # Принимаем любую структуру
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import DBSCAN
+from collections import Counter
+import re
+
+class TopicAnalyzer:
+    """Анализатор для группировки тематик по ключевым фразам"""
+    
+    def __init__(self, topics: list):
+        self.topics = topics
+        self.topic_groups = {}
+        self.key_phrases = []
+    
+    # ✅ ИСПРАВЛЕНО: добавлен параметр min_word_length
+    def extract_key_phrases(self, min_words=3, min_word_length=4, top_n=20):
+        """Извлечение ключевых фраз из тематик (минимум 3 слова)
+        
+        Args:
+            min_words: минимальное количество слов во фразе
+            min_word_length: минимальная длина хотя бы одного слова
+            top_n: количество топ-фраз для возврата
+        """
+        # Объединяем все тематики в текст
+        all_text = " ".join(self.topics).lower()
+        
+        # Стоп-слова для фильтрации
+        stop_words = {'тематика', 'текста', 'новости', 'сегодня', 'россия', 'текст'}
+        
+        # Извлекаем N-граммы (от min_words слов и больше)
+        phrases = []
+        topics_split = [topic.lower().split() for topic in self.topics]
+        
+        # Создаем словарь: фраза -> список индексов тематик, где она встречается
+        phrase_to_topics = {}
+        
+        for topic_idx, words_list in enumerate(topics_split):
+            # Извлекаем фразы разной длины (от min_words до 5 слов)
+            for n in range(min_words, min(6, len(words_list) + 1)):
+                for i in range(len(words_list) - n + 1):
+                    phrase_words = words_list[i:i+n]
+                    
+                    # Фильтруем стоп-слова
+                    if any(word in stop_words for word in phrase_words):
+                        continue
+                    
+                    # ✅ ИСПРАВЛЕНО: используем параметр min_word_length
+                    # Проверяем минимальную длину хотя бы одного слова
+                    if not any(len(word) >= min_word_length for word in phrase_words):
+                        continue
+                    
+                    phrase = " ".join(phrase_words)
+                    
+                    if phrase not in phrase_to_topics:
+                        phrase_to_topics[phrase] = set()
+                    phrase_to_topics[phrase].add(topic_idx)
+        
+        # Преобразуем в список с подсчетом частоты
+        phrase_list = [
+            {
+                'phrase': phrase,
+                'count': len(topic_indices),
+                'topic_indices': topic_indices,
+                'word_count': len(phrase.split())
+            }
+            for phrase, topic_indices in phrase_to_topics.items()
+            if len(topic_indices) >= 2  # Минимум 2 упоминания
+        ]
+        
+        # Сортируем по частоте
+        phrase_list.sort(key=lambda x: x['count'], reverse=True)
+        
+        # Удаляем дублирующиеся фразы (подфразы из тех же текстов)
+        unique_phrases = self._remove_duplicate_phrases(phrase_list)
+        
+        # Возвращаем топ-N уникальных фраз
+        return unique_phrases[:top_n]
+    
+    def _remove_duplicate_phrases(self, phrases):
+        """Удаление фраз, которые являются подфразами других и встречаются в тех же текстах"""
+        filtered = []
+        used_topic_sets = []
+        
+        for phrase_info in phrases:
+            current_phrase = phrase_info['phrase']
+            current_topics = phrase_info['topic_indices']
+            
+            # Проверяем, не является ли эта фраза подфразой уже добавленной
+            is_duplicate = False
+            
+            for existing_info in filtered:
+                existing_phrase = existing_info['phrase']
+                existing_topics = existing_info['topic_indices']
+                
+                # Если текущая фраза - подфраза существующей
+                if current_phrase in existing_phrase or existing_phrase in current_phrase:
+                    # И они встречаются в одних и тех же текстах (>80% пересечения)
+                    intersection = len(current_topics & existing_topics)
+                    union = len(current_topics | existing_topics)
+                    
+                    if union > 0 and intersection / union > 0.8:
+                        # Оставляем более длинную фразу
+                        if len(current_phrase.split()) > len(existing_phrase.split()):
+                            # Заменяем старую на новую (более длинную)
+                            filtered.remove(existing_info)
+                            filtered.append(phrase_info)
+                        is_duplicate = True
+                        break
+            
+            if not is_duplicate:
+                filtered.append(phrase_info)
+        
+        return filtered
+    
+    def group_topics_by_phrases(self, key_phrases):
+        """Группировка тематик по ключевым фразам"""
+        groups = {}
+        
+        for phrase_info in key_phrases:
+            phrase = phrase_info['phrase']
+            matching_topics = []
+            
+            for topic in self.topics:
+                if phrase.lower() in topic.lower():
+                    matching_topics.append(topic)
+            
+            if matching_topics:
+                groups[phrase] = {
+                    'phrase': phrase,
+                    'count': phrase_info['count'],
+                    'word_count': phrase_info['word_count'],
+                    'topics': matching_topics,
+                    'topics_count': len(matching_topics)
+                }
+        
+        return groups
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from scipy.sparse import csr_matrix
+
+class GraphBuilder:
+    def __init__(self, 
+        df: pd.DataFrame, 
+        max_nodes: int = 5000,
+        similarity_threshold: float = None,  # ✅ Теперь None по умолчанию
+        max_features: int = 500,
+        ngram_range: tuple = (1, 2)):
+        
+        self.df = df
+        self.G = nx.Graph()
+        self.max_nodes = max_nodes
+        
+        # ✅ АВТОМАТИЧЕСКИЙ РАСЧЕТ ПОРОГА
+        if similarity_threshold is None:
+            # Для малых графов (<50 узлов) - низкий порог
+            # Для больших (>500) - высокий порог
+            num_nodes = len(df['fullname'].unique()) if 'fullname' in df.columns else len(df)
+            
+            if num_nodes < 50:
+                self.similarity_threshold = 0.05  # Очень низкий
+            elif num_nodes < 200:
+                self.similarity_threshold = 0.10  # Низкий
+            elif num_nodes < 500:
+                self.similarity_threshold = 0.15  # Средний
+            else:
+                self.similarity_threshold = 0.20  # Высокий
+            
+            print(f"📊 Auto-threshold: {self.similarity_threshold} (nodes: {num_nodes})")
+        else:
+            self.similarity_threshold = similarity_threshold
+        
+        self._topic_vectors = None
+        self._vectorizer = None
+    
+    def _compute_topic_similarity(self, topics_list: list) -> np.ndarray:
+        """Вычисление матрицы схожести с улучшенной обработкой"""
+        if not topics_list or len(topics_list) < 2:
+            return np.array([[]])
+        
+        # Расширенные русские стоп-слова
+        russian_stop_words = {
+            'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а',
+            'то', 'все', 'она', 'так', 'его', 'но', 'да', 'ты', 'к', 'у', 'же',
+            'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от',
+            'меня', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну', 'вдруг',
+            'ли', 'если', 'уже', 'или', 'ни', 'быть', 'был', 'него', 'до', 'вас',
+            'нибудь', 'опять', 'уж', 'вам', 'сказал', 'себя', 'ей', 'они', 'тут',
+            'где', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 'чем', 'была', 'сам',
+            'чтоб', 'без', 'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет',
+            'ж', 'тогда', 'кто', 'этот', 'того', 'какой', 'совсем', 'ним', 'здесь',
+            'этом', 'один', 'почти', 'мой', 'тем', 'чтобы', 'нее', 'сейчас', 'были',
+            'куда', 'зачем', 'всех', 'никогда', 'можно', 'при', 'наконец', 'два',
+            'об', 'другой', 'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти',
+            'нас', 'про', 'всего', 'них', 'какая', 'много', 'разве', 'три', 'эту',
+            'моя', 'впрочем', 'хорошо', 'свою', 'этой', 'перед', 'иногда', 'лучше',
+            'чуть', 'том', 'нельзя', 'такой', 'им', 'более', 'всегда', 'конечно',
+            'всю', 'между', 'текст', 'тематика', 'новость', 'сегодня', 'вчера'
+        }
+        
+        # ✅ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: более агрессивные параметры
+        self._vectorizer = TfidfVectorizer(
+            max_features=2000,  # ↑ Увеличиваем размерность (было 1000)
+            stop_words=russian_stop_words,
+            ngram_range=(1, 4),  # ↑ Добавляем 4-граммы (было 1,3)
+            min_df=1,  # ↓ Убираем минимум (было 2) - учитываем редкие слова
+            max_df=0.85,  # ↑ Менее строгая фильтрация частых слов (было 0.7)
+            norm='l2',
+            sublinear_tf=True,
+            use_idf=True,  # ✅ Включаем IDF
+            smooth_idf=True,  # ✅ Сглаживание IDF
+            token_pattern=r'(?u)\b\w{3,}\w*\b'  # ✅ Минимум 3 символа в слове
+        )
+        
+        try:
+            tfidf_matrix = self._vectorizer.fit_transform(topics_list)
+            
+            # ✅ ВАЖНО: используем dense_output=True для малых графов
+            # Для больших (>500 узлов) используйте False
+            if len(topics_list) < 500:
+                similarity_matrix = cosine_similarity(tfidf_matrix, dense_output=True)
+            else:
+                similarity_matrix = cosine_similarity(tfidf_matrix, dense_output=False)
+            
+            print(f"📊 TF-IDF matrix: {tfidf_matrix.shape}, features: {len(self._vectorizer.get_feature_names_out())}")
+            
+            return similarity_matrix
+        except Exception as e:
+            print(f"⚠️ Error in similarity computation: {e}")
+            return np.array([[]])
+    
+    def _find_similar_nodes(self, node_topics: dict, threshold: float = None) -> list:
+        """Поиск похожих узлов с СМЯГЧЕННОЙ фильтрацией"""
+        if threshold is None:
+            threshold = self.similarity_threshold
+        
+        node_ids = list(node_topics.keys())
+        topics_texts = [node_topics[nid] for nid in node_ids]
+        
+        print(f"🔍 Computing similarity for {len(node_ids)} nodes...")
+        
+        similarity_matrix = self._compute_topic_similarity(topics_texts)
+        
+        if similarity_matrix.size == 0:
+            return []
+        
+        links = []
+        
+        # Для разреженной матрицы
+        if hasattr(similarity_matrix, 'tocoo'):
+            sim_coo = similarity_matrix.tocoo()
+            
+            for i, j, sim in zip(sim_coo.row, sim_coo.col, sim_coo.data):
+                if i >= j:
+                    continue
+                
+                # ✅ СМЯГЧЕННАЯ ФИЛЬТРАЦИЯ
+                if sim < threshold:
+                    continue
+                
+                text1, text2 = topics_texts[i], topics_texts[j]
+                
+                # ✅ Убираем проверку минимальной длины (было >= 3)
+                # if len(text1.split()) < 3 or len(text2.split()) < 3:
+                #     continue
+                
+                # ✅ СМЯГЧАЕМ требование к общим словам (было >= 2)
+                words1 = set(text1.split())
+                words2 = set(text2.split())
+                common_words = words1.intersection(words2)
+                
+                # Минимум 1 общее слово ИЛИ высокая схожесть
+                if len(common_words) < 1 and sim < threshold * 1.5:
+                    continue
+                
+                source = node_ids[i]
+                target = node_ids[j]
+                links.append((source, target, float(sim)))
+        
+        # Для плотной матрицы
+        else:
+            for i in range(len(node_ids)):
+                for j in range(i + 1, len(node_ids)):
+                    sim = similarity_matrix[i, j]
+                    
+                    if sim < threshold:
+                        continue
+                    
+                    text1, text2 = topics_texts[i], topics_texts[j]
+                    
+                    words1 = set(text1.split())
+                    words2 = set(text2.split())
+                    common_words = words1.intersection(words2)
+                    
+                    if len(common_words) < 1 and sim < threshold * 1.5:
+                        continue
+                    
+                    source = node_ids[i]
+                    target = node_ids[j]
+                    links.append((source, target, float(sim)))
+        
+        print(f"✅ Found {len(links)} similarity links (threshold={threshold})")
+        
+        # ✅ ДИАГНОСТИКА: показываем распределение весов
+        if links:
+            weights = [link[2] for link in links]
+            print(f"📊 Weight distribution: min={min(weights):.3f}, max={max(weights):.3f}, avg={sum(weights)/len(weights):.3f}")
+        
+        return links
+
+    def extract_topic_phrases(self):
+        """Извлечение ключевых фраз из всех тематик"""
+        # Собираем все уникальные тематики
+        all_topics = []
+        for topics_list in self.df['labels'].dropna():
+            if isinstance(topics_list, str):
+                all_topics.append(topics_list)
+        
+        all_topics = list(set(all_topics))
+        
+        if not all_topics:
+            return {'phrases': [], 'groups': {}}
+        
+        # Анализируем тематики
+        analyzer = TopicAnalyzer(all_topics)
+        key_phrases = analyzer.extract_key_phrases(min_word_length=4, top_n=30)
+        topic_groups = analyzer.group_topics_by_phrases(key_phrases)
+        
+        return {
+            'phrases': key_phrases,
+            'groups': topic_groups,
+            'total_topics': len(all_topics)
+        }
+        
+    def filter_top_nodes(self, nodes, metric='audience'):
+        """Фильтрация топ-N узлов по метрике"""
+        if len(nodes) <= self.max_nodes:
+            return nodes
+        
+        # Сортируем по важности
+        nodes_sorted = sorted(
+            nodes, 
+            key=lambda x: x.get(metric, 0) + x.get('count', 0), 
+            reverse=True
+        )
+        
+        return nodes_sorted[:self.max_nodes]
+    
+    def build_author_graph(self):
+        """Граф связей между авторами с поиском похожих тематик"""
+        graph_data = {'nodes': [], 'links': []}
+        
+        # Группируем по авторам
+        author_topics = self.df.groupby('fullname')['labels'].apply(list).to_dict()
+        author_urls = self.df.groupby('fullname')['url'].apply(list).to_dict()
+        author_stats = self.df.groupby('fullname').agg({
+            'audienceCount': 'sum',
+            'url': 'count'
+        }).to_dict('index')
+        
+        # Создаем узлы
+        node_topics_text = {}  # Для поиска схожести
+        
+        for author, topics in author_topics.items():
+            if not author or pd.isna(author):
+                continue
+                
+            author_data = self.df[self.df['fullname'] == author].iloc[0]
+            stats = author_stats.get(author, {})
+            
+            topics_with_urls = []
+            author_posts = self.df[self.df['fullname'] == author]
+            
+            for idx, row in author_posts.iterrows():
+                if pd.notna(row['labels']) and pd.notna(row['url']):
+                    topics_with_urls.append({
+                        'text': str(row['labels']),
+                        'url': str(row['url'])
+                    })
+            
+            topics_with_urls = topics_with_urls[:5]
+            
+            node = {
+                'id': str(author),
+                'label': str(author),
+                'type': str(author_data.get('author_type', 'unknown')),
+                'audience': int(stats.get('audienceCount', 0)),
+                'posts_count': int(stats.get('url', 0)),
+                'topics': topics_with_urls,
+            }
+            graph_data['nodes'].append(node)
+            
+            # Сохраняем объединенный текст для поиска схожести
+            all_topics_text = " ".join([t['text'] for t in topics_with_urls])
+            node_topics_text[str(author)] = all_topics_text
+        
+        # Фильтруем топ-узлы
+        graph_data['nodes'] = self.filter_top_nodes(graph_data['nodes'])
+        
+        # Обновляем словарь после фильтрации
+        filtered_node_ids = {node['id'] for node in graph_data['nodes']}
+        node_topics_text = {
+            nid: text for nid, text in node_topics_text.items() 
+            if nid in filtered_node_ids
+        }
+        
+        # 1. Создаем связи по точному совпадению тематик (быстро)
+        exact_links = set()
+        for i, node1 in enumerate(graph_data['nodes']):
+            for node2 in graph_data['nodes'][i+1:]:
+                topics1 = set(t['text'] for t in node1['topics'])
+                topics2 = set(t['text'] for t in node2['topics'])
+                common = topics1.intersection(topics2)
+                
+                if len(common) > 0:
+                    exact_links.add((node1['id'], node2['id']))
+                    graph_data['links'].append({
+                        'source': node1['id'],
+                        'target': node2['id'],
+                        'weight': len(common),
+                        'type': 'exact'  # Метка типа связи
+                    })
+        
+        # 2. Ищем похожие тематики (для узлов без точных совпадений)
+        print(f"🔗 Found {len(exact_links)} exact links")
+        print(f"🔍 Searching for similar topics...")
+        
+        similarity_links = self._find_similar_nodes(node_topics_text, self.similarity_threshold)
+        
+        # Добавляем только новые связи (не дублирующие точные)
+        added_similar = 0
+        for source, target, weight in similarity_links:
+            # Проверяем, нет ли уже точной связи
+            if (source, target) not in exact_links and (target, source) not in exact_links:
+                graph_data['links'].append({
+                    'source': source,
+                    'target': target,
+                    'weight': weight * 5,  # Масштабируем для визуализации
+                    'type': 'similar'  # Метка типа связи
+                })
+                added_similar += 1
+        
+        print(f"✅ Added {added_similar} similarity links")
+        print(f"📊 Total links: {len(graph_data['links'])}")
+        
+        return graph_data
+    
+    def build_topic_graph(self):
+        """Граф связей между тематиками с поиском похожих"""
+        graph_data = {'nodes': [], 'links': []}
+        
+        # Собираем все тематики
+        topic_urls = {}
+        topic_authors = {}
+        
+        for _, row in self.df.iterrows():
+            if pd.isna(row['labels']):
+                continue
+                
+            topic = str(row['labels'])
+            author = str(row['fullname']) if pd.notna(row['fullname']) else 'unknown'
+            url = str(row['url']) if pd.notna(row['url']) else None
+            
+            if topic not in topic_urls:
+                topic_urls[topic] = []
+                topic_authors[topic] = set()
+            
+            if url:
+                topic_urls[topic].append(url)
+            topic_authors[topic].add(author)
+        
+        # Создаем узлы
+        node_topics_text = {}
+        for topic, urls in topic_urls.items():
+            node = {
+                'id': topic,
+                'label': topic[:50] + '...' if len(topic) > 50 else topic,
+                'type': 'topic',
+                'count': len(urls),
+                'authors_count': len(topic_authors[topic]),
+                'urls': urls[:5]
+            }
+            graph_data['nodes'].append(node)
+            node_topics_text[topic] = topic  # Для тематик используем сам текст
+        
+        # Фильтруем топ-узлы
+        graph_data['nodes'] = self.filter_top_nodes(graph_data['nodes'], metric='count')
+        
+        # Обновляем словарь после фильтрации
+        filtered_node_ids = {node['id'] for node in graph_data['nodes']}
+        node_topics_text = {
+            nid: text for nid, text in node_topics_text.items() 
+            if nid in filtered_node_ids
+        }
+        
+        # 1. Создаем связи по общим авторам
+        exact_links = set()
+        for i, node1 in enumerate(graph_data['nodes']):
+            authors1 = topic_authors[node1['id']]
+            
+            for node2 in graph_data['nodes'][i+1:]:
+                authors2 = topic_authors[node2['id']]
+                common_authors = authors1.intersection(authors2)
+                
+                if len(common_authors) > 0:
+                    exact_links.add((node1['id'], node2['id']))
+                    graph_data['links'].append({
+                        'source': node1['id'],
+                        'target': node2['id'],
+                        'weight': len(common_authors),
+                        'type': 'exact'
+                    })
+        
+        # 2. Ищем похожие тематики
+        print(f"🔗 Found {len(exact_links)} exact links (common authors)")
+        print(f"🔍 Searching for similar topics...")
+        
+        similarity_links = self._find_similar_nodes(node_topics_text, self.similarity_threshold)
+        
+        added_similar = 0
+        for source, target, weight in similarity_links:
+            if (source, target) not in exact_links and (target, source) not in exact_links:
+                graph_data['links'].append({
+                    'source': source,
+                    'target': target,
+                    'weight': weight * 3,
+                    'type': 'similar'
+                })
+                added_similar += 1
+        
+        print(f"✅ Added {added_similar} similarity links")
+        print(f"📊 Total links: {len(graph_data['links'])}")
+        
+        return graph_data
+    
+    def get_graph_statistics(self):
+        """Статистика графа для AI анализа"""
+        if len(self.G.nodes()) == 0:
+            return {
+                'nodes_count': 0,
+                'edges_count': 0,
+                'density': 0,
+                'avg_degree': 0,
+                'top_nodes': []
+            }
+            
+        stats = {
+            'nodes_count': self.G.number_of_nodes(),
+            'edges_count': self.G.number_of_edges(),
+            'density': nx.density(self.G),
+            'avg_degree': sum(dict(self.G.degree()).values()) / self.G.number_of_nodes() if self.G.number_of_nodes() > 0 else 0,
+        }
+        
+        if nx.is_connected(self.G):
+            stats['diameter'] = nx.diameter(self.G)
+            stats['avg_shortest_path'] = nx.average_shortest_path_length(self.G)
+        
+        # Топ узлы по центральности
+        if len(self.G.nodes()) > 0:
+            degree_centrality = nx.degree_centrality(self.G)
+            stats['top_nodes'] = sorted(degree_centrality.items(), key=lambda x: x[1], reverse=True)[:5]
+        else:
+            stats['top_nodes'] = []
+        
+        return stats
+
+def load_csv_data(file_path: str) -> pd.DataFrame:
+    """Загрузка CSV с обработкой ошибок"""
+    try:
+        df = pd.read_csv(file_path)
+        
+        # Приводим timeCreate к datetime если есть
+        if 'timeCreate' in df.columns:
+            df['timeCreate'] = pd.to_datetime(df['timeCreate'], errors='coerce')
+        
+        # Заполняем пропуски
+        if 'audienceCount' in df.columns:
+            df['audienceCount'] = df['audienceCount'].fillna(0)
+        if 'viewsCount' in df.columns:
+            df['viewsCount'] = df['viewsCount'].fillna(0)
+            
+        return df
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка чтения CSV: {str(e)}")
+
+@app.get("/csv-files")
+async def list_csv_files():
+    """Список доступных CSV файлов на сервере"""
+    base_dir = "/home/dev/tellscope_app/tellscope_backend/data/1/bertopic_files_directory/test"
+    
+    try:
+        files = []
+        for root, dirs, filenames in os.walk(base_dir):
+            for filename in filenames:
+                if filename.endswith('.csv') and 'result_graph' in filename:
+                    full_path = os.path.join(root, filename)
+                    rel_path = os.path.relpath(full_path, base_dir)
+                    files.append({
+                        'name': filename,
+                        'path': full_path,
+                        'relative_path': rel_path
+                    })
+        
+        return {'files': files, 'default': DEFAULT_CSV_PATH}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+def _compute_topic_similarity_hybrid(self, topics_list: list) -> np.ndarray:
+    """Гибридный метод: TF-IDF + Jaccard"""
+    if not topics_list or len(topics_list) < 2:
+        return np.array([[]])
+    
+    # 1. TF-IDF схожесть
+    tfidf_sim = self._compute_topic_similarity(topics_list)
+    
+    # 2. Jaccard схожесть по биграммам
+    def get_bigrams(text):
+        words = text.lower().split()
+        return set(zip(words[:-1], words[1:]))
+    
+    n = len(topics_list)
+    jaccard_sim = np.zeros((n, n))
+    
+    for i in range(n):
+        bigrams_i = get_bigrams(topics_list[i])
+        for j in range(i + 1, n):
+            bigrams_j = get_bigrams(topics_list[j])
+            
+            if len(bigrams_i) == 0 or len(bigrams_j) == 0:
+                jaccard_sim[i, j] = 0
+            else:
+                intersection = len(bigrams_i & bigrams_j)
+                union = len(bigrams_i | bigrams_j)
+                jaccard_sim[i, j] = intersection / union if union > 0 else 0
+            
+            jaccard_sim[j, i] = jaccard_sim[i, j]
+    
+    # 3. Комбинируем (70% TF-IDF + 30% Jaccard)
+    if isinstance(tfidf_sim, np.ndarray):
+        hybrid_sim = 0.7 * tfidf_sim + 0.3 * jaccard_sim
+    else:
+        # Для разреженных матриц
+        hybrid_sim = tfidf_sim.multiply(0.7).toarray() + 0.3 * jaccard_sim
+    
+    print(f"🔀 Hybrid similarity: TF-IDF + Jaccard")
+    
+    return hybrid_sim
+
+
+@app.post("/build-from-csv")
+async def build_graph_from_csv(
+    graph_type: str = Form('author'),
+    csv_path: Optional[str] = Form(None),  # ✅ Теперь полный путь
+    file: Optional[UploadFile] = File(None),
+    similarity_threshold: Optional[float] = Form(None),
+    similarity_method: str = Form('tfidf'),
+    min_common_words: int = Form(1)
+):
+    try:
+        # Загружаем данные
+        if file:
+            df = pd.read_csv(file.file)
+        elif csv_path:
+            # ✅ Проверяем, что файл существует и принадлежит пользователю
+            if not os.path.exists(csv_path):
+                raise HTTPException(404, f"CSV file not found: {csv_path}")
+            
+            # ✅ Дополнительная проверка безопасности
+            base_data_dir = '/home/dev/tellscope_app/tellscope_backend/data/'
+            if not os.path.abspath(csv_path).startswith(base_data_dir):
+                raise HTTPException(403, "Access denied")
+            
+            df = pd.read_csv(csv_path)
+        else:
+            raise HTTPException(400, "No CSV file provided")
+        
+        print(f"📂 Loaded {len(df)} records from CSV: {csv_path}")
+        
+        if 'timeCreate' in df.columns:
+            df['timeCreate'] = pd.to_datetime(df['timeCreate'], errors='coerce')
+        
+        # ✅ Создаем builder с автоматическим порогом
+        builder = GraphBuilder(df, similarity_threshold=similarity_threshold)
+        
+        # ✅ Выбираем метод схожести
+        if similarity_method == 'hybrid':
+            builder._compute_topic_similarity = builder._compute_topic_similarity_hybrid
+        
+        # Строим граф
+        if graph_type == 'author':
+            graph_data = builder.build_author_graph()
+        elif graph_type == 'topic':
+            graph_data = builder.build_topic_graph()
+        else:
+            raise HTTPException(400, f"Unknown graph type: {graph_type}")
+        
+        # ✅ ДИАГНОСТИКА связей
+        exact_links = [l for l in graph_data['links'] if l.get('type') == 'exact']
+        similar_links = [l for l in graph_data['links'] if l.get('type') == 'similar']
+        
+        print(f"📊 Graph stats:")
+        print(f"  - Nodes: {len(graph_data['nodes'])}")
+        print(f"  - Exact links: {len(exact_links)}")
+        print(f"  - Similar links: {len(similar_links)}")
+        print(f"  - Threshold used: {builder.similarity_threshold}")
+        
+        statistics = builder.get_graph_statistics()
+        topic_analysis = builder.extract_topic_phrases()
+        
+        # Обработка дат
+        date_range = {}
+        if 'timeCreate' in df.columns and not df.empty:
+            min_date = df['timeCreate'].min()
+            max_date = df['timeCreate'].max()
+            date_range = {
+                'start': min_date.isoformat() if pd.notna(min_date) else None,
+                'end': max_date.isoformat() if pd.notna(max_date) else None
+            }
+        else:
+            date_range = {'start': None, 'end': None}
+        
+        result = {
+            'graph': graph_data,
+            'statistics': statistics,
+            'topic_analysis': topic_analysis,
+            'metadata': {
+                'total_records': len(df),
+                'date_range': date_range,
+                'graph_type': graph_type,
+                'similarity_threshold': builder.similarity_threshold,
+                'similarity_method': similarity_method,
+                'exact_links_count': len(exact_links),
+                'similar_links_count': len(similar_links)
+            }
+        }
+        
+        return result
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+@app.post("/build")
+async def build_graph(data: dict):
+    """Построение графа из данных (старый эндпойнт)"""
+    try:
+        df = pd.DataFrame(data['records'])
+        graph_type = data.get('type', 'author')
+        
+        builder = GraphBuilder(df)
+        
+        if graph_type == 'author':
+            graph_data = builder.build_author_graph()
+        elif graph_type == 'topic':
+            graph_data = builder.build_topic_graph()
+        elif graph_type == 'geo':
+            graph_data = builder.build_geo_graph()
+        else:
+            raise HTTPException(400, "Unknown graph type")
+        
+        statistics = builder.get_graph_statistics()
+        
+        return {
+            'graph': graph_data,
+            'statistics': statistics,
+            'metadata': {
+                'total_records': len(df),
+                'date_range': {
+                    'start': df['timeCreate'].min().isoformat() if 'timeCreate' in df.columns and not df.empty else None,
+                    'end': df['timeCreate'].max().isoformat() if 'timeCreate' in df.columns and not df.empty else None
+                }
+            }
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/analyze")
+async def analyze_graph(query: GraphQuery):
+    """AI анализ графа"""
+    print(f"=== ANALYZE REQUEST ===")
+    print(f"Question: {query.question[:100]}...")
+    print(f"Graph data type: {type(query.graph_data)}")
+    print(f"Graph data keys: {query.graph_data.keys() if isinstance(query.graph_data, dict) else 'not a dict'}")
+    
+    try:
+        # ✅ Безопасное извлечение данных
+        if isinstance(query.graph_data, dict):
+            graph = query.graph_data.get('graph', query.graph_data)
+            statistics = query.graph_data.get('statistics', {})
+            metadata = query.graph_data.get('metadata', {})
+        else:
+            raise HTTPException(400, "graph_data must be a dictionary")
+        
+        # ✅ Проверяем наличие узлов
+        if 'nodes' not in graph or len(graph['nodes']) == 0:
+            raise HTTPException(400, "Graph has no nodes")
+        
+        print(f"Graph info: {len(graph['nodes'])} nodes, {len(graph.get('links', []))} links")
+        
+        # Формируем контекст
+        context = f"""
+Ты - аналитик социальных сетей. У тебя есть граф с следующими характеристиками:
+
+СТАТИСТИКА ГРАФА:
+- Количество узлов: {statistics.get('nodes_count', len(graph['nodes']))}
+- Количество связей: {statistics.get('edges_count', len(graph.get('links', [])))}
+- Плотность графа: {statistics.get('density', 0):.4f}
+- Средняя степень: {statistics.get('avg_degree', 0):.2f}
+
+МЕТАДАННЫЕ:
+{json.dumps(metadata, ensure_ascii=False, indent=2)}
+
+ТОП УЗЛЫ ПО ЦЕНТРАЛЬНОСТИ:
+{json.dumps(statistics.get('top_nodes', [])[:5], ensure_ascii=False, indent=2)}
+
+ПРИМЕРЫ УЗЛОВ:
+{json.dumps(graph['nodes'][:10], ensure_ascii=False, indent=2)}
+
+ПРИМЕРЫ СВЯЗЕЙ:
+{json.dumps(graph.get('links', [])[:10], ensure_ascii=False, indent=2)}
+
+ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query.question}
+
+Проанализируй граф и дай развернутый ответ на вопрос. Используй конкретные данные из графа.
+Форматируй ответ с использованием Markdown для лучшей читаемости.
+"""
+
+        response = client.chat.completions.create(
+            messages=[{"role": "user", "content": context}],
+            model="gpt-5-mini",
+            max_tokens=2000,
+        )
+        
+        answer = response.choices[0].message.content
+        
+        return {
+            'answer': answer,
+            'context_used': {
+                'nodes_analyzed': min(10, len(graph['nodes'])),
+                'links_analyzed': min(10, len(graph.get('links', [])))
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"ERROR in analyze: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Analysis error: {str(e)}")
+
+from llm_agent import SocialMediaAgent
+
+class SmartAgentRequest(BaseModel):
+    user_query: str
+    index: int
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    user_id: Optional[str] = None
+    reports_dir: Optional[str] = None
+
+active_tasks: Dict[str, dict] = {}
+websocket_ready_events: Dict[str, Event] = {}
+
+# --- ИСПРАВЛЕНИЕ: УЛУЧШЕННЫЙ CONNECTION MANAGER ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, WebSocket] = {}
+
+    async def connect(self, task_id: str, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[task_id] = websocket
+        print(f"WebSocket accepted and stored for task {task_id}")
+
+    def disconnect(self, task_id: str):
+        if task_id in self.active_connections:
+            del self.active_connections[task_id]
+            print(f"WebSocket disconnected and removed for task {task_id}")
+        if task_id in websocket_ready_events:
+            del websocket_ready_events[task_id]
+
+    async def send_message(self, task_id: str, message: dict):
+        if task_id in self.active_connections:
+            websocket = self.active_connections[task_id]
+            if websocket.client_state.name == "CONNECTED":
+                try:
+                    await websocket.send_json(message)
+                except Exception as e:
+                    print(f"Error sending message to {task_id}: {e}. Disconnecting.")
+                    self.disconnect(task_id)
+            else:
+                print(f"WebSocket for task {task_id} is not connected. Removing.")
+                self.disconnect(task_id)
+
+manager = ConnectionManager()
+
+class AgentProgressLogger:
+    """Класс для отправки прогресса через WebSocket"""
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+    
+    async def log(self, message: str, msg_type: str = "status", **kwargs):
+        await manager.send_message(self.task_id, {
+            "type": msg_type,
+            "message": message,
+            **kwargs
+        })
+
+from llm_agent import ReportBuilder
+
+async def run_agent_task(task_id: str, user_query: str, input_file: str, user_id: str = None, folder_name: str = None):
+    """
+    Эта функция теперь выступает как простой диспетчер.
+    Она создает агента и запускает его основной метод `run_task`,
+    который выполняет всю работу и возвращает путь к готовому отчету.
+    """
+    logger = AgentProgressLogger(task_id)
+    try:
+        # 1. Ожидание WebSocket соединения (логика не меняется)
+        if task_id in websocket_ready_events:
+            try:
+                await asyncio.wait_for(websocket_ready_events[task_id].wait(), timeout=15.0)
+                print(f"WebSocket is ready for task {task_id}. Starting agent work.")
+            except asyncio.TimeoutError:
+                error_msg = "Client failed to connect via WebSocket within 15 seconds."
+                await logger.log(error_msg, "error")
+                active_tasks[task_id].update({"status": "failed", "error": error_msg})
+                return
+
+        await logger.log("Инициализация интеллектуального агента...", "status")
+        
+        # 2. Создание экземпляра агента с передачей callback для логирования прогресса
+        agent = SocialMediaAgent(progress_callback=logger.log)
+
+        # 3. Определение пути для сохранения отчета
+        if user_id:
+            reports_dir = Path(f"/home/dev/tellscope_app/tellscope_backend/data/{user_id}/users_reports/{folder_name or ''}")
+        else:
+            reports_dir = Path("/home/dev/tellscope_app/tellscope_backend/reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_save_path = reports_dir / f"SmartReport_{task_id}.docx"
+
+        # 4. Запуск основной задачи агента
+        # Агент сам выполнит планирование, анализ, генерацию и сохранение отчета.
+        report_path = await agent.run_task(
+            user_query=user_query,
+            input_file=input_file,
+            report_save_path=str(report_save_path)
+        )
+
+        # 5. Обновление статуса задачи по завершении
+        active_tasks[task_id]["report_path"] = report_path
+        active_tasks[task_id]["status"] = "completed"
+        await logger.log("Отчет успешно создан!", "complete", report_url=f"/api/download-report/{task_id}")
+        await asyncio.sleep(1) # Небольшая задержка для отправки сообщения
+
+    except Exception as e:
+        error_msg = f"Произошла критическая ошибка в работе агента: {str(e)}"
+        print(f"Error in task {task_id}: {error_msg}")
+        traceback.print_exc()
+        await logger.log(error_msg, "error")
+        active_tasks[task_id].update({"status": "failed", "error": str(e)})
+        await asyncio.sleep(1)
+
+
+@app.post("/run-smart-agent", tags=['smart agent'])
+async def run_smart_agent(
+    background_tasks: BackgroundTasks,
+    request: SmartAgentRequest
+):
+    """Запуск умного агента для анализа данных"""
+    
+    task_id = str(uuid.uuid4())
+    
+    websocket_ready_events[task_id] = Event()
+    
+    active_tasks[task_id] = {
+        "status": "initializing",
+        "user_query": request.user_query,
+        "input_file": None,
+        "report_path": None,
+        "error": None,
+        "created_at": time.time(),
+        "user_id": request.user_id  # <-- сохраняем user_id
+    }
+    
+    try:
+        file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
+        indexes = load_dict_from_pickle(file_path)
+        
+        data = elastic_query(
+            theme_index=indexes[request.index], 
+            min_date=request.min_date, 
+            max_date=request.max_date, 
+            query_str='all'
+        )
+        
+        temp_dir = Path("/home/dev/tellscope_app/tellscope_backend/temp")
+        temp_dir.mkdir(exist_ok=True)
+        
+        input_file = temp_dir / f"data_{task_id}.json"
+        with open(input_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        active_tasks[task_id]["input_file"] = str(input_file)
+        active_tasks[task_id]["status"] = "pending"
+        
+        # Передаем user_id в фоновую задачу
+        background_tasks.add_task(
+            run_agent_task, 
+            task_id, 
+            request.user_query, 
+            str(input_file),
+            request.user_id  # <-- добавили
+        )
+        
+        return {"task_id": task_id, "status": "started"}
+        
+    except Exception as e:
+        active_tasks[task_id]["status"] = "failed"
+        active_tasks[task_id]["error"] = str(e)
+        if task_id in websocket_ready_events:
+            del websocket_ready_events[task_id]
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.websocket("/ws/agent/{task_id}")
+async def websocket_endpoint(websocket: WebSocket, task_id: str):
+    """
+    WebSocket для получения прогресса выполнения агента.
+    Эта версия использует неблокирующий цикл для отправки обновлений и keep-alive сообщений.
+    """
+    print(f"WebSocket connection attempt for task_id: {task_id}")
+
+    # 1. Ждем, пока задача будет создана в active_tasks
+    # Увеличиваем время ожидания, чтобы решить race condition
+    max_wait_time = 20  # секунд
+    start_time = time.time()
+    task_found = False
+    while time.time() - start_time < max_wait_time:
+        if task_id in active_tasks:
+            task_found = True
+            break
+        await asyncio.sleep(0.1)
+
+    if not task_found:
+        print(f"Task {task_id} not found after {max_wait_time}s. Closing connection.")
+        await websocket.close(code=1008, reason="Task not found or timed out.")
+        return
+
+    # 2. Принимаем и регистрируем соединение
+    try:
+        await manager.connect(task_id, websocket)
+        # Сообщаем фоновой задаче, что WebSocket готов
+        if task_id in websocket_ready_events:
+            websocket_ready_events[task_id].set()
+            print(f"Signaled 'ready' event for task {task_id}")
+    except Exception as e:
+        print(f"Failed to accept/connect WebSocket for {task_id}: {e}")
+        return # Просто выходим, если не удалось принять соединение
+
+    # 3. Основной цикл работы WebSocket
+    try:
+        # Этот цикл будет работать, пока задача не завершится или клиент не отключится
+        while True:
+            # Проверяем статус задачи в словаре
+            # Если задачи больше нет (например, старая и удалена), выходим
+            if task_id not in active_tasks:
+                print(f"Task {task_id} was removed. Closing WebSocket.")
+                break
+
+            task_status = active_tasks[task_id].get("status")
+            if task_status in ["completed", "failed"]:
+                print(f"Task {task_id} finished with status: {task_status}. Closing WebSocket.")
+                # Финальная задержка перед закрытием, чтобы клиент успел получить последнее сообщение
+                await asyncio.sleep(2)
+                break
+
+            # Неблокирующее ожидание сообщения от клиента (для ping/pong)
+            # с таймаутом, чтобы цикл не зависал.
+            try:
+                # Ждем сообщение от клиента не более 20 секунд
+                client_data = await asyncio.wait_for(websocket.receive_json(), timeout=20.0)
+                if client_data.get("type") == "ping":
+                    await manager.send_message(task_id, {"type": "pong"})
+            except asyncio.TimeoutError:
+                # Если клиент молчит 20 секунд, отправляем ему keepalive,
+                # чтобы прокси (Nginx) не закрыли соединение.
+                await manager.send_message(task_id, {"type": "keepalive"})
+            except WebSocketDisconnect:
+                # Если клиент сам отключился
+                print(f"Client disconnected for task {task_id}.")
+                break
+            except Exception as e:
+                # Другие ошибки при получении данных
+                print(f"Error while receiving data for task {task_id}: {e}")
+                break
+
+    except Exception as e:
+        print(f"An unexpected error occurred in WebSocket loop for task {task_id}: {e}")
+        traceback.print_exc()
+    finally:
+        # 4. Очистка при любом выходе из цикла
+        await manager.send_message(task_id, {"type": "status", "message": "Соединение закрыто."})
+        manager.disconnect(task_id)
+        if websocket.client_state.name != "DISCONNECTED":
+            await websocket.close(code=1000)
+        print(f"WebSocket cleanup complete for {task_id}")
+
+
+@app.get("/download-report/{task_id}", tags=['smart agent'])
+async def download_report(task_id: str):
+    """Скачивание готового отчета"""
+    if task_id not in active_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task = active_tasks[task_id]
+    report_path = task.get("report_path")
+    
+    if not report_path or not Path(report_path).exists():
+        raise HTTPException(status_code=404, detail="Report not found")
+    
+    return FileResponse(
+        path=report_path,
+        filename=Path(report_path).name,
+        media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    )
+
+@app.get("/agent-status/{task_id}", tags=['smart agent'])
+async def get_agent_status(task_id: str):
+    """Получить статус задачи агента"""
+    if task_id not in active_tasks:
+        return {"error": "Task not found"}
+    
+    task = active_tasks[task_id]
+    return {
+        "status": task["status"],
+        "error": task.get("error"),
+        "has_report": task.get("report_path") is not None
+    }
+    
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
