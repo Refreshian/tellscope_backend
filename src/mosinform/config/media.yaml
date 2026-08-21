@@ -1,0 +1,61 @@
+# Нормализация СМИ: contour = official | independent
+# official — традиционные СМИ и их каналы; independent — районные паблики, блогеры.
+
+outlets:
+  - canonical: Вечерняя Москва
+    contour: official
+    aliases: ["Вечерняя Москва", "vm.ru", "t.me/vmoskva"]
+  - canonical: АГН Москва
+    contour: official
+    aliases: ["Агентство городских новостей Москва", "Агентство городских новостей", "mskagency.ru", "Агентство \"Москва\"", "Агентство «Москва»"]
+  - canonical: Москва 24
+    contour: official
+    aliases: ["Москва 24", "m24.ru", "Телеканал Москва 24"]
+  - canonical: ТАСС
+    contour: official
+    aliases: ["ТАСС"]
+  - canonical: РИА Новости
+    contour: official
+    aliases: ["РИА Новости", "ria.ru"]
+  - canonical: Комсомольская правда
+    contour: official
+    aliases: ["Комсомольская правда", "kp.ru"]
+  - canonical: Российская газета
+    contour: official
+    aliases: ["Российская газета", "rg.ru"]
+  - canonical: Аргументы и факты
+    contour: official
+    aliases: ["Аргументы и Факты", "Аргументы и факты", "aif.ru"]
+  - canonical: Московский комсомолец
+    contour: official
+    aliases: ["Московский Комсомолец", "Московский комсомолец", "mk.ru"]
+  - canonical: Интерфакс
+    contour: official
+    aliases: ["Интерфакс"]
+  - canonical: Известия
+    contour: official
+    aliases: ["Известия"]
+  - canonical: Коммерсантъ
+    contour: official
+    aliases: ["Коммерсантъ"]
+  - canonical: RT
+    contour: official
+    aliases: ["RT"]
+  - canonical: БезФормата
+    contour: independent
+    aliases: ["БезФормата"]
+  - canonical: Rambler
+    contour: independent
+    aliases: ["Rambler"]
+  - canonical: Дзен
+    contour: independent
+    aliases: ["dzen.ru", "Дзен"]
+
+key_media:
+  - Вечерняя Москва
+  - АГН Москва
+  - Комсомольская правда
+  - Москва 24
+  - Российская газета
+  - РИА Новости
+  - ТАСС

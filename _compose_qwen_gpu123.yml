@@ -1,0 +1,38 @@
+# Qwen3-32B-FP8 on physical GPUs 1,2,3. GPU 0 is reserved for Tellscope embeddings.
+services:
+  vllm-api:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    runtime: nvidia
+    deploy:
+      resources:
+        limits:
+          cpus: 16
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1', '2', '3']
+              capabilities: [gpu]
+    environment:
+      - HF_TOKEN=__HF_TOKEN__
+      - NVIDIA_VISIBLE_DEVICES=1,2,3
+      - NCCL_DEBUG=WARN
+      - UV_TORCH_BACKEND=auto
+      - HF_HUB_DISABLE_XET=1
+    ipc: host
+    shm_size: 32G
+    volumes:
+      - /opt/vllm/volumes/models:/models
+    ports:
+      - "8000:8000"
+    command: >
+      --model Qwen/Qwen3-32B-FP8
+      --dtype auto
+      --max-model-len 8192
+      --pipeline-parallel-size 3
+      --tensor-parallel-size 1
+      --gpu-memory-utilization 0.90
+      --max-num-seqs 32
+      --download-dir /models
+      --host 0.0.0.0
+      --port 8000
