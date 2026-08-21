@@ -118,8 +118,10 @@ def _apply_model(msg: Message, rec: dict) -> None:
 def _vllm_classify(messages: list[Message], catalog: Catalog, cfg: dict, progress=None) -> list[dict]:
     base = (cfg.get("base_url") or os.environ.get("VLLM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
     model = cfg.get("model") or os.environ.get("VLLM_MODEL") or "Qwen/Qwen3-32B-FP8"
-    batch_size = int(cfg.get("batch_size") or 4)
+    batch_size = max(1, min(int(cfg.get("batch_size") or 4), 4))
     timeout = float(cfg.get("timeout_sec") or 180)
+    text_limit = int(cfg.get("text_limit") or 1000)
+    max_tokens = int(cfg.get("max_tokens") or 400)
     allowed = ", ".join(f"{o.id} ({o.short})" for o in catalog.objects)
     system = (
         "Ты аналитик медиаприсутствия органов власти Москвы. "
@@ -129,38 +131,78 @@ def _vllm_classify(messages: list[Message], catalog: Catalog, cfg: dict, progres
         "Поля item: id, object_ids (массив), sentiment (positive|neutral|negative), "
         "role (main|episodic|background), initiated (true если похоже на релиз/пресс-службу)."
     )
+    url = f"{base}/v1/chat/completions"
     out: list[dict] = []
     with httpx.Client(timeout=timeout) as client:
-        for i in range(0, len(messages), batch_size):
+        total = len(messages)
+        for i in range(0, total, batch_size):
             chunk = messages[i : i + batch_size]
-            payload_items = [
-                {"id": m.id, "title": m.title, "source": m.source, "text": (m.text or "")[:1800]}
-                for m in chunk
-            ]
-            body = {
-                "model": model,
-                "temperature": 0.1,
-                "max_tokens": 1200,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
-                ],
-                "chat_template_kwargs": {"enable_thinking": False},
-            }
-            try:
-                resp = client.post(f"{base}/v1/chat/completions", json=body)
-                resp.raise_for_status()
-                content = (((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
-                parsed = _parse_json(content)
-                items = parsed.get("items") if isinstance(parsed, dict) else parsed
-                if isinstance(items, list):
-                    out.extend(items)
-            except Exception as exc:
-                if progress:
-                    progress(f"партия {i // batch_size + 1}: {exc}")
-            if progress and i and i % 40 == 0:
-                progress(f"размечено {min(i + batch_size, len(messages))}/{len(messages)}")
+            items = _classify_chunk(client, url, model, system, chunk, text_limit, max_tokens)
+            out.extend(items)
+            done = min(i + batch_size, total)
+            if progress and (done == total or done % 20 == 0 or i == 0):
+                progress(f"размечено {done}/{total}")
     return out
+
+
+def _classify_chunk(
+    client: httpx.Client,
+    url: str,
+    model: str,
+    system: str,
+    chunk: list[Message],
+    text_limit: int,
+    max_tokens: int,
+) -> list[dict]:
+    if not chunk:
+        return []
+    items = _post_classify(client, url, model, system, chunk, text_limit, max_tokens)
+    if items is not None:
+        return items
+    if len(chunk) > 1:
+        mid = len(chunk) // 2
+        return _classify_chunk(client, url, model, system, chunk[:mid], text_limit, max_tokens) + _classify_chunk(
+            client, url, model, system, chunk[mid:], text_limit, max_tokens
+        )
+    if text_limit > 400:
+        return _classify_chunk(client, url, model, system, chunk, 400, min(max_tokens, 192))
+    return []
+
+
+def _post_classify(
+    client: httpx.Client,
+    url: str,
+    model: str,
+    system: str,
+    chunk: list[Message],
+    text_limit: int,
+    max_tokens: int,
+) -> list[dict] | None:
+    payload_items = [
+        {"id": m.id, "title": m.title, "source": m.source, "text": (m.text or "")[:text_limit]}
+        for m in chunk
+    ]
+    body = {
+        "model": model,
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
+        ],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        resp = client.post(url, json=body)
+        if resp.status_code == 400:
+            return None
+        resp.raise_for_status()
+        content = (((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+        parsed = _parse_json(content)
+        items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        return items if isinstance(items, list) else []
+    except httpx.HTTPError:
+        return None
 
 
 def _parse_json(text: str):

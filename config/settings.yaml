@@ -10,8 +10,8 @@ tellscope:
   api_key: ""
   classify_path: /api/v1/classify
   generate_path: /api/v1/generate
-  batch_size: 16
-  timeout_sec: 120
+  batch_size: 4
+  timeout_sec: 180
 
 report:
   org_line: Информационный центр Правительства Москвы «Мосинформ»

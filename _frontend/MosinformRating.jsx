@@ -15,6 +15,12 @@ import { useCheckAuth } from '@/hooks/useCheckAuth';
 
 import styles from './MosinformRating.module.scss';
 
+const _fileSize = bytes => {
+	if (!bytes) return '0 КБ';
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} КБ`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+};
+
 const MosinformRating = () => {
 	useCheckAuth();
 	const { active_menu } = useSelector(store => store.booleanValues);
@@ -121,7 +127,7 @@ const MosinformRating = () => {
 						<ul className={styles.files}>
 							{files.map(f => (
 								<li key={f.name}>
-									{f.name} · {(f.size / 1024 / 1024).toFixed(1)} МБ
+									{f.name} · {_fileSize(f.size)}
 								</li>
 							))}
 						</ul>
