@@ -20,5 +20,6 @@ data/cache/
 .env.*
 _deploy_gpu_split.py
 _deploy_tellscope.py
+_deploy_mosinform_save.py
 _remote_snap/
 !config/**

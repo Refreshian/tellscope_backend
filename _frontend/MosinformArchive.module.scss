@@ -1,0 +1,134 @@
+@import '@st/variables';
+@import '@st/functions';
+
+.list {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	gap: adapt(16px, 1440px);
+}
+
+.head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: adapt(16px, 1440px);
+	flex-wrap: wrap;
+}
+
+.lead,
+.hint,
+.empty {
+	margin: 0;
+	color: rgba($color_black, 0.65);
+	line-height: 1.45;
+}
+
+.empty {
+	width: 100%;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: adapt(12px, 1440px);
+	padding-top: adapt(40px, 1440px);
+}
+
+.link {
+	color: $color_blue;
+	font-weight: 600;
+	text-decoration: none;
+
+	&:hover {
+		text-decoration: underline;
+	}
+}
+
+.errorBox {
+	width: 100%;
+	background: #fff5f5;
+	border: 1px solid #fc8181;
+	border-radius: adapt(8px, 1440px);
+	padding: adapt(12px, 1440px) adapt(16px, 1440px);
+	color: #c53030;
+}
+
+.card {
+	width: min(760px, 100%);
+	background: $color_white;
+	border: 1px solid rgba($color_black, 0.1);
+	border-radius: adapt(10px, 1440px);
+	padding: adapt(16px, 1440px) adapt(18px, 1440px);
+	display: flex;
+	flex-direction: column;
+	gap: adapt(8px, 1440px);
+
+	p {
+		margin: 0;
+		color: #333;
+
+		span {
+			font-weight: 600;
+		}
+	}
+}
+
+.row {
+	display: flex;
+	align-items: center;
+	gap: adapt(10px, 1440px);
+	flex-wrap: wrap;
+}
+
+.badge {
+	display: inline-flex;
+	align-items: center;
+	padding: 2px 8px;
+	border-radius: 999px;
+	font-size: 0.75rem;
+	font-weight: 600;
+	background: #eef2f6;
+	color: #344054;
+
+	&.queued,
+	&.unknown {
+		background: #f2f4f7;
+		color: #475467;
+	}
+
+	&.running {
+		background: #eff8ff;
+		color: #175cd3;
+	}
+
+	&.done {
+		background: #ecfdf3;
+		color: #067647;
+	}
+
+	&.error {
+		background: #fef3f2;
+		color: #b42318;
+	}
+}
+
+.meta {
+	color: rgba($color_black, 0.5);
+	font-size: 0.85rem;
+}
+
+.actions {
+	display: flex;
+	gap: adapt(10px, 1440px);
+	flex-wrap: wrap;
+	padding-top: adapt(4px, 1440px);
+
+	button {
+		border: 0;
+		background: $color_blue;
+		color: $color_white;
+		border-radius: adapt(8px, 1440px);
+		padding: adapt(8px, 1440px) adapt(14px, 1440px);
+		cursor: pointer;
+		font: inherit;
+	}
+}

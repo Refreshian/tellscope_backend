@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSelector } from 'react-redux';
+import { Link } from 'react-router-dom';
 import Cookies from 'js-cookie';
 
 import Content from '@/components/content/Content';
@@ -14,6 +15,8 @@ import { API_URL, TOKEN } from '@/app.constants';
 import { useCheckAuth } from '@/hooks/useCheckAuth';
 
 import styles from './MosinformRating.module.scss';
+
+const LAST_JOB_KEY = 'mosinform_last_job';
 
 const _fileSize = bytes => {
 	if (!bytes) return '0 КБ';
@@ -33,12 +36,6 @@ const MosinformRating = () => {
 	const [busy, setBusy] = useState(false);
 	const timer = useRef(null);
 
-	useEffect(() => {
-		return () => {
-			if (timer.current) clearInterval(timer.current);
-		};
-	}, []);
-
 	const poll = useCallback(async id => {
 		try {
 			const { data } = await $axios.get(`/mosinform/jobs/${id}`);
@@ -46,12 +43,26 @@ const MosinformRating = () => {
 			if (data.status === 'done' || data.status === 'error') {
 				setBusy(false);
 				if (timer.current) clearInterval(timer.current);
+			} else {
+				setBusy(true);
 			}
 		} catch (e) {
 			setError(e.response?.data?.detail || e.message);
 			setBusy(false);
 		}
 	}, []);
+
+	useEffect(() => {
+		const saved = localStorage.getItem(LAST_JOB_KEY);
+		if (saved) {
+			setJobId(saved);
+			poll(saved);
+			timer.current = setInterval(() => poll(saved), 2500);
+		}
+		return () => {
+			if (timer.current) clearInterval(timer.current);
+		};
+	}, [poll]);
 
 	const start = async () => {
 		if (!files.length) {
@@ -77,6 +88,7 @@ const MosinformRating = () => {
 			}
 			const data = await res.json();
 			setJobId(data.job_id);
+			localStorage.setItem(LAST_JOB_KEY, data.job_id);
 			if (timer.current) clearInterval(timer.current);
 			timer.current = setInterval(() => poll(data.job_id), 2500);
 			poll(data.job_id);
@@ -109,7 +121,9 @@ const MosinformRating = () => {
 					<h1 className={styles.title}>Мосинформ.Рейтинг</h1>
 					<p className={styles.lead}>
 						Загрузите выгрузки Медиалогии (docx, xlsx или zip). Система разберёт тексты,
-						разметит объекты локальной моделью и соберёт презентацию.
+						разметит объекты локальной моделью и соберёт презентацию. Результат
+						сохраняется на сервере — его можно открыть позже во вкладке{' '}
+						<Link to="/data-set?tab=mosinform">Наборы данных → Мосинформ.Рейтинг</Link>.
 					</p>
 					<label className={styles.label}>Период на слайдах</label>
 					<input
