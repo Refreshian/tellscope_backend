@@ -1,0 +1,48 @@
+version: 1
+# Serving lock for tellscope40. Secrets live in .env, not here.
+# Image digest taken from docker images --digests on 2026-08-31 (tag latest is not trusted).
+
+generate:
+  provider: vllm
+  model: Qwen/Qwen3-32B-FP8
+  revision: ""
+  base_url: http://127.0.0.1:8000
+  image: vllm/vllm-openai
+  image_tag: latest
+  image_digest: sha256:d9a5c1c1614c959fde8d2a4d68449db184572528a6055afdd0caf1e66fb51504
+  pipeline_parallel_size: 3
+  tensor_parallel_size: 1
+  max_model_len: 8192
+  gpu: "1,2,3"
+
+embed:
+  provider: sentence_transformers
+  model: deepvk/USER2-base
+  revision: ""
+  device: cuda:0
+  gpu: "0"
+
+external:
+  provider: aitunnel
+  base_url: https://api.aitunnel.ru/v1
+  profiles:
+    mosinform_insights: gpt-4.1-mini
+    dashboard_qa: gpt-4.1-mini
+    smart_agent_planner: claude-sonnet-4.5
+
+prompts:
+  mosinform_classify: classify_v1
+  mosinform_insights: insights_v1
+  llm_topic_label: topic_label_v1
+  llm_run_default: llm_run_default_v1
+  llm_run_user: llm_run_user
+  dashboard_qa: dashboard_qa_v1
+  dashboard_qa_raw: dashboard_qa_raw_v1
+  dashboard_qa_tonality: dashboard_qa_tonality_v1
+  dashboard_qa_graph: dashboard_qa_graph_v1
+  dashboard_qa_media: dashboard_qa_media_v1
+  dashboard_qa_voice: dashboard_qa_voice_v1
+  dashboard_qa_bot: dashboard_qa_bot_v1
+  smart_agent_plan: smart_agent_plan_v1
+  smart_agent_intro: smart_agent_intro_v1
+  smart_agent_narrative: smart_agent_narrative_v1

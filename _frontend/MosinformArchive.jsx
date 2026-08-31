@@ -17,8 +17,8 @@ const STATUS_LABEL = {
 };
 
 const formatWhen = iso => {
-	if (!iso) return '—';
-	const date = new Date(iso);
+	if (!iso || String(iso).startsWith('2020-01-01')) return '—';
+	const date = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T'));
 	if (Number.isNaN(date.getTime())) return iso;
 	return date.toLocaleString('ru-RU');
 };
@@ -149,6 +149,16 @@ const MosinformArchive = ({ filterText = '' }) => {
 							<span>Итог:</span> текстов {job.summary.messages}, объектов{' '}
 							{job.summary.objects}, без объекта {job.summary.untagged}
 						</p>
+					)}
+					{(job.lineage?.model_id || job.lineage?.prompt_id) && (
+						<p className={styles.meta}>
+							{job.lineage.model_id || ''}
+							{job.lineage.prompt_id ? ` · ${job.lineage.prompt_id}` : ''}
+							{job.lineage.git_sha ? ` · ${job.lineage.git_sha}` : ''}
+						</p>
+					)}
+					{job.stale && (
+						<p className={styles.meta}>Задача не обновлялась больше двух часов</p>
 					)}
 					<p className={styles.meta}>
 						{formatWhen(job.created_at)}

@@ -1,0 +1,8 @@
+Ты готовишь слайды рейтинга медиаприсутствия ОИВ Москвы в деловом стиле пилота Мосинформ.
+По цифрам и заголовкам напиши JSON с ключами volume, speakers, media, tone, role, concentration, initiated, observations.
+Каждый ключ кроме observations — массив из ровно 4 коротких фраз на русском (1–2 предложения).
+observations — массив из 3 объектов {title, fact, meaning, full}. Без воды и эмодзи.
+
+Период: {period}
+Статистика: {stats}
+Заголовки: {headlines}

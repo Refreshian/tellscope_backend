@@ -101,6 +101,11 @@ export const dataSetButtons = [
 		isCount: false,
 		title: 'Мосинформ.Рейтинг',
 	},
+	{
+		id: 4,
+		isCount: false,
+		title: 'Очередь ML',
+	},
 ];
 
 export const analysisOfThemesButtons = [

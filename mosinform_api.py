@@ -15,6 +15,11 @@ from fastapi.responses import FileResponse
 
 from mosinform.pipeline import run_pipeline
 
+try:
+    from mlops.jobs import register as mlops_register
+except ImportError:
+    mlops_register = None
+
 load_dotenv()
 
 router = APIRouter(prefix="/mosinform", tags=["mosinform rating"])
@@ -52,6 +57,19 @@ def _persist(job_id: str) -> None:
 def _set(job_id: str, **fields) -> None:
     REDIS.hset(_job_key(job_id), mapping={k: str(v) for k, v in fields.items()})
     _persist(job_id)
+    if mlops_register:
+        data = _get(job_id)
+        mlops_register(
+            job_id,
+            product="mosinform",
+            route="/mosinform-rating",
+            status=data.get("status") or "",
+            message=data.get("message") or "",
+            period=data.get("period") or "",
+            files=data.get("files") or "",
+            created_at=data.get("created_at") or "",
+            updated_at=data.get("updated_at") or datetime.now().isoformat(),
+        )
 
 
 def _get(job_id: str) -> dict:
@@ -126,9 +144,19 @@ def _public_job(job_id: str) -> dict | None:
         return None
     status = data.get("status") or ("done" if has_pptx else "unknown")
     summary = _parse_summary(data.get("summary"))
+    lineage = _parse_summary(data.get("lineage"))
+    stale = False
+    updated = data.get("updated_at") or ""
+    if status in {"running", "queued"} and updated:
+        try:
+            age = (datetime.now() - datetime.fromisoformat(updated)).total_seconds()
+            stale = age > 2 * 3600
+        except ValueError:
+            stale = False
     return {
         "job_id": job_id,
         "status": status,
+        "stale": stale,
         "message": data.get("message") or "",
         "progress": data.get("progress") or "",
         "period": data.get("period") or "",
@@ -136,6 +164,21 @@ def _public_job(job_id: str) -> dict | None:
         "created_at": data.get("created_at") or "",
         "updated_at": data.get("updated_at") or "",
         "summary": {key: summary[key] for key in SUMMARY_KEYS if key in summary},
+        "lineage": {
+            k: lineage[k]
+            for k in (
+                "git_sha",
+                "model_id",
+                "model_rev",
+                "image_digest",
+                "prompt_id",
+                "catalog_version",
+                "catalog_hash",
+                "cache_key",
+                "aitunnel_model",
+            )
+            if k in lineage
+        },
         "has_pptx": has_pptx,
         "has_xlsx": has_xlsx,
     }
@@ -148,11 +191,10 @@ def _run(job_id: str, input_dir: Path, output_dir: Path, period: str) -> None:
     try:
         _set(job_id, status="running", message="старт", progress="5")
         os.environ.setdefault("MOSINFORM_VLLM", "1")
-        os.environ.setdefault("VLLM_BASE_URL", "http://127.0.0.1:8000")
-        os.environ.setdefault("VLLM_MODEL", "Qwen/Qwen3-32B-FP8")
-        result = run_pipeline(input_dir, output_dir, period=period, tellscope=True, progress=progress)
-        _set(
-            job_id,
+        result = run_pipeline(
+            input_dir, output_dir, period=period, tellscope=True, progress=progress, job_id=job_id
+        )
+        payload = dict(
             status="done",
             message="готово",
             progress="100",
@@ -161,6 +203,9 @@ def _run(job_id: str, input_dir: Path, output_dir: Path, period: str) -> None:
             xlsx=result.get("xlsx", ""),
             updated_at=datetime.now().isoformat(),
         )
+        if result.get("lineage"):
+            payload["lineage"] = json.dumps(result["lineage"], ensure_ascii=False)
+        _set(job_id, **payload)
     except Exception as exc:
         _set(
             job_id,
@@ -189,6 +234,12 @@ async def create_job(
 ):
     if not files:
         raise HTTPException(400, "Нужно загрузить хотя бы один файл")
+    try:
+        from mlops.runtime import GpuBusy, assert_can_start
+
+        assert_can_start("mosinform")
+    except GpuBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     job_id = uuid.uuid4().hex[:12]
     input_dir = DATA_ROOT / job_id / "in"
     output_dir = DATA_ROOT / job_id / "out"

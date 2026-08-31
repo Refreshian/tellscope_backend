@@ -16,10 +16,12 @@ import styles from './DataSet.module.scss';
 import Folder from './folder/Folder';
 import HistoryCard from './history-card/HistoryCard';
 import MosinformArchive from './MosinformArchive';
+import MlopsQueue from './MlopsQueue';
 import NoData from './no-data/NoData';
 import { dataSetButtons } from '@/data/panel.data';
 
 const MOSINFORM_TAB = 'Мосинформ.Рейтинг';
+const QUEUE_TAB = 'Очередь ML';
 
 const DataSet = () => {
 	const { addButtonTarget_PopupDelete } = useActions();
@@ -33,11 +35,12 @@ const DataSet = () => {
 	});
 	const location = useLocation();
 	const navigate = useNavigate();
-	const [activeButton, setActiveButton] = useState(
-		new URLSearchParams(location.search).get('tab') === 'mosinform'
-			? MOSINFORM_TAB
-			: 'Файлы данных',
-	);
+	const [activeButton, setActiveButton] = useState(() => {
+		const tab = new URLSearchParams(location.search).get('tab');
+		if (tab === 'mosinform') return MOSINFORM_TAB;
+		if (tab === 'queue') return QUEUE_TAB;
+		return 'Файлы данных';
+	});
 	const [showDevModal, setShowDevModal] = useState(false);
 
 	const {
@@ -87,9 +90,8 @@ const DataSet = () => {
 
 	useEffect(() => {
 		const tab = new URLSearchParams(location.search).get('tab');
-		if (tab === 'mosinform') {
-			setActiveButton(MOSINFORM_TAB);
-		}
+		if (tab === 'mosinform') setActiveButton(MOSINFORM_TAB);
+		if (tab === 'queue') setActiveButton(QUEUE_TAB);
 	}, [location.search]);
 
 	const onClick = button => {
@@ -100,7 +102,9 @@ const DataSet = () => {
 		setActiveButton(button);
 		if (button === MOSINFORM_TAB) {
 			navigate('/data-set?tab=mosinform', { replace: true });
-		} else if (location.search.includes('tab=mosinform')) {
+		} else if (button === QUEUE_TAB) {
+			navigate('/data-set?tab=queue', { replace: true });
+		} else if (location.search.includes('tab=')) {
 			navigate('/data-set', { replace: true });
 		}
 	};
@@ -192,14 +196,16 @@ const DataSet = () => {
 			);
 		} else if (activeButton === MOSINFORM_TAB) {
 			return <MosinformArchive filterText={filterText} />;
+		} else if (activeButton === QUEUE_TAB) {
+			return <MlopsQueue filterText={filterText} />;
 		}
 	};
 
 	const hasFiles = allData && allData.length !== 0;
-	const isMosinform = activeButton === MOSINFORM_TAB;
+	const isArchive = activeButton === MOSINFORM_TAB || activeButton === QUEUE_TAB;
 	const styleContent = {
-		justifyContent: hasFiles || isMosinform ? '' : 'center',
-		alignItems: hasFiles || isMosinform ? '' : 'center',
+		justifyContent: hasFiles || isArchive ? '' : 'center',
+		alignItems: hasFiles || isArchive ? '' : 'center',
 		paddingTop:
 			activeButton === 'three' ? 'calc(24/1440*100vw)' : 'calc(92/1440*100vw)',
 		paddingRight: activeButton === 'three' ? '0px' : 'calc(44/1440*100vw)',

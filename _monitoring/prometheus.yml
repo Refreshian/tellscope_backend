@@ -26,3 +26,11 @@ scrape_configs:
       - targets: ["host.docker.internal:8000"]
         labels:
           service: vllm
+
+  - job_name: tellscope
+    metrics_path: /mlops/metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["host.docker.internal:5000"]
+        labels:
+          service: tellscope

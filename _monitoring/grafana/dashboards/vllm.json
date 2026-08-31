@@ -883,6 +883,154 @@
         },
         "overrides": []
       }
+    },
+    {
+      "id": 20,
+      "type": "stat",
+      "title": "Tellscope GPU busy",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [{ "expr": "tellscope_gpu_busy", "legendFormat": "", "refId": "A" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "свободен", "color": "green" }, "1": { "text": "занят", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "type": "stat",
+      "title": "Stale jobs",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [{ "expr": "tellscope_jobs_stale", "legendFormat": "", "refId": "A" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "type": "stat",
+      "title": "Gateway errors",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [{ "expr": "sum(tellscope_gateway_errors_total) or vector(0)", "legendFormat": "", "refId": "A" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 23,
+      "type": "stat",
+      "title": "Gateway calls",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [{ "expr": "sum(tellscope_gateway_calls_total) or vector(0)", "legendFormat": "", "refId": "A" }],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": { "mappings": [], "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Jobs by product and status",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [
+        {
+          "expr": "tellscope_jobs",
+          "legendFormat": "{{product}} {{status}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "pointSize": 5, "spanNulls": false, "showPoints": "never" },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Gateway calls by provider",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prom-internal" },
+      "targets": [
+        {
+          "expr": "increase(tellscope_gateway_calls_total[5m])",
+          "legendFormat": "{{provider}} {{profile}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "pointSize": 5, "spanNulls": false, "showPoints": "never" },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      }
     }
   ],
   "refresh": "10s",

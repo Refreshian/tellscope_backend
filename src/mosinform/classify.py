@@ -10,6 +10,20 @@ import httpx
 from .catalog import Catalog
 from .models import Message
 
+try:
+    from mlops.gateway import GatewayError, chat as llm_chat
+    from mlops.lineage import cache_fingerprint, file_hash
+    from mlops.lock import generate_cfg, prompt_id as lock_prompt_id
+    from mlops.prompts import render_prompt
+except ImportError:  # local CLI without mlops on PYTHONPATH
+    GatewayError = None
+    llm_chat = None
+    cache_fingerprint = None
+    file_hash = None
+    generate_cfg = None
+    lock_prompt_id = None
+    render_prompt = None
+
 INITIATED_MARKERS = (
     "пресс-служб",
     "сообщили в департамент",
@@ -34,14 +48,28 @@ def classify_messages(
     progress=None,
 ) -> list[Message]:
     ts_cfg = (settings or {}).get("tellscope") or {}
+    prompt_id = ts_cfg.get("prompt_id") or (lock_prompt_id("mosinform_classify", "classify_v1") if lock_prompt_id else "classify_v1")
+    model = ts_cfg.get("model") or (generate_cfg()["model"] if generate_cfg else os.environ.get("VLLM_MODEL") or "Qwen/Qwen3-32B-FP8")
+    catalog_hash = ""
+    if file_hash:
+        from .catalog import CONFIG
+
+        catalog_hash = file_hash(CONFIG / "objects.yaml")
+    fp = cache_fingerprint(model, prompt_id, catalog_hash) if cache_fingerprint else "legacy"
     cache: dict[str, dict] = {}
+    versioned_path = None
     if cache_dir:
-        cache_path = Path(cache_dir) / "tellscope.jsonl"
-        if cache_path.exists():
-            for line in cache_path.read_text(encoding="utf-8").splitlines():
+        versioned_path = Path(cache_dir) / f"classify_{fp}.jsonl"
+        legacy_path = Path(cache_dir) / "tellscope.jsonl"
+        chosen = versioned_path if versioned_path.exists() else legacy_path
+        if chosen.exists():
+            for line in chosen.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     rec = json.loads(line)
-                    cache[rec["id"]] = rec
+                    if rec.get("id"):
+                        cache[rec["id"]] = rec
+        ts_cfg["_cache_key"] = fp
+        ts_cfg["_cache_legacy"] = chosen == legacy_path and not versioned_path.exists()
 
     pending: list[Message] = []
     for msg in messages:
@@ -55,13 +83,15 @@ def classify_messages(
     if ts_cfg.get("enabled") and pending:
         if progress:
             progress(f"LLM-разметка {len(pending)} текстов")
+        ts_cfg["prompt_id"] = prompt_id
         results = _vllm_classify(pending, catalog, ts_cfg, progress=progress)
         if cache_dir:
             cache_dir.mkdir(parents=True, exist_ok=True)
-            with (Path(cache_dir) / "tellscope.jsonl").open("a", encoding="utf-8") as fh:
+            out_path = versioned_path or (Path(cache_dir) / "tellscope.jsonl")
+            with out_path.open("a", encoding="utf-8") as fh:
                 for rec in results:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        by_id = {r["id"]: r for r in results}
+        by_id = {r["id"]: r for r in results if r.get("id")}
         for msg in pending:
             if msg.id in by_id:
                 _apply_model(msg, by_id[msg.id])
@@ -116,92 +146,116 @@ def _apply_model(msg: Message, rec: dict) -> None:
 
 
 def _vllm_classify(messages: list[Message], catalog: Catalog, cfg: dict, progress=None) -> list[dict]:
-    base = (cfg.get("base_url") or os.environ.get("VLLM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
     model = cfg.get("model") or os.environ.get("VLLM_MODEL") or "Qwen/Qwen3-32B-FP8"
     batch_size = max(1, min(int(cfg.get("batch_size") or 4), 4))
     timeout = float(cfg.get("timeout_sec") or 180)
     text_limit = int(cfg.get("text_limit") or 1000)
     max_tokens = int(cfg.get("max_tokens") or 400)
     allowed = ", ".join(f"{o.id} ({o.short})" for o in catalog.objects)
-    system = (
-        "Ты аналитик медиаприсутствия органов власти Москвы. "
-        "/no_think\n"
-        "Верни ТОЛЬКО JSON вида {\"items\":[...]} без рассуждений и без markdown. "
-        f"object_ids только из списка: {allowed}. "
-        "Поля item: id, object_ids (массив), sentiment (positive|neutral|negative), "
-        "role (main|episodic|background), initiated (true если похоже на релиз/пресс-службу)."
-    )
-    url = f"{base}/v1/chat/completions"
+    prompt_id = cfg.get("prompt_id") or "classify_v1"
+    if render_prompt:
+        system = render_prompt(prompt_id, allowed=allowed)
+    else:
+        system = (
+            "Ты аналитик медиаприсутствия органов власти Москвы. "
+            "/no_think\n"
+            "Верни ТОЛЬКО JSON вида {\"items\":[...]} без рассуждений и без markdown. "
+            f"object_ids только из списка: {allowed}. "
+            "Поля item: id, object_ids (массив), sentiment (positive|neutral|negative), "
+            "role (main|episodic|background), initiated (true если похоже на релиз/пресс-службу)."
+        )
     out: list[dict] = []
-    with httpx.Client(timeout=timeout) as client:
-        total = len(messages)
-        for i in range(0, total, batch_size):
-            chunk = messages[i : i + batch_size]
-            items = _classify_chunk(client, url, model, system, chunk, text_limit, max_tokens)
-            out.extend(items)
-            done = min(i + batch_size, total)
-            if progress and (done == total or done % 20 == 0 or i == 0):
-                progress(f"размечено {done}/{total}")
+    total = len(messages)
+    for i in range(0, total, batch_size):
+        chunk = messages[i : i + batch_size]
+        items = _classify_chunk(model, system, chunk, text_limit, max_tokens, timeout)
+        out.extend(items)
+        done = min(i + batch_size, total)
+        if progress and (done == total or done % 20 == 0 or i == 0):
+            progress(f"размечено {done}/{total}")
     return out
 
 
 def _classify_chunk(
-    client: httpx.Client,
-    url: str,
     model: str,
     system: str,
     chunk: list[Message],
     text_limit: int,
     max_tokens: int,
+    timeout: float,
 ) -> list[dict]:
     if not chunk:
         return []
-    items = _post_classify(client, url, model, system, chunk, text_limit, max_tokens)
+    items = _post_classify(model, system, chunk, text_limit, max_tokens, timeout)
     if items is not None:
         return items
     if len(chunk) > 1:
         mid = len(chunk) // 2
-        return _classify_chunk(client, url, model, system, chunk[:mid], text_limit, max_tokens) + _classify_chunk(
-            client, url, model, system, chunk[mid:], text_limit, max_tokens
+        return _classify_chunk(model, system, chunk[:mid], text_limit, max_tokens, timeout) + _classify_chunk(
+            model, system, chunk[mid:], text_limit, max_tokens, timeout
         )
     if text_limit > 400:
-        return _classify_chunk(client, url, model, system, chunk, 400, min(max_tokens, 192))
+        return _classify_chunk(model, system, chunk, 400, min(max_tokens, 192), timeout)
     return []
 
 
 def _post_classify(
-    client: httpx.Client,
-    url: str,
     model: str,
     system: str,
     chunk: list[Message],
     text_limit: int,
     max_tokens: int,
+    timeout: float,
 ) -> list[dict] | None:
     payload_items = [
         {"id": m.id, "title": m.title, "source": m.source, "text": (m.text or "")[:text_limit]}
         for m in chunk
     ]
-    body = {
-        "model": model,
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
-        ],
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
+    extra = {"chat_template_kwargs": {"enable_thinking": False}}
     try:
-        resp = client.post(url, json=body)
-        if resp.status_code == 400:
-            return None
-        resp.raise_for_status()
-        content = (((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+        if llm_chat:
+            result = llm_chat(
+                provider="vllm",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
+                ],
+                model=model,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra=extra,
+            )
+            content = result.content
+        else:
+            base = (os.environ.get("VLLM_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+            resp = httpx.Client(timeout=timeout).post(
+                f"{base}/v1/chat/completions",
+                json={
+                    "model": model,
+                    "temperature": 0.1,
+                    "max_tokens": max_tokens,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(payload_items, ensure_ascii=False)},
+                    ],
+                    **extra,
+                },
+            )
+            if resp.status_code == 400:
+                return None
+            resp.raise_for_status()
+            content = (((resp.json().get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
         parsed = _parse_json(content)
         items = parsed.get("items") if isinstance(parsed, dict) else parsed
         return items if isinstance(items, list) else []
-    except httpx.HTTPError:
+    except Exception as exc:
+        if GatewayError and isinstance(exc, GatewayError) and exc.status_code == 400:
+            return None
+        if isinstance(exc, httpx.HTTPError):
+            return None
+        if GatewayError and isinstance(exc, GatewayError):
+            return None
         return None
 
 
@@ -220,19 +274,8 @@ def _parse_json(text: str):
 
 
 def rewrite_insights_aitunnel(bundle, catalog, settings: dict) -> dict:
-    key = os.environ.get("AITUNNEL_API_KEY") or ((settings or {}).get("aitunnel") or {}).get("api_key")
-    if not key:
-        return {}
-    base = (
-        ((settings or {}).get("aitunnel") or {}).get("base_url")
-        or os.environ.get("AITUNNEL_BASE_URL")
-        or "https://api.aitunnel.ru/v1"
-    ).rstrip("/")
-    model = (
-        ((settings or {}).get("aitunnel") or {}).get("model")
-        or os.environ.get("AITUNNEL_MODEL")
-        or "gpt-4.1-mini"
-    )
+    cfg = (settings or {}).get("aitunnel") or {}
+    prompt_id = cfg.get("prompt_id") or "insights_v1"
     top = [
         {
             "name": catalog.label(s.object_id),
@@ -247,15 +290,42 @@ def rewrite_insights_aitunnel(bundle, catalog, settings: dict) -> dict:
     for st in bundle.object_stats[:5]:
         titles = [m.title for m in bundle.messages if st.object_id in m.object_ids and m.title][:6]
         headlines[catalog.label(st.object_id)] = titles
-    prompt = (
-        "Ты готовишь слайды рейтинга медиаприсутствия ОИВ Москвы в деловом стиле пилота Мосинформ. "
-        "По цифрам и заголовкам напиши JSON с ключами volume, speakers, media, tone, role, concentration, initiated, observations. "
-        "Каждый ключ кроме observations — массив из ровно 4 коротких фраз на русском (1–2 предложения). "
-        "observations — массив из 3 объектов {title, fact, meaning, full}. Без воды и эмодзи.\n\n"
-        f"Период: {bundle.period_label}\nСтатистика: {json.dumps(top, ensure_ascii=False)}\n"
-        f"Заголовки: {json.dumps(headlines, ensure_ascii=False)}"
-    )
+    if render_prompt:
+        prompt = render_prompt(
+            prompt_id,
+            period=bundle.period_label,
+            stats=json.dumps(top, ensure_ascii=False),
+            headlines=json.dumps(headlines, ensure_ascii=False),
+        )
+    else:
+        prompt = (
+            "Ты готовишь слайды рейтинга медиаприсутствия ОИВ Москвы в деловом стиле пилота Мосинформ. "
+            "По цифрам и заголовкам напиши JSON с ключами volume, speakers, media, tone, role, concentration, initiated, observations. "
+            "Каждый ключ кроме observations — массив из ровно 4 коротких фраз на русском (1–2 предложения). "
+            "observations — массив из 3 объектов {title, fact, meaning, full}. Без воды и эмодзи.\n\n"
+            f"Период: {bundle.period_label}\nСтатистика: {json.dumps(top, ensure_ascii=False)}\n"
+            f"Заголовки: {json.dumps(headlines, ensure_ascii=False)}"
+        )
     try:
+        if llm_chat:
+            result = llm_chat(
+                provider="aitunnel",
+                profile="mosinform_insights",
+                messages=[
+                    {"role": "system", "content": "Отвечай только валидным JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=2500,
+                timeout=90,
+            )
+            data = _parse_json(result.content)
+            return data if isinstance(data, dict) else {}
+        key = os.environ.get("AITUNNEL_API_KEY") or cfg.get("api_key")
+        if not key:
+            return {}
+        base = (cfg.get("base_url") or os.environ.get("AITUNNEL_BASE_URL") or "https://api.aitunnel.ru/v1").rstrip("/")
+        model = cfg.get("model") or os.environ.get("AITUNNEL_MODEL") or "gpt-4.1-mini"
         with httpx.Client(timeout=90) as client:
             resp = client.post(
                 f"{base}/chat/completions",
