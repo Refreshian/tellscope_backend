@@ -12,7 +12,7 @@ import time
 logger = logging.getLogger(__name__)
 
 # 🔥 КРИТИЧЕСКИ ВАЖНО: Устанавливаем ПЕРЕД любыми импортами
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'  # Только GPU 3
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Только GPU 0
 os.environ['TORCH_NVML_BASED_CUDA_CHECK'] = '0'  # Отключаем NVML
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
@@ -24,9 +24,9 @@ load_dotenv()
 multiprocessing.set_start_method('spawn', force=True)
 
 def kill_gpu_processes():
-    """Убиваем все процессы, использующие GPU 3"""
+    """Убиваем все процессы, использующие GPU 0"""
     try:
-        cmd = "nvidia-smi --id=3 --query-compute-apps=pid --format=csv,noheader"
+        cmd = "nvidia-smi --id=0 --query-compute-apps=pid --format=csv,noheader"
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         
         if result.returncode == 0 and result.stdout.strip():
@@ -42,8 +42,8 @@ def kill_gpu_processes():
                         pass
         
         # Сброс GPU
-        subprocess.run("nvidia-smi --gpu-reset -i 3", shell=True, capture_output=True)
-        logger.info("✅ GPU 3 сброшен")
+        subprocess.run("nvidia-smi --gpu-reset -i 0", shell=True, capture_output=True)
+        logger.info("✅ GPU 0 сброшен")
         
     except Exception as e:
         logger.error(f"❌ Ошибка при очистке GPU: {e}")

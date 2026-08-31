@@ -13,16 +13,16 @@ from io import BytesIO
 
 from docx import Document
 from docx.shared import Inches
-from openai import OpenAI
+
+from mlops.gateway import GatewayChatClient, achat
+from mlops.lock import external_cfg, generate_cfg, prompt_id as lock_prompt_id
+from mlops.prompts import render_prompt
 
 # ==========================================
-# КОНФИГУРАЦИЯ (без изменений)
+# КОНФИГУРАЦИЯ (модели из serving lock, ключи только из .env)
 # ==========================================
-EXTERNAL_API_KEY = "sk-aitunnel-PrKMg8fNFewHciI2DvmAHGaD8g7cSyjD"
-EXTERNAL_BASE_URL = "https://api.aitunnel.ru/v1/"
-EXTERNAL_MODEL = "claude-sonnet-4.5"
-LOCAL_MODEL_NAME = "Qwen/Qwen3-32B-FP8"
-LOCAL_LLM_URL = "http://localhost:8000/v1/chat/completions"
+EXTERNAL_MODEL = (external_cfg("smart_agent_planner").get("model") or "claude-sonnet-4.5")
+LOCAL_MODEL_NAME = (generate_cfg().get("model") or "Qwen/Qwen3-32B-FP8")
 BATCH_SIZE = 32
 MAX_CONCURRENCY = 64
 CONNECT_TIMEOUT = 15
@@ -35,80 +35,33 @@ MAX_RETRIES = 2
 
 class ExternalLLMbrain:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=EXTERNAL_API_KEY,
-            base_url=EXTERNAL_BASE_URL,
-        )
+        self.client = GatewayChatClient(provider="aitunnel", profile="smart_agent_planner")
 
     def _is_english_requested(self, text: str) -> bool:
         lowered = text.lower()
         return "english" in lowered or "англий" in lowered
 
     def plan_task(self, user_query: str, data_sample: str, available_columns: List[str] = None) -> Dict[str, Any]:
+        """
+        Строит JSON-план анализа данных по запросу пользователя.
+        План должен описывать:
+        - какие режимы анализа нужны (темы, тональность, демография);
+        - какие графики и по каким полям нужно построить;
+        - структуру итогового Word-отчета.
+        """
         columns_info = f"\n\nДоступные колонки в данных: {', '.join(available_columns)}" if available_columns else ""
         needs_english = self._is_english_requested(user_query)
         target_language = "английском" if needs_english else "русском"
 
-        system_prompt = f"""
-        Ты - гениальный архитектор анализа данных. Твоя задача - превратить сложный запрос пользователя в детализированный, структурированный JSON-план для Python-скрипта.
-        На вход подается:
-        1. Запрос пользователя.
-        2. Образец данных (JSON структура).{columns_info}
-
-        Твоя цель - создать JSON-план, который агент сможет выполнить шаг за шагом. Особое внимание удели запросам, где требуется анализ "каждой тематики". Для этого используй блок `"type": "thematic_breakdown"`.
-
-        Язык ответа в отчете: {target_language}.
-
-        ТЫ ДОЛЖЕН ВЕРНУТЬ ТОЛЬКО ВАЛИДНЫЙ JSON СТРОГО ПО ФОРМАТУ НИЖЕ. БЕЗ ПОЯСНЕНИЙ.
-
-        ФОРМАТ JSON-ПЛАНА:
-        {{
-            "filters": {{...}},
-            "analysis_needed": true,
-            "local_llm_system_prompt": "...",
-            "local_llm_user_question": "...",
-            "report_title": "Название отчета",
-            "report_structure": [
-                {{ "type": "title" }},
-                {{ "type": "section", "title": "1. Введение", "content_source": "user_query" }},
-                {{ "type": "overall_stats" }},
-                {{
-                    "type": "thematic_breakdown",
-                    "title": "2. Детальный анализ тематик",
-                    "breakdown_by_column": "llm_result_clean",
-                    "max_themes": 7,
-                    "num_examples": 5,
-                    "thematic_section_structure": ["introduction", "demographics_chart", "examples"]
-                }},
-                {{ "type": "section", "title": "3. Итоговые выводы", "content_source": "final_conclusions" }}
-            ]
-        }}
-
-        ПРИМЕР ЗАПРОСА ПОЛЬЗОВАТЕЛЯ: "Проанализируй все сообщения темы 'Платон', создай отчет: какие тематики есть и сделай отчет по каждой тематике: 1. Во введении каждой тематики расскажи про что она. 2. Нарисуй график распределения авторов по полу и возрасту. 3. Приведи 5 примеров."
-
-        ПРИМЕР ИДЕАЛЬНОГО JSON-ПЛАНА ДЛЯ ЭТОГО ЗАПРОСА:
-        {{
-            "filters": {{}},
-            "analysis_needed": true,
-            "local_llm_system_prompt": "Ты — классификатор текста. Определи основную тему сообщения. Ответ - ТОЛЬКО название темы (1-3 слова) на русском. Без рассуждений.",
-            "local_llm_user_question": "Определи тему этого сообщения.",
-            "report_title": "Анализ обсуждений системы 'Платон' в соцмедиа",
-            "report_structure": [
-                {{ "type": "title" }},
-                {{ "type": "section", "title": "1. Введение", "content_source": "user_query" }},
-                {{ "type": "overall_stats", "title": "Общая статистика по теме 'Платон'" }},
-                {{
-                    "type": "thematic_breakdown",
-                    "title": "2. Детальный анализ тематик обсуждений",
-                    "breakdown_by_column": "llm_result_clean",
-                    "max_themes": 7,
-                    "num_examples": 5,
-                    "thematic_section_structure": ["introduction", "demographics_chart", "examples"]
-                }},
-                {{ "type": "section", "title": "3. Итоговые выводы", "content_source": "final_conclusions" }}
-            ]
-        }}
-        """
+        try:
+            system_prompt = render_prompt(
+                lock_prompt_id("smart_agent_plan", "smart_agent_plan_v1"),
+                columns_info=columns_info,
+                target_language=target_language,
+            )
+        except Exception as e:
+            print(f"ОШИБКА загрузки промпта плана: {e}. Используется план по умолчанию.")
+            return self._get_default_plan(user_query, target_language)
         try:
             response = self.client.chat.completions.create(
                 messages=[
@@ -122,8 +75,10 @@ class ExternalLLMbrain:
             content = response.choices[0].message.content
             print(f"DEBUG: Получен план от API:\n{content}\n")
             plan = json.loads(content)
-            if "report_structure" not in plan or not plan["report_structure"]:
-                 raise ValueError("План не содержит report_structure")
+            from mlops.eval_plan import validate_plan
+            errors = validate_plan(plan)
+            if errors:
+                raise ValueError("; ".join(errors))
             return plan
         except Exception as e:
             print(f"ОШИБКА при создании плана: {e}. Используется план по умолчанию.")
@@ -131,19 +86,18 @@ class ExternalLLMbrain:
 
     def generate_thematic_intro(self, topic_name: str, topic_examples: List[str], user_query: str) -> str:
         examples_str = "\n".join([f"- {ex[:250]}..." for ex in topic_examples])
-        prompt = f"""
-        Ты аналитик соцмедиа. Напиши короткое (3-4 предложения) введение для раздела отчета, посвященного тематике "{topic_name}".
-        Общий контекст анализа: "{user_query}".
-
-        Вот примеры сообщений из этой тематики:
-        {examples_str}
-
-        В своем тексте кратко опиши:
-        1. О чем эта тематика.
-        2. В каком ключе (позитивном, негативном, нейтральном) идут обсуждения, судя по примерам.
-
-        Отвечай только готовым текстом на русском языке, без заголовков, Markdown и рассуждений.
-        """
+        try:
+            prompt = render_prompt(
+                lock_prompt_id("smart_agent_intro", "smart_agent_intro_v1"),
+                topic_name=topic_name,
+                user_query=user_query,
+                examples_str=examples_str,
+            )
+        except Exception:
+            prompt = (
+                f"Напиши короткое введение (3-4 предложения) для тематики \"{topic_name}\" "
+                f"в контексте \"{user_query}\". Примеры:\n{examples_str}"
+            )
         try:
             response = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
@@ -156,15 +110,14 @@ class ExternalLLMbrain:
             return f"Не удалось автоматически сгенерировать описание для тематики '{topic_name}'. Эта тема выделена на основе анализа сообщений."
 
     def generate_narrative(self, stats_data: str, user_query: str) -> str:
-        prompt = f"""
-        Ты профессиональный аналитик соцмедиа. Пользователь просил: "{user_query}".
-        Вот ОБЩАЯ итоговая статистика после обработки всех данных:
-        {stats_data}
-
-        Напиши раздел "Итоговые выводы" для Word-отчета.
-        Обобщи основные тренды, дай интерпретацию цифрам и результатам анализа тематик. Текст должен быть связным, профессиональным, на русском языке.
-        Не используй Markdown, не используй жирный/курсив. Не добавляй рассуждения. Дай чистый готовый текст.
-        """
+        try:
+            prompt = render_prompt(
+                lock_prompt_id("smart_agent_narrative", "smart_agent_narrative_v1"),
+                user_query=user_query,
+                stats_data=stats_data,
+            )
+        except Exception:
+            prompt = f"Напиши итоговые выводы по запросу \"{user_query}\". Статистика:\n{stats_data}"
         try:
             response = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
@@ -201,20 +154,29 @@ class ExternalLLMbrain:
 # ... Классы LocalLLMWorker и ReportBuilder остаются без изменений ...
 class LocalLLMWorker:
     def __init__(self): self.session = None
-    async def _create_session(self): return aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=512, limit_per_host=256), timeout=aiohttp.ClientTimeout(total=TOTAL_TIMEOUT, connect=CONNECT_TIMEOUT))
     async def _generate_single(self, text: str, system_prompt: str, user_question: str) -> str:
         if not text: return "Пустой текст"
         cleaned_text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)[:4000]
-        payload = {"model": LOCAL_MODEL_NAME, "messages": [{"role": "system", "content": system_prompt},{"role": "user", "content": f"{user_question}\n\nТекст:\n{cleaned_text}"}],"temperature": 0.1, "max_tokens": 200 }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{user_question}\n\nТекст:\n{cleaned_text}"},
+        ]
         for attempt in range(MAX_RETRIES + 1):
             try:
-                async with self.session.post(LOCAL_LLM_URL, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(); answer = data['choices'][0]['message']['content'].strip(); return re.sub(r'(?i)\bthink\b[:：]?', '', answer).split("Ответ:")[-1].strip()
-            except Exception: await asyncio.sleep(0.5 * (2 ** attempt))
+                result = await achat(
+                    provider="vllm",
+                    messages=messages,
+                    model=LOCAL_MODEL_NAME,
+                    temperature=0.1,
+                    max_tokens=200,
+                    timeout=TOTAL_TIMEOUT,
+                )
+                answer = (result.content or "").strip()
+                return re.sub(r'(?i)\bthink\b[:：]?', '', answer).split("Ответ:")[-1].strip()
+            except Exception:
+                await asyncio.sleep(0.5 * (2 ** attempt))
         return "Ошибка анализа"
     async def process_batch(self, texts: List[str], system_prompt: str, user_question: str) -> List[str]:
-        self.session = await self._create_session()
         semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
         async def worker(txt):
             async with semaphore: return await self._generate_single(txt, system_prompt, user_question)
@@ -223,9 +185,7 @@ class LocalLLMWorker:
             if i % 10 == 0:
                 await self.progress_callback(f"Анализ текстов: {i}/{total}...")
             await f
-        results = await asyncio.gather(*tasks)
-        await self.session.close()
-        return results
+        return await asyncio.gather(*tasks)
 
 class ReportBuilder:
     def __init__(self, filename="Analytics_Report.docx"): self.doc = Document(); self.filename = filename
@@ -305,6 +265,8 @@ class SocialMediaAgent:
         self.worker = LocalLLMWorker()
         self.worker.progress_callback = progress_callback # Передаем callback в воркер
         self.data_df = None
+        # Кэш плана на время выполнения задачи
+        self._plan: Dict[str, Any] = {}
         self.progress_callback = progress_callback
 
     async def _log_progress(self, message: str):
@@ -327,7 +289,125 @@ class SocialMediaAgent:
         df = self.data_df.copy()
         # Тут может быть сложная логика фильтрации
         self.data_df = df
-        
+
+    def _get_analysis_modes(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Безопасно читает блок analysis_modes с разумными значениями по умолчанию
+        для обратной совместимости со старыми планами.
+        """
+        default_modes = {
+            "topics": plan.get("analysis_needed", True),
+            "sentiment": False,
+            "demographics": ["sex", "age_group", "hub"],
+        }
+        modes = plan.get("analysis_modes") or {}
+        # не ломаемся, если пришёл странный тип
+        if not isinstance(modes, dict):
+            return default_modes
+        return {
+            "topics": bool(modes.get("topics", default_modes["topics"])),
+            "sentiment": bool(modes.get("sentiment", default_modes["sentiment"])),
+            "demographics": modes.get("demographics", default_modes["demographics"]),
+        }
+
+    async def _run_sentiment_analysis_if_needed(self, analysis_modes: Dict[str, Any]):
+        """
+        Запускает дополнительный проход локальной LLM для тональности,
+        если это указано в analysis_modes.
+        """
+        if not analysis_modes.get("sentiment"):
+            return
+
+        if self.data_df is None or self.data_df.empty:
+            return
+
+        await self._log_progress("Этап 1b: Анализ тональности сообщений...")
+
+        # Промпты можно позже сделать настраиваемыми через план, пока — дефолтные.
+        system_prompt = (
+            "Ты — анализатор тональности текста. "
+            "Определи общую тональность сообщения: Позитив, Негатив или Нейтрально. "
+            "Ответь ТОЛЬКО одним словом из этого списка."
+        )
+        user_question = "Определи тональность этого сообщения."
+
+        texts = self.data_df["text"].fillna("").tolist()
+        sentiments = await self.worker.process_batch(texts, system_prompt, user_question)
+
+        def _normalize_sentiment(raw: str) -> str:
+            if not raw:
+                return "Не определено"
+            t = raw.strip().lower()
+            if "позит" in t or "positive" in t:
+                return "Позитив"
+            if "негат" in t or "negative" in t:
+                return "Негатив"
+            if "нейтр" in t or "neutral" in t:
+                return "Нейтрально"
+            return "Не определено"
+
+        self.data_df["sentiment"] = [ _normalize_sentiment(x) for x in sentiments ]
+
+    def _get_chart_defs(self, plan: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """
+        Возвращает словарь описаний графиков по их id.
+        Если в плане нет поля charts, добавляет разумный дефолтный набор.
+        """
+        charts_list = plan.get("charts")
+        if not charts_list or not isinstance(charts_list, list):
+            charts_list = [
+                {
+                    "id": "sex_distribution",
+                    "title": "Распределение авторов по полу",
+                    "type": "pie",
+                    "group_by": "sex",
+                    "filter": {},
+                },
+                {
+                    "id": "age_distribution",
+                    "title": "Распределение авторов по возрастным группам",
+                    "type": "bar",
+                    "group_by": "age_group",
+                    "filter": {},
+                },
+                {
+                    "id": "hub_distribution",
+                    "title": "Распределение сообщений по площадкам",
+                    "type": "bar",
+                    "group_by": "hub",
+                    "filter": {},
+                },
+            ]
+        charts_map = {}
+        for ch in charts_list:
+            if isinstance(ch, dict) and "id" in ch:
+                charts_map[ch["id"]] = ch
+        return charts_map
+
+    def _build_series_for_chart(self, chart_def: Dict[str, Any], df: pd.DataFrame) -> pd.Series:
+        """
+        Универсальный билдер pd.Series для графика по описанию chart_def.
+        Умеет учитывать простейший фильтр (равенства по колонкам).
+        """
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+
+        work_df = df
+        filter_spec = chart_def.get("filter") or {}
+        if isinstance(filter_spec, dict) and filter_spec:
+            for col, value in filter_spec.items():
+                if col in work_df.columns:
+                    work_df = work_df[work_df[col] == value]
+
+        group_by = chart_def.get("group_by")
+        if not group_by or group_by not in work_df.columns:
+            return pd.Series(dtype=float)
+
+        series = work_df[group_by].astype(str).replace(
+            ["nan", "None", ""], "Не указан"
+        ).value_counts()
+        return series
+
     async def run_task(self, user_query: str, input_file: str, report_save_path: str):
         # 1. ЗАГРУЗКА И ПЛАНИРОВАНИЕ
         await self._log_progress("Загрузка и подготовка данных...")
@@ -337,30 +417,51 @@ class SocialMediaAgent:
         
         await self._log_progress("Планирование анализа (мозг агента)...")
         plan = await asyncio.to_thread(self.brain.plan_task, user_query, sample, columns)
-        await self._log_progress(f"План утвержден: {json.dumps(plan, ensure_ascii=False, indent=2)}")
+        # сохраняем план локально, чтобы переиспользовать
+        self._plan = plan or {}
+        await self._log_progress(f"План утвержден: {json.dumps(self._plan, ensure_ascii=False, indent=2)}")
+
+        analysis_modes = self._get_analysis_modes(self._plan)
+        charts_map = self._get_chart_defs(self._plan)
 
         # 2. ФИЛЬТРАЦИЯ
         await self._log_progress("Применение фильтров...")
-        self.filter_data(plan.get('filters', {}))
+        self.filter_data(self._plan.get('filters', {}))
         if self.data_df.empty:
             raise Exception("Нет данных после фильтрации. Отчет не может быть создан.")
 
         # 3. АНАЛИЗ ТЕМ (КЛАССИФИКАЦИЯ)
-        if plan.get('analysis_needed'):
-            await self._log_progress("Этап 1: Классификация сообщений...")
-            texts = self.data_df['text'].fillna("").tolist()
-            labels = await self.worker.process_batch(texts, plan['local_llm_system_prompt'], plan['local_llm_user_question'])
-            self.data_df['llm_result_clean'] = [re.sub(r'[^\w\s-]', '', str(x)).strip().capitalize() for x in labels]
-            self.data_df = self.data_df[self.data_df['llm_result_clean'].str.len() > 1]
-            self.data_df = self.data_df[~self.data_df['llm_result_clean'].str.contains("Ошибка анализа", case=False)]
+        if analysis_modes.get("topics") and self._plan.get("analysis_needed"):
+            await self._log_progress("Этап 1: Классификация сообщений по тематикам...")
+            texts = self.data_df["text"].fillna("").tolist()
+            labels = await self.worker.process_batch(
+                texts,
+                self._plan["local_llm_system_prompt"],
+                self._plan["local_llm_user_question"],
+            )
+            self.data_df["llm_result_clean"] = [
+                re.sub(r"[^\w\s-]", "", str(x)).strip().capitalize() for x in labels
+            ]
+            self.data_df = self.data_df[self.data_df["llm_result_clean"].str.len() > 1]
+            self.data_df = self.data_df[
+                ~self.data_df["llm_result_clean"].str.contains(
+                    "Ошибка анализа", case=False
+                )
+            ]
+
+        # 3b. АНАЛИЗ ТОНАЛЬНОСТИ (ОПЦИОНАЛЬНО)
+        await self._run_sentiment_analysis_if_needed(analysis_modes)
         
         # 4. СБОРКА ОТЧЕТА ПО ПЛАНУ
         await self._log_progress("Этап 2: Сборка итогового отчета...")
         report = ReportBuilder(filename=report_save_path)
         
-        report_context = { "user_query": user_query, "report_title": plan.get("report_title", "Аналитический отчет") }
+        report_context = {
+            "user_query": user_query,
+            "report_title": self._plan.get("report_title", "Аналитический отчет"),
+        }
 
-        for section_plan in plan.get("report_structure", []):
+        for section_plan in self._plan.get("report_structure", []):
             section_type = section_plan.get("type")
             
             if section_type == "title": report.add_title(report_context["report_title"])
@@ -413,11 +514,73 @@ class SocialMediaAgent:
                             examples_data = topic_df.head(num_examples).to_dict('records')
                             report.add_examples(examples_data, title="Примеры сообщений по теме", level=3)
 
+            elif section_type == "sentiment_overview" and "sentiment" in self.data_df.columns:
+                await self._log_progress("Формирование раздела с анализом тональности...")
+                title = section_plan.get("title", "Анализ тональности")
+                report.add_heading(title, level=1)
+
+                sentiment_col = section_plan.get("sentiment_column", "sentiment")
+                if sentiment_col in self.data_df.columns:
+                    sent_dist = (
+                        self.data_df[sentiment_col]
+                        .astype(str)
+                        .replace(["nan", "None", ""], "Не определено")
+                        .value_counts()
+                    )
+                    report.add_chart(
+                        "Распределение сообщений по тональности",
+                        sent_dist,
+                        chart_type="pie",
+                        level=2,
+                    )
+
+            elif section_type == "custom_chart_section":
+                await self._log_progress("Формирование пользовательского раздела с графиками...")
+                title = section_plan.get("title", "Дополнительные графики")
+                report.add_heading(title, level=1)
+
+                chart_ids = section_plan.get("charts") or []
+                for ch_id in chart_ids:
+                    ch_def = charts_map.get(ch_id)
+                    if not ch_def:
+                        continue
+                    series = self._build_series_for_chart(ch_def, self.data_df)
+                    chart_title = ch_def.get("title", ch_id)
+                    chart_type = ch_def.get("type", "bar")
+                    report.add_chart(chart_title, series, chart_type=chart_type, level=2)
+
         # 5. ГЕНЕРАЦИЯ ИТОГОВЫХ ВЫВОДОВ
-        final_conclusion_section = next((s for s in plan["report_structure"] if s.get("content_source") == "final_conclusions"), None)
+        final_conclusion_section = next(
+            (s for s in self._plan.get("report_structure", []) if s.get("content_source") == "final_conclusions"),
+            None,
+        )
         if final_conclusion_section:
             await self._log_progress("Этап 3: Генерация итоговых выводов...")
-            stats_summary = {"total_messages": len(self.data_df), "unique_authors": self.data_df['authorObject'].apply(lambda x: x.get('id') if isinstance(x, dict) else None).nunique(), "analysis_top_results": self.data_df.get('llm_result_clean', pd.Series(dtype=str)).value_counts().head(5).to_dict()}
+            # Расширенный набор статистик для LLM
+            stats_summary = {
+                "total_messages": len(self.data_df),
+                "unique_authors": self.data_df["authorObject"]
+                .apply(lambda x: x.get("id") if isinstance(x, dict) else None)
+                .nunique(),
+                "analysis_top_results": self.data_df.get(
+                    "llm_result_clean", pd.Series(dtype=str)
+                )
+                .value_counts()
+                .head(5)
+                .to_dict(),
+            }
+            if "sentiment" in self.data_df.columns:
+                stats_summary["sentiment_distribution"] = (
+                    self.data_df["sentiment"]
+                    .astype(str)
+                    .replace(["nan", "None", ""], "Не определено")
+                    .value_counts()
+                    .to_dict()
+                )
+            if "hub" in self.data_df.columns:
+                stats_summary["hub_distribution"] = (
+                    self.data_df["hub"].astype(str).value_counts().head(10).to_dict()
+                )
             stats_str = json.dumps(stats_summary, ensure_ascii=False)
             conclusions = await asyncio.to_thread(self.brain.generate_narrative, stats_str, user_query)
             report.add_section(final_conclusion_section.get("title", "Итоговые выводы"), conclusions, level=1)

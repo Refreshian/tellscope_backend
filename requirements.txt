@@ -83,6 +83,7 @@ huggingface-hub==0.36.0
 humanfriendly==10.0
 hyperframe==6.1.0
 idna==3.11
+ijson>=3.3.0
 imageio==2.37.0
 importlib_metadata==8.4.0
 importlib_resources==6.4.5

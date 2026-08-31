@@ -15,7 +15,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 # 🔥 НОВОЕ: Отключаем NVML в форк-процессах
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'  # Используем только GPU 3
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # GPU 0: embeddings
 os.environ['TORCH_NVML_BASED_CUDA_CHECK'] = '0'  # Отключаем проверку через NVML
 
 class ModelManager:
@@ -34,8 +34,9 @@ class ModelManager:
     def __init__(self, device_id=None):
         with self._lock:
             if not self._initialized:
-                self.model_path = "deepvk/USER2-base"
                 self.cache_folder = '/home/dev/tellscope_app/tellscope_backend/data/embed_models'
+                self.model_name = "deepvk/USER2-base"
+                self.local_model_path = os.path.join(self.cache_folder, "USER2-base")
                 self.device = None
                 self.preferred_device_id = device_id if device_id is not None else 0  # Используем GPU 0 (видимый как единственный)
                 self._initialized = True
@@ -147,7 +148,7 @@ class ModelManager:
                 
                 logger.info(f"✅ Доступно GPU: {available_gpus}")
                 
-                # Используем первый доступный GPU (это GPU 3 из-за CUDA_VISIBLE_DEVICES)
+                # Используем первый доступный GPU (это GPU 0 из-за CUDA_VISIBLE_DEVICES)
                 device_id = 0
                 torch.cuda.set_device(device_id)
                 device = f'cuda:{device_id}'
@@ -208,11 +209,15 @@ class ModelManager:
                 logger.info(f"📦 Загрузка модели на устройство: {self.device}")
                 
                 try:
+                    # Сначала используем локальную копию, чтобы не зависеть от сети/DNS.
+                    model_source = self.local_model_path if os.path.isdir(self.local_model_path) else self.model_name
+                    logger.info(f"📦 Источник модели: {model_source}")
                     self._model = SentenceTransformer(
-                        self.model_path,
+                        model_source,
                         device=self.device,
                         cache_folder=self.cache_folder,
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        local_files_only=os.path.isdir(self.local_model_path)
                     )
                     
                     # Тестовое кодирование

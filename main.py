@@ -9,7 +9,7 @@ import itertools
 import re
 import shutil
 import tempfile
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union, Dict, Tuple
 from collections import ChainMap, defaultdict
 import time
 from os import listdir 
@@ -32,7 +32,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import BackgroundTasks, FastAPI, File, Request, UploadFile, WebSocket, logger, status, Depends, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 # from fastapi.exceptions import ValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import uvicorn
 import numpy as np
 
@@ -118,6 +118,13 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Скрыть INFO и WARNING соо�
 
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:50"
 os.environ["SUNO_USE_SMALL_MODELS"] = "True"
+
+# Локальный vLLM (OpenAI-compatible). Если VLLM_MODEL не задан — берётся первый id из GET {base}/v1/models
+_VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000").rstrip("/")
+VLLM_CHAT_COMPLETIONS_URL = f"{_VLLM_BASE_URL}/v1/chat/completions"
+VLLM_MODELS_URL = f"{_VLLM_BASE_URL}/v1/models"
+VLLM_MODEL_ENV = os.environ.get("VLLM_MODEL")
+_VLLM_FALLBACK_MODEL_ID = "Qwen/Qwen3-32B-FP8"
  
 DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 engine = create_async_engine(DATABASE_URL)
@@ -2105,6 +2112,815 @@ async def competitors(query: QueryCompetitors): # , user: User = Depends(current
     }
 
 
+class LCAExamplesRequest(BaseModel):
+    """Запрос для получения синтетических примеров по типу/подтипу метафоры."""
+    frame_type: Optional[str] = None
+    frame_subtype: Optional[str] = None
+    limit_per_cluster: int = 4
+    custom_topic: Optional[str] = None
+    # Явный выбор модели LLM для генерации примеров; по умолчанию используется глобальный ai_model
+    model_name: Optional[str] = None
+    # Дополнительные настройки генерации
+    author_gender: Optional[str] = None      # 'Мужской' / 'Женский' / другое
+    author_age_group: Optional[str] = None   # '18-25', '26-35', '36-50', '51+' и т.п.
+    person: Optional[str] = None             # 'я', 'мы', 'они', 'он/она', 'ты/вы'
+    max_chars: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=8000,
+        description="Ограничение на длину текста в символах",
+    )
+
+
+FIXED_LCA_PROFILES: Dict[Tuple[str, str], Dict[str, str]] = {
+    # Тип → Подтип → (пол, возраст, платформа) по таблице 8.1 Word-отчёта
+    ("4. СЕМЕЙНЫЕ", "Семья/род"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("1. ПРОСТРАНСТВЕННЫЕ", "Дом/жилище"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("6. ВОЕННЫЕ", "Крепость/оборона"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("2. ОРГАНИЧЕСКИЕ", "Рождение/рост"): {
+        "author_gender": "Женский",
+        "author_age_group": "36-50",
+        "platform": "VK",
+    },
+    ("10. ИСТОРИЧЕСКИЕ", "Наследие/памятник"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("3. МЕХАНИЧЕСКИЕ", "Строительство"): {
+        "author_gender": "Мужской",
+        "author_age_group": "36-50",
+        "platform": "VK",
+    },
+    ("9. ИГРОВЫЕ", "Игра/партия"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("5. САКРАЛЬНЫЕ", "Миссия/предназначение"): {
+        "author_gender": "Мужской",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("7. ПРИРОДНЫЕ", "Почва/земля"): {
+        "author_gender": "Мужской",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+    ("8. МЕДИЦИНСКИЕ", "Болезнь/здоровье"): {
+        "author_gender": "Женский",
+        "author_age_group": "51+",
+        "platform": "VK",
+    },
+}
+
+# Кэш статистики по полу/возрасту для типов метафор
+METAPHOR_DEM_STATS: Dict[str, Dict[str, Dict]] = {}
+
+
+@app.get("/metaphor-taxonomy", tags=['ai analytics'])
+async def get_metaphor_taxonomy():
+    """
+    Возвращает полную типологию метафор (типы и подтипы),
+    чтобы фронтенд мог показывать все варианты, независимо от результатов LCA.
+    """
+    taxonomy = [
+        {
+            "frame_type": "1. ПРОСТРАНСТВЕННЫЕ",
+            "subtypes": ["Путь/дорога", "Центр-периферия", "Дом/жилище", "Граница/рубеж"],
+        },
+        {
+            "frame_type": "2. ОРГАНИЧЕСКИЕ",
+            "subtypes": ["Организм/тело", "Дерево/корни", "Рождение/рост"],
+        },
+        {
+            "frame_type": "3. МЕХАНИЧЕСКИЕ",
+            "subtypes": ["Машина/механизм", "Строительство", "Инструмент"],
+        },
+        {
+            "frame_type": "4. СЕМЕЙНЫЕ",
+            "subtypes": ["Мать/отец", "Братство", "Семья/род"],
+        },
+        {
+            "frame_type": "5. САКРАЛЬНЫЕ",
+            "subtypes": ["Храм/святыня", "Жертва", "Миссия/предназначение"],
+        },
+        {
+            "frame_type": "6. ВОЕННЫЕ",
+            "subtypes": ["Крепость/оборона", "Битва/война", "Армия/строй"],
+        },
+        {
+            "frame_type": "7. ПРИРОДНЫЕ",
+            "subtypes": ["Стихия/поток", "Почва/земля", "Климат/погода"],
+        },
+        {
+            "frame_type": "8. МЕДИЦИНСКИЕ",
+            "subtypes": ["Болезнь/здоровье", "Вирус/зараза", "Хирургия/ампутация"],
+        },
+        {
+            "frame_type": "9. ИГРОВЫЕ",
+            "subtypes": ["Игра/партия", "Спектакль/роль"],
+        },
+        {
+            "frame_type": "10. ИСТОРИЧЕСКИЕ",
+            "subtypes": ["Эпоха/век", "Наследие/памятник"],
+        },
+    ]
+    return {"taxonomy": taxonomy}
+
+
+def _age_to_group(age_val) -> Optional[str]:
+    """Группировка возраста в интервалы, совпадающие с фронтендом."""
+    if age_val is None:
+        return None
+    try:
+        age_int = int(str(age_val).strip())
+    except (ValueError, TypeError):
+        return None
+    if age_int <= 25:
+        return "18-25"
+    if age_int <= 35:
+        return "26-35"
+    if age_int <= 50:
+        return "36-50"
+    return "51+"
+
+
+def _load_metaphor_dem_stats() -> Dict[str, Dict]:
+    """
+    Загружает файл patriotism_text_clusters.xlsx и считает,
+    сколько авторов каждого пола/возрастной группы есть в каждом типе метафор.
+    """
+    global METAPHOR_DEM_STATS
+    if METAPHOR_DEM_STATS:
+        return METAPHOR_DEM_STATS
+
+    path = "/home/dev/tellscope_app/tellscope_backend/data/patriotism_text_clusters.xlsx"
+    try:
+        df = pd.read_excel(path)
+    except FileNotFoundError:
+        return {}
+
+    stats: Dict[str, Dict] = {}
+
+    for _, row in df.iterrows():
+        ft = row.get("frame_type")
+        if not isinstance(ft, str) or not ft.strip():
+            continue
+
+        gender_raw = row.get("author_gender", "")
+        gender_str = str(gender_raw).strip().lower()
+        # Обрабатываем NaN / пустые значения как "не указан"
+        if not gender_str or gender_str in ("nan", "none"):
+            gender_norm = "не указан"
+        else:
+            gender_norm = gender_str
+
+        age_raw = row.get("author_age", None)
+        age_group = _age_to_group(age_raw)
+        if not age_group:
+            # Пустой или некорректный возраст считаем как отдельную группу
+            age_group = "Не указана"
+
+        if ft not in stats:
+            stats[ft] = {"total": 0, "by_gender_age": {}, "by_gender": {}, "by_age": {}}
+
+        stats[ft]["total"] += 1
+        key = (gender_norm, age_group)
+        stats[ft]["by_gender_age"][key] = stats[ft]["by_gender_age"].get(key, 0) + 1
+        # агрегаты отдельно по полу и по возрасту
+        stats[ft]["by_gender"][gender_norm] = stats[ft]["by_gender"].get(gender_norm, 0) + 1
+        stats[ft]["by_age"][age_group] = stats[ft]["by_age"].get(age_group, 0) + 1
+
+    METAPHOR_DEM_STATS = stats
+    return stats
+
+
+@app.get("/metaphor-dominant-demographics", tags=['ai analytics'])
+async def get_metaphor_dominant_demographics(frame_type: str):
+    """
+    Возвращает наиболее частое сочетание пола и возрастной группы
+    для заданного типа метафор (по данным patriotism_text_clusters.xlsx),
+    игнорируя случаи, когда пол или возраст не указаны.
+    """
+    if not frame_type:
+        raise HTTPException(status_code=400, detail="Параметр frame_type обязателен.")
+
+    stats = _load_metaphor_dem_stats()
+    ft_stats = stats.get(frame_type)
+    if not ft_stats or ft_stats.get("total", 0) == 0:
+        return {
+            "frame_type": frame_type,
+            "author_gender": None,
+            "author_age_group": None,
+            "count": 0,
+            "total": 0,
+            "percent": 0.0,
+        }
+
+    by_ga = ft_stats["by_gender_age"]
+    best_key = None
+    best_count = 0
+
+    # Ищем просто самую частую комбинацию пола и возраста
+    for (g, ag), cnt in by_ga.items():
+        if cnt > best_count:
+            best_count = cnt
+            best_key = (g, ag)
+
+    if not best_key:
+        return {
+            "frame_type": frame_type,
+            "author_gender": None,
+            "author_age_group": None,
+            "count": 0,
+            "total": int(ft_stats["total"]),
+            "percent": 0.0,
+        }
+
+    gender_norm, age_group = best_key
+    total = ft_stats["total"]
+    percent = round(100.0 * best_count / total, 1) if total > 0 else 0.0
+
+    # Нормализуем отображение пола
+    if gender_norm == "не указан":
+        display_gender = "Не указан"
+    elif gender_norm in ("женский", "мужской"):
+        display_gender = gender_norm.capitalize()
+    else:
+        display_gender = str(gender_norm)
+
+    return {
+        "frame_type": frame_type,
+        "author_gender": display_gender,
+        "author_age_group": age_group,
+        "count": int(best_count),
+        "total": int(total),
+        "percent": percent,
+    }
+
+
+@app.get("/metaphor-demographics", tags=['ai analytics'])
+async def get_metaphor_demographics(
+    frame_type: str,
+    author_gender: Optional[str] = None,
+    author_age_group: Optional[str] = None,
+):
+    """
+    Возвращает процент сообщений в заданном типе метафор,
+    написанных авторами с указанным полом и возрастной группой.
+    """
+    if not frame_type:
+        raise HTTPException(status_code=400, detail="Параметр frame_type обязателен.")
+
+    # Должен быть указан хотя бы один из параметров (пол или возраст)
+    if not author_gender and not author_age_group:
+        raise HTTPException(
+            status_code=400,
+            detail="Для расчёта процента нужно указать хотя бы пол или возрастную группу.",
+        )
+
+    stats = _load_metaphor_dem_stats()
+    ft_stats = stats.get(frame_type)
+    if not ft_stats or ft_stats.get("total", 0) == 0:
+        return {
+            "frame_type": frame_type,
+            "author_gender": author_gender,
+            "author_age_group": author_age_group,
+            "count": 0,
+            "total": 0,
+            "percent": 0.0,
+        }
+
+    gender_norm = str(author_gender).strip().lower() if author_gender else None
+    age_group = author_age_group
+    by_ga = ft_stats["by_gender_age"]
+
+    # 3 режима: и пол, и возраст; только пол; только возраст
+    if gender_norm and age_group:
+        # Особый случай: «не указан» / «Не указана» — считаем долю таких записей
+        # среди всех сообщений данного типа (включая известные и неизвестные).
+        if gender_norm == "не указан" or age_group == "Не указана":
+            count = by_ga.get((gender_norm, age_group), 0)
+            denom = ft_stats["total"]
+        else:
+            # считаем только по записям с непустым полом в этой возрастной группе
+            count = by_ga.get((gender_norm, age_group), 0)
+            denom = sum(v for (g, ag), v in by_ga.items() if ag == age_group and g)
+    elif gender_norm:
+        # только пол
+        if gender_norm == "не указан":
+            # доля неизвестного пола среди всех сообщений данного типа
+            count = sum(v for (g, ag), v in by_ga.items() if g == gender_norm)
+            denom = ft_stats["total"]
+        else:
+            # делим на все записи с известным полом
+            count = sum(v for (g, ag), v in by_ga.items() if g == gender_norm)
+            denom = sum(v for (g, ag), v in by_ga.items() if g)
+    elif age_group:
+        # только возраст: считаем долю этой возрастной группы среди всех сообщений
+        # данного типа (включая и известный, и неизвестный возраст)
+        count = sum(v for (g, ag), v in by_ga.items() if ag == age_group)
+        denom = ft_stats["total"]
+    else:
+        count = 0
+        denom = 0
+
+    percent = round(100.0 * count / denom, 1) if denom > 0 else 0.0
+
+    return {
+        "frame_type": frame_type,
+        "author_gender": author_gender,
+        "author_age_group": author_age_group,
+        "count": int(count),
+        "total": int(denom),
+        "percent": percent,
+    }
+
+
+@app.post("/lca-examples", tags=['ai analytics'])
+async def get_lca_examples(query: LCAExamplesRequest):
+    """
+    Возвращает сгенерированные примеры сообщений по результатам LCA-кластеризации.
+    Источником служит файл patriotism_lca_synthetic_examples.json, который создаётся
+    скриптом metaphor_typology_analyzer_27.02.py.
+    """
+    lca_path = "/home/dev/tellscope_app/tellscope_backend/data/patriotism_lca_synthetic_examples.json"
+
+    try:
+        with open(lca_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Файл с синтетическими примерами не найден. Сначала запустите анализатор метафор."
+        )
+
+    records = data if isinstance(data, list) else []
+
+    # Фильтрация по типу / подтипу, если заданы
+    if query.frame_type:
+        records = [r for r in records if r.get("frame_type") == query.frame_type]
+    if query.frame_subtype:
+        records = [r for r in records if r.get("frame_subtype") == query.frame_subtype]
+
+    # Нормализуем желаемое количество примеров
+    desired_n = max(1, query.limit_per_cluster or 1)
+    # Определяем модель: либо явно запрошенная, либо глобальная по умолчанию
+    used_model = query.model_name or ai_model
+
+    # Функция для расчёта max_tokens по ограничению в символах
+    def compute_max_tokens(max_chars: Optional[int]) -> int:
+        if max_chars is None or max_chars <= 0:
+            return 300
+        # Для русского BPE чаще 2–3 символа на токен; деление на 3 занижало бюджет
+        # (300 символов → 100 токенов → фактически ~200 знаков у обрыва по max_tokens).
+        ceil_half = (max_chars + 1) // 2
+        slack = max(8, max_chars // 12)
+        approx_tokens = ceil_half + slack
+        return max(50, min(approx_tokens, 8192))
+
+    # Более жёсткое описание грамматического лица / позиции
+    def person_instruction(person: Optional[str]) -> str:
+        if not person:
+            return ""
+        mapping = {
+            "я": "Говори от первого лица единственного числа («я»), используй соответствующие формы глаголов и местоимений.",
+            "мы": "Говори от первого лица множественного числа («мы»), подчёркивай коллективную позицию.",
+            "они": "Говори о ситуации в третьем лице множественного числа («они»), как наблюдатель.",
+            "он/она": "Говори о персонаже в третьем лице единственного числа («он» / «она»), как сторонний наблюдатель.",
+            "ты/вы": "Обращайся к читателю на «ты» или «вы», используй форму обращения во втором лице.",
+        }
+        base = mapping.get(person, "")
+        if not base:
+            return ""
+        return base + " Всегда соблюдай это лицо при построении фраз."
+
+    # Если пользователь задал свой текст-контекст, генерируем примеры только по нему,
+    # не опираясь на оффлайн-файл с примерами.
+    if query.custom_topic and query.frame_type:
+        ft = query.frame_type
+        sub = query.frame_subtype
+
+        # Если подтип не указан, ищем его в FIXED_LCA_PROFILES по типу
+        if ft and not sub:
+            for (t, s) in FIXED_LCA_PROFILES.keys():
+                if t == ft:
+                    sub = s
+                    break
+
+        key = (ft, sub) if ft and sub else None
+        if not key or key not in FIXED_LCA_PROFILES:
+            raise HTTPException(
+                status_code=400,
+                detail="Для пользовательского текста нужен корректный тип/подтип из таксономии."
+            )
+
+        profile = FIXED_LCA_PROFILES[key]
+        portrait = {
+            "author_gender": profile.get("author_gender", "не указан"),
+            "author_age_group": profile.get("author_age_group", "не указана"),
+            "platform": profile.get("platform", "VK"),
+        }
+        # Переопределяем портрет, если пользователь задал пол / возраст явно
+        if query.author_gender:
+            portrait["author_gender"] = query.author_gender
+        if query.author_age_group:
+            portrait["author_age_group"] = query.author_age_group
+
+        topic = query.custom_topic[:500]  # ограничим длину контекста
+        person_hint = ""
+        if query.person:
+            person_hint = f"\nГрамматическое лицо / позиция говорящего: {query.person}."
+        person_rule = person_instruction(query.person)
+
+        max_tokens = compute_max_tokens(query.max_chars)
+
+        system_msg = (
+            "Ты — симулятор пользователя российских социальных сетей. "
+            "Пиши естественные, правдоподобные посты/комментарии на русском языке, "
+            "без объяснений и метакомментариев. "
+            "Строго соблюдай заданный портрет аудитории и грамматическое лицо."
+        )
+
+        examples = []
+        for i in range(desired_n):
+            user_prompt = f"""
+Профиль автора:
+- Пол: {portrait['author_gender']}
+- Возрастная группа: {portrait['author_age_group']}
+- Платформа: {portrait['platform']}
+{person_hint}
+
+Метафорический фрейм:
+- Тип: {ft}
+- Подтип: {sub}
+
+Текст-пример (контекст):
+\"\"\"{topic}\"\"\"
+
+ЗАДАНИЕ:
+На основе этого текста-примера сгенерируй новый текст (1–4 предложения), который:
+- выглядел бы как реальный пост или комментарий в {portrait['platform']};
+- сохраняет основную тему и интонацию примера, но не копирует его дословно;
+- использует образность фрейма «{ft} → {sub}» (на уровне смысла).
+
+Если указано лицо/позиция говорящего, строго следуй ему:
+{person_rule or 'если лицо не задано, выбери его сам, но делай текст естественным для данного пола и возраста.'}
+
+Ограничение по длине: не более {query.max_chars or 'примерно 300'} символов.
+
+Сделай этот пример стилистически отличным от возможных других сообщений:
+можно варьировать тон (более ироничный, более официально-деловой, более эмоциональный и т.п.).
+
+Ответь только текстом сообщения без каких-либо пояснений.
+"""
+            try:
+                resp = client.chat.completions.create(
+                    model=used_model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.9,
+                )
+                text = resp.choices[0].message.content.strip()
+            except Exception as e:
+                text = f"Ошибка генерации: {e}"
+
+            examples.append(
+                {
+                    "example_idx": i + 1,
+                    "topic_context": topic,
+                    "source_url": "",
+                    "source_id": "",
+                    "generated_post": text,
+                    "cluster_id": -1,
+                }
+            )
+
+        return {
+            "frames": [
+                {
+                    "frame_type": ft,
+                    "frame_subtype": sub,
+                    "portrait": portrait,
+                    "examples": examples,
+                }
+            ]
+        }
+
+    # Если в файле нет примеров для запрошенного типа/подтипа —
+    # пробуем сгенерировать их «на лету» по FIXED_LCA_PROFILES.
+    if not records:
+        ft = query.frame_type
+        sub = query.frame_subtype
+
+        # Если подтип не указан, ищем его в FIXED_LCA_PROFILES по типу
+        if ft and not sub:
+            for (t, s) in FIXED_LCA_PROFILES.keys():
+                if t == ft:
+                    sub = s
+                    break
+
+        key = (ft, sub) if ft and sub else None
+        if not key or key not in FIXED_LCA_PROFILES:
+            raise HTTPException(
+                status_code=404,
+                detail="Нет примеров для указанного типа/подтипа метафор."
+            )
+
+        profile = FIXED_LCA_PROFILES[key]
+        portrait = {
+            "author_gender": profile.get("author_gender", "не указан"),
+            "author_age_group": profile.get("author_age_group", "не указана"),
+            "platform": profile.get("platform", "VK"),
+        }
+        # Переопределяем портрет при явном выборе
+        if query.author_gender:
+            portrait["author_gender"] = query.author_gender
+        if query.author_age_group:
+            portrait["author_age_group"] = query.author_age_group
+
+        # Генерируем примеры на лету через LLM
+        n = desired_n
+        examples = []
+        topic = f"Обсуждение патриотизма в рамках фрейма {ft} → {sub}"
+
+        system_msg = (
+            "Ты — симулятор пользователя российских социальных сетей. "
+            "Пиши естественные, правдоподобные посты/комментарии на русском языке, "
+            "без объяснений и метакомментариев. "
+            "Строго соблюдай заданный портрет аудитории и грамматическое лицо."
+        )
+
+        person_hint = ""
+        if query.person:
+            person_hint = f"\nГрамматическое лицо / позиция говорящего: {query.person}."
+        person_rule = person_instruction(query.person)
+
+        max_tokens = compute_max_tokens(query.max_chars)
+
+        for i in range(n):
+            user_prompt = f"""
+Профиль автора:
+- Пол: {portrait['author_gender']}
+- Возрастная группа: {portrait['author_age_group']}
+- Платформа: {portrait['platform']}
+{person_hint}
+
+Метафорический фрейм:
+- Тип: {ft}
+- Подтип: {sub}
+
+Тема сообщения:
+- {topic}
+
+ЗАДАНИЕ:
+Напиши короткий, но содержательный текст (1–4 предложения), который:
+- выглядел бы как реальный пост или комментарий в {portrait['platform']};
+- использует образность фрейма «{ft} → {sub}» (на уровне смысла, а не обязательного повторения слов);
+- отражает патриотический дискурс (история, единство, общая семья, долг, память и т.п.).
+
+Если указано лицо/позиция говорящего, строго следуй ему:
+{person_rule or 'если лицо не задано, выбери его сам, но делай текст естественным для данного пола и возраста.'}
+
+Ограничение по длине: не более {query.max_chars or 'примерно 300'} символов.
+
+Сделай этот пример стилистически отличным от возможных других сообщений:
+можно варьировать тон (более ироничный, более официально-деловой, более эмоциональный и т.п.).
+
+Ответь только текстом сообщения без каких-либо пояснений.
+"""
+            try:
+                resp = client.chat.completions.create(
+                    model=used_model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.85,
+                )
+                text = resp.choices[0].message.content.strip()
+            except Exception as e:
+                text = f"Ошибка генерации: {e}"
+
+            examples.append(
+                {
+                    "example_idx": i + 1,
+                    "topic_context": topic,
+                    "source_url": "",
+                    "source_id": "",
+                    "generated_post": text,
+                    "cluster_id": -1,
+                }
+            )
+
+        return {
+            "frames": [
+                {
+                    "frame_type": ft,
+                    "frame_subtype": sub,
+                    "portrait": portrait,
+                    "examples": examples,
+                }
+            ]
+        }
+
+    from collections import Counter  # локальный импорт
+
+    # Группируем по (frame_type, frame_subtype)
+    grouped: Dict[Tuple[str, str], list] = {}
+    for r in records:
+        key = (r.get("frame_type"), r.get("frame_subtype"))
+        grouped.setdefault(key, []).append(r)
+
+    def most_common(counter: Counter, default: str) -> str:
+        return counter.most_common(1)[0][0] if counter else default
+
+    response_frames = []
+    for (frame_type, frame_subtype), items in grouped.items():
+        key = (frame_type, frame_subtype)
+
+        # 1) Пытаемся взять портрет прямо из LCA-кластера (как в Word-отчёте)
+        lca_portrait = None
+        for it in items:
+            p = it.get("portrait")
+            if isinstance(p, dict) and p:
+                lca_portrait = p
+                break
+
+        if lca_portrait:
+            def extract_field(key_p: str, default: str) -> str:
+                raw = lca_portrait.get(key_p, "")
+                if isinstance(raw, str):
+                    return raw.split(" (")[0].strip() or default
+                return str(raw) or default
+
+            portrait = {
+                "author_gender": extract_field("author_gender", "не указан"),
+                "author_age_group": extract_field("author_age_group", "не указана"),
+                "platform": extract_field("platform", "VK"),
+            }
+        elif key in FIXED_LCA_PROFILES:
+            # 2) ЖЁСТКОЕ соответствие Word-таблице 8.1, если нет портрета в данных
+            fixed = FIXED_LCA_PROFILES[key]
+            portrait = {
+                "author_gender": fixed.get("author_gender", "не указан"),
+                "author_age_group": fixed.get("author_age_group", "не указана"),
+                "platform": fixed.get("platform", "VK"),
+            }
+        else:
+            # 3) Fallback: считаем по самим примерам
+            gender_counter = Counter(i.get("author_gender") for i in items if i.get("author_gender"))
+            age_counter = Counter(i.get("author_age_group") for i in items if i.get("author_age_group"))
+            platform_counter = Counter(i.get("platform") for i in items if i.get("platform"))
+
+            portrait = {
+                "author_gender": most_common(gender_counter, "не указан"),
+                "author_age_group": most_common(age_counter, "не указана"),
+                "platform": most_common(platform_counter, "VK"),
+            }
+
+        # Берём не более desired_n примеров из файла
+        limited_items = items[: desired_n]
+        examples = [
+            {
+                "example_idx": it.get("example_idx"),
+                "topic_context": it.get("topic_context", ""),
+                "source_url": it.get("source_url", ""),
+                "source_id": it.get("source_id", ""),
+                "generated_post": it.get("generated_post", ""),
+                "cluster_id": it.get("cluster_human_id", it.get("cluster_id")),
+            }
+            for it in limited_items
+        ]
+
+        # Если примеров меньше, чем нужно — досинтезируем недостающие на лету
+        if len(examples) < desired_n:
+            ft = frame_type
+            sub = frame_subtype
+            topic = (
+                limited_items[0].get("topic_context", "")
+                if limited_items and limited_items[0].get("topic_context")
+                else f"Обсуждение патриотизма в рамках фрейма {ft} → {sub}"
+            )
+
+            system_msg = (
+                "Ты — симулятор пользователя российских социальных сетей. "
+                "Пиши естественные, правдоподобные посты/комментарии на русском языке, "
+                "без объяснений и метакомментариев. "
+                "Строго соблюдай заданный портрет аудитории и грамматическое лицо."
+            )
+
+            person_hint = ""
+            if query.person:
+                person_hint = f"\nГрамматическое лицо / позиция говорящего: {query.person}."
+            person_rule = person_instruction(query.person)
+
+            max_tokens = compute_max_tokens(query.max_chars)
+
+            for extra_idx in range(len(examples), desired_n):
+                user_prompt = f"""
+Профиль автора:
+- Пол: {portrait['author_gender']}
+- Возрастная группа: {portrait['author_age_group']}
+- Платформа: {portrait['platform']}
+{person_hint}
+
+Метафорический фрейм:
+- Тип: {ft}
+- Подтип: {sub}
+
+Тема сообщения:
+- {topic}
+
+ЗАДАНИЕ:
+Напиши короткий, но содержательный текст (1–4 предложения), который:
+- выглядел бы как реальный пост или комментарий в {portrait['platform']};
+- использует образность фрейма «{ft} → {sub}» (на уровне смысла, а не обязательного повторения слов);
+- отражает патриотический дискурс (история, единство, общая семья, долг, память и т.п.).
+
+Если указано лицо/позиция говорящего, строго следуй ему:
+{person_rule or 'если лицо не задано, выбери его сам, но делай текст естественным для данного пола и возраста.'}
+
+Ограничение по длине: не более {query.max_chars or 'примерно 300'} символов.
+
+Сделай этот пример стилистически отличным от возможных других сообщений:
+можно варьировать тон (более ироничный, более официально-деловой, более эмоциональный и т.п.).
+
+Ответь только текстом сообщения без каких-либо пояснений.
+"""
+                try:
+                    resp = client.chat.completions.create(
+                        model=used_model,
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        max_tokens=max_tokens,
+                        temperature=0.9,
+                    )
+                    text = resp.choices[0].message.content.strip()
+                except Exception as e:
+                    text = f"Ошибка генерации: {e}"
+
+                examples.append(
+                    {
+                        "example_idx": extra_idx + 1,
+                        "topic_context": topic,
+                        "source_url": "",
+                        "source_id": "",
+                        "generated_post": text,
+                        "cluster_id": -1,
+                    }
+                )
+
+        response_frames.append(
+            {
+                "frame_type": frame_type,
+                "frame_subtype": frame_subtype,
+                "portrait": portrait,
+                "examples": examples,
+            }
+        )
+
+    return {"frames": response_frames}
+
+
+@app.get("/configs", tags=['utils'], response_class=HTMLResponse)
+async def get_configs_page():
+    """
+    Отдаёт HTML-страницу с конфигами сервисов.
+    Файл лежит в фронтенд-проекте: src/components/configs.html.
+    """
+    cfg_path = "/home/dev/tellscope_app/tellscope_frontend/src/components/configs.html"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            html = f.read()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail="Файл configs.html не найден на сервере.",
+        )
+
+    return HTMLResponse(content=html, status_code=200)
+
+
 @app.get("/create-data-projector/{user_id}/{folder_name}/{file_name}")
 async def create_data_projector(user_id: str, folder_name: str, file_name: str, user: User = Depends(current_user)):
     # Путь к файлу с темами 
@@ -2508,6 +3324,41 @@ import traceback
 import aiohttp
 import torch
 from tqdm import tqdm
+
+_vllm_resolved_model_id: Optional[str] = None
+
+
+async def get_vllm_model_id() -> str:
+    """Модель из serving lock, иначе VLLM_MODEL / /v1/models."""
+    try:
+        from mlops.lock import generate_cfg
+        mid = (generate_cfg().get("model") or "").strip()
+        if mid:
+            return mid
+    except Exception:
+        pass
+    global _vllm_resolved_model_id
+    if VLLM_MODEL_ENV is not None and str(VLLM_MODEL_ENV).strip():
+        return str(VLLM_MODEL_ENV).strip()
+    if _vllm_resolved_model_id is not None:
+        return _vllm_resolved_model_id
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(VLLM_MODELS_URL) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for m in data.get("data") or []:
+                        mid = m.get("id")
+                        if mid:
+                            _vllm_resolved_model_id = str(mid)
+                            logging.info("vLLM model (auto from /v1/models): %s", _vllm_resolved_model_id)
+                            return _vllm_resolved_model_id
+    except Exception as e:
+        logging.warning("vLLM /v1/models auto-detect failed: %s", e)
+    return _VLLM_FALLBACK_MODEL_ID
+
+
 from datetime import datetime
 from transformers import AutoTokenizer, pipeline
 from sentence_transformers import SentenceTransformer
@@ -3384,7 +4235,20 @@ async def run_llm_query(task_data: dict):
         umap_model, hdbscan_model, topic_model = await umap_hdbscan_task
 
         # 11. Обучение BERTopic
-        topics, probs = topic_model.fit_transform(valid_data['texts'], valid_data['embeddings'])
+        try:
+            topics, probs = topic_model.fit_transform(valid_data['texts'], valid_data['embeddings'])
+        except ValueError as e:
+            if "min_df" not in str(e) and "max_df" not in str(e):
+                raise
+            logging.warning(f"BERTopic vectorizer fallback after: {e}")
+            topic_model.vectorizer_model = CountVectorizer(
+                analyzer='word',
+                token_pattern=r'(?u)\b\w+\b',
+                lowercase=True,
+                min_df=1,
+                max_df=1.0,
+            )
+            topics, probs = topic_model.fit_transform(valid_data['texts'], valid_data['embeddings'])
 
         # Обновляем статус
         await redis_db.hset(f"task:{task_data['task_id']}", mapping={
@@ -3498,6 +4362,11 @@ async def update_user_data(
         await redis_db.hset(task_data["user_id"], "bertopic_files_directory", serialized_folders)
         
         logging.info(f"✅ Данные пользователя обновлены: {file_info}")
+        try:
+            from mlops.runtime import finish_llm_run
+            finish_llm_run(task_data, status="done", artifact_dir=file_location)
+        except Exception:
+            pass
         
     except Exception as e:
         logging.error(f"❌ Ошибка при обновлении данных пользователя: {e}")
@@ -3693,14 +4562,14 @@ async def process_llm_requests_optimized(unique_texts: List[str], unique_texts_d
     
     logging.info(f"🚀 Начало LLM обработки: {len(unique_texts)} уникальных текстов")
     
-    # Проверка доступности LLM API
+    # Проверка доступности LLM API через serving lock
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("http://localhost:8000/v1/models", timeout=aiohttp.ClientTimeout(total=5)) as response:
-                if response.status == 200:
-                    logging.info("✅ LLM API доступен")
-                else:
-                    logging.error(f"⚠️ LLM API вернул статус {response.status}")
+        from mlops.gateway import ping_vllm
+        if await ping_vllm():
+            logging.info("✅ LLM API доступен")
+        else:
+            logging.error("⚠️ LLM API недоступен")
+            raise RuntimeError("vLLM /v1/models failed")
     except Exception as e:
         logging.error(f"❌ LLM API недоступен: {e}")
         raise
@@ -3727,57 +4596,44 @@ async def process_llm_requests_optimized(unique_texts: List[str], unique_texts_d
 
     async def generate_answer_with_retries(text: str, question: str, system_prompt: str = None, max_retries: int = 2) -> str:
         """Улучшенная версия generate_answer с повторными попытками"""
-        url = "http://localhost:8000/v1/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        
-        system_line = (
-            system_prompt.strip() if system_prompt else
-            "Ты отвечаешь очень кратко, только на поставленный вопрос. Только факт из текста, не повторяй формулировки вопроса."
-        )
-        
+        from mlops.gateway import GatewayError, achat
+
+        if system_prompt and system_prompt.strip():
+            system_line = system_prompt.strip()
+        else:
+            try:
+                from mlops.lock import prompt_id as lock_prompt_id
+                from mlops.prompts import render_prompt
+                system_line = render_prompt(lock_prompt_id("llm_run_default", "llm_run_default_v1"))
+            except Exception:
+                system_line = "Ты отвечаешь очень кратко, только на поставленный вопрос. Только факт из текста, не повторяй формулировки вопроса."
         user_content = f"Текст: {cached_truncate_text(text, 7500)}\n\nВопрос: {question.strip()}\n\nОтвет:"
 
-        payload = {
-            "model": "Qwen/Qwen3-32B-FP8",
-            "messages": [
-                {"role": "system", "content": system_line},
-                {"role": "user", "content": user_content}
-            ],
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "chat_template_kwargs": {"enable_thinking": False}
-        }
-
-        # Переиспользуем соединения
-        connector = aiohttp.TCPConnector(
-            limit=100,
-            limit_per_host=30,
-            keepalive_timeout=300,
-            enable_cleanup_closed=True
-        )
-        
-        timeout = aiohttp.ClientTimeout(total=60, connect=10)
-        
         for attempt in range(max_retries + 1):
             try:
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                    async with session.post(url, json=payload, headers=headers) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            generated = data["choices"][0]["message"]["content"]
-                            answer = generated.strip().rstrip('.').strip()
-                            return answer if answer else "Модель не ответила"
-                        else:
-                            if attempt < max_retries:
-                                await asyncio.sleep(0.1 * (attempt + 1))
-                                continue
-                            return f"Ошибка API: {response.status}"
-                            
-            except asyncio.TimeoutError:
+                result = await achat(
+                    provider="vllm",
+                    messages=[
+                        {"role": "system", "content": system_line},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.7,
+                    max_tokens=None,
+                    timeout=60,
+                    extra={"top_p": 0.8, "chat_template_kwargs": {"enable_thinking": False}},
+                )
+                answer = result.content.strip().rstrip(".").strip()
+                return answer if answer else "Модель не ответила"
+            except GatewayError as e:
+                if e.status_code == 0 and "timeout" in str(e).lower():
+                    if attempt < max_retries:
+                        await asyncio.sleep(0.1 * (attempt + 1))
+                        continue
+                    return "Timeout ошибка"
                 if attempt < max_retries:
                     await asyncio.sleep(0.1 * (attempt + 1))
                     continue
-                return "Timeout ошибка"
+                return f"Ошибка API: {e.status_code or str(e)}"
             except Exception as e:
                 if attempt < max_retries:
                     await asyncio.sleep(0.1 * (attempt + 1))
@@ -3891,13 +4747,17 @@ async def create_clustering_models_async(embeddings: np.ndarray, texts: List[str
         
         # BERTopic модель
         representation_model = MaximalMarginalRelevance(diversity=0.8)
+        # c-TF-IDF fits CountVectorizer on one concatenated document per topic.
+        # min_df=2 + max_df=0.9 raises "max_df corresponds to < documents than min_df"
+        # when HDBSCAN finds fewer than 3 topics (typical for short query slices).
+        n_docs = max(len(texts) if texts is not None else 0, len(embeddings) if embeddings is not None else 0, 1)
         vectorizer_model = CountVectorizer(
             analyzer='word',
             token_pattern=r'(?u)\b\w+\b',
             lowercase=True,
-            min_df=2,  # Увеличьте min_df для фильтрации редких слов
-            max_df=0.9,  # Уменьшите max_df
-            ngram_range=(1, 3),  # Расширьте диапазон n-gram
+            min_df=1,
+            max_df=1.0,
+            ngram_range=(1, 2) if n_docs < 80 else (1, 3),
             stop_words=None
         )
         
@@ -3906,7 +4766,7 @@ async def create_clustering_models_async(embeddings: np.ndarray, texts: List[str
             verbose=True,
             representation_model=representation_model,
             vectorizer_model=vectorizer_model,
-            min_topic_size=3,  # Увеличьте минимальный размер топика
+            min_topic_size=2 if n_docs < 40 else 3,
             calculate_probabilities=True
         )
         
@@ -3933,6 +4793,48 @@ def prepare_valid_data(texts: List[str], llm_labels: List, embeddings: np.ndarra
     valid_data['embeddings'] = np.array(valid_data['embeddings'])
     return valid_data
 
+
+
+def clean_theme_text(label) -> str:
+    """Drop internal hash ids and 'Тематика текста:' prefixes from LLM labels."""
+    import re
+    if isinstance(label, (tuple, list)):
+        label = label[-1] if len(label) >= 2 else (label[0] if label else "")
+    if label is None:
+        return ""
+    text = str(label).strip()
+    text = re.sub(r"^[0-9a-fA-F]{32}\d{8}[,:;\s-]*", "", text).strip()
+    prefixes = (
+        "Тематика текста:",
+        "Тематика текста",
+        "Тематика:",
+        "Тема текста:",
+        "Тема:",
+    )
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            text = text[len(prefix):].strip(" :,-")
+            break
+    return text
+
+
+def unpack_saved_llm_labels(saved_data):
+    """Normalize pickle formats to (hashes|None, list[str] labels)."""
+    hashes, labels = None, []
+    if isinstance(saved_data, dict) and "labels" in saved_data:
+        hashes = saved_data.get("hashes")
+        labels = saved_data.get("labels") or []
+    elif isinstance(saved_data, list) and saved_data:
+        first = saved_data[0]
+        if isinstance(first, (tuple, list)) and len(first) >= 2:
+            hashes = [item[0] for item in saved_data]
+            labels = [item[1] for item in saved_data]
+        else:
+            labels = saved_data
+    else:
+        labels = saved_data or []
+    return hashes, [clean_theme_text(x) for x in labels]
 
 def clean_label(label: str) -> str:
     """Очистка и форматирование заголовка"""
@@ -4086,33 +4988,14 @@ async def generate_topic_label_optimized(
     if len(clean_keywords) == 0:
         return "Разные темы (нет общего)"
     
-    url = "http://localhost:8000/v1/chat/completions"
-    headers = {"Content-Type": "application/json"}
-    
-    # УЛУЧШЕННЫЙ ПРОМПТ с чёткой структурой
-    system_prompt = """Ты эксперт по созданию коротких, понятных заголовков для тематических кластеров текстов.
+    from mlops.gateway import GatewayError, achat
+    from mlops.lock import prompt_id as lock_prompt_id
+    from mlops.prompts import render_prompt
 
-ПРАВИЛА:
-1. Заголовок должен быть на РУССКОМ языке
-2. Длина: 3-6 слов (максимум 8)
-3. Формат: существительное + определение ИЛИ глагольная конструкция
-4. БЕЗ общих слов типа "тема", "вопрос", "проблема"
-5. БЕЗ перечисления ключевых слов через запятую
-6. Заголовок должен отражать СУТЬ, а не просто список слов
-7. Используй конкретные термины из ключевых слов
-
-ПРИМЕРЫ ХОРОШИХ заголовков:
-- "Управление персоналом и мотивация"
-- "Цифровая трансформация бизнеса"
-- "Стратегии работы с клиентами"
-- "Инновации в образовании"
-
-ПРИМЕРЫ ПЛОХИХ заголовков:
-- "10 ключевых моментов" (слишком общо)
-- "HR, персонал, управление" (просто список)
-- "Основные понятия и практики" (нет конкретики)
-
-Отвечай ТОЛЬКО заголовком, без пояснений."""
+    try:
+        system_prompt = render_prompt(lock_prompt_id("llm_topic_label", "topic_label_v1"))
+    except Exception:
+        system_prompt = "Ты эксперт по созданию коротких заголовков тематик. Отвечай ТОЛЬКО заголовком на русском, 3-6 слов."
 
     # Формируем контекст с весами для лучшего понимания
     context = f"Ключевые слова: {key_words}"
@@ -4123,48 +5006,37 @@ async def generate_topic_label_optimized(
 
 Создай краткий заголовок (3-6 слов), который точно отражает тему:"""
 
-    payload = {
-        "model": "Qwen/Qwen3-32B-FP8",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        "temperature": 0.5,  # Понижена для более стабильных результатов
-        "top_p": 0.85,
-        "max_tokens": 50,  # Ограничение длины ответа
-        "chat_template_kwargs": {"enable_thinking": False}
-    }
-
-    timeout = aiohttp.ClientTimeout(total=30)
-    
     for attempt in range(max_retries + 1):
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload, headers=headers) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        label = data["choices"][0]["message"]["content"].strip()
-                        
-                        # Валидация ответа
-                        if validate_label(label, key_words):
-                            return label
-                        else:
-                            # Если валидация не прошла, пробуем ещё раз
-                            if attempt < max_retries:
-                                await asyncio.sleep(0.2)
-                                continue
-                            return "Разные темы (нет общего)"
-                    else:
-                        if attempt < max_retries:
-                            await asyncio.sleep(0.2)
-                            continue
-                        return "Разные темы (нет общего)"
+            result = await achat(
+                provider="vllm",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.5,
+                max_tokens=50,
+                timeout=30,
+                extra={"top_p": 0.85, "chat_template_kwargs": {"enable_thinking": False}},
+            )
+            label = result.content.strip()
+            if validate_label(label, key_words):
+                return label
+            if attempt < max_retries:
+                await asyncio.sleep(0.2)
+                continue
+            return "Разные темы (нет общего)"
+        except GatewayError:
+            if attempt < max_retries:
+                await asyncio.sleep(0.2)
+                continue
+            return "Разные темы (нет общего)"
         except Exception:
             if attempt < max_retries:
                 await asyncio.sleep(0.2)
                 continue
             return "Разные темы (нет общего)"
-    
+
     return "Разные темы (нет общего)"
 
 async def save_visualizations_async(topic_model: BERTopic, valid_data: Dict, 
@@ -4471,11 +5343,27 @@ async def llm_run(
             "total_texts": "0",
             "completed_texts": "0",
             "progress": "0",
-            "bad_request": "0"
+            "bad_request": "0",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
         }
 
+        try:
+            from mlops.runtime import GpuBusy, assert_can_start, register_llm_run
+            assert_can_start("llm-run")
+        except GpuBusy as exc:
+            holder = (exc.holders or [{}])[0]
+            return JSONResponse(
+                status_code=409,
+                content={"error": f"GPU занят задачей {holder.get('product')} {holder.get('job_id')}"},
+            )
         await redis_db.hset(f"task:{task_id}", mapping=task_data)
         await redis_db.rpush("queue:tasks", task_id)
+        try:
+            from mlops.runtime import register_llm_run
+            register_llm_run(task_data, status="pending")
+        except Exception:
+            pass
 
         # Проверка на количество активных задач
         # active_tasks = await redis_db.get("active_tasks_count") or 0
@@ -4534,13 +5422,29 @@ async def process_task(task_id: str, task_data: dict, background_tasks: Backgrou
         if await redis_db.set(f"lock:task:{task_id}", "1", nx=True, ex=300):
             try:
                 # Обновляем статус задачи
-                await redis_db.hset(f"task:{task_id}", "status", "in_progress")
+                await redis_db.hset(
+                    f"task:{task_id}",
+                    mapping={"status": "in_progress", "updated_at": datetime.now().isoformat()},
+                )
+                try:
+                    from mlops.runtime import register_llm_run
+                    register_llm_run({**task_data, "updated_at": datetime.now().isoformat()}, status="in_progress")
+                except Exception:
+                    pass
 
                 # Выполнение обработки
                 await run_llm_query(task_data)
 
                 # Отмечаем задачу как завершенную
-                await redis_db.hset(f"task:{task_id}", "status", "done")
+                await redis_db.hset(
+                    f"task:{task_id}",
+                    mapping={"status": "done", "updated_at": datetime.now().isoformat()},
+                )
+                try:
+                    from mlops.runtime import register_llm_run
+                    register_llm_run({**task_data, "status": "done", "updated_at": datetime.now().isoformat()}, status="done")
+                except Exception:
+                    pass
             finally:
                 # Удаляем блокировку
                 await redis_db.delete(f"lock:task:{task_id}")
@@ -4552,6 +5456,11 @@ async def process_task(task_id: str, task_data: dict, background_tasks: Backgrou
 
         # Обновляем статус в случае ошибки
         await redis_db.hset(f"task:{task_id}", mapping={"status": "failed", "error": str(e)})
+        try:
+            from mlops.runtime import register_llm_run
+            register_llm_run({**task_data, "status": "failed"}, status="failed")
+        except Exception:
+            pass
 
     finally:
         # Сбрасываем статус GPU
@@ -4762,14 +5671,7 @@ async def llm_analyze(user_id: int, folder_name: str, file_name: str):
         with open(llm_file_path, 'rb') as f:
             saved_data = pickle.load(f)
             
-        # Проверяем формат данных
-        if isinstance(saved_data, dict) and 'hashes' in saved_data and 'labels' in saved_data:
-            saved_hashes = saved_data['hashes']
-            saved_labels = saved_data['labels']
-        else:
-            # Старый формат - только список меток
-            saved_labels = saved_data
-            saved_hashes = None
+        saved_hashes, saved_labels = unpack_saved_llm_labels(saved_data)
             
     except Exception as e:
         print(f"Ошибка при загрузке файла меток: {str(e)}")
@@ -4788,16 +5690,18 @@ async def llm_analyze(user_id: int, folder_name: str, file_name: str):
             all_data = elastic_query(theme_index=indexes[info_html['index_number']], query_str=info_html['query_str'], 
                                  min_date=info_html['min_data'], max_date=info_html['max_data'])
         
-        # Фильтруем данные по сохраненным хэшам
+        # Фильтруем данные по сохраненным хэшам, сохраняя выравнивание меток
         filtered_data = []
+        aligned_labels = []
         hash_to_data = {item['hash']: item for item in all_data}
         
-        for hash_val in saved_hashes:
+        for hash_val, lab in zip(saved_hashes, saved_labels):
             if hash_val in hash_to_data:
                 filtered_data.append(hash_to_data[hash_val])
+                aligned_labels.append(lab)
         
         data = pd.DataFrame(filtered_data)
-        thematics = saved_labels
+        thematics = aligned_labels
         
     else:
         # Старый способ - используем весь запрос
@@ -6094,7 +6998,7 @@ class MultipleTextRequest(BaseModel):
 async def process_text(text: str, question: str, system_prompt: Optional[str]) -> str:
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post("http://localhost:8000/v1/chat/completions", json={
+            async with session.post(VLLM_CHAT_COMPLETIONS_URL, json={
                 "text": text,
                 "question": question,
                 "system_prompt": system_prompt
@@ -6111,11 +7015,8 @@ async def process_text(text: str, question: str, system_prompt: Optional[str]) -
 
 
 # =========================
-# Конфигурация
+# Конфигурация (модель: get_vllm_model_id(), URL — VLLM_CHAT_COMPLETIONS_URL в начале файла)
 # =========================
-
-MODEL_NAME = "Qwen/Qwen3-32B-FP8"
-LLM_URL = "http://localhost:8000/v1/chat/completions"
 
 # Параллелизм и батчи
 BATCH_SIZE = 32
@@ -6181,9 +7082,6 @@ async def llm_run_multiple(
     except Exception as e:
         logging.error(f"Error processing request: {str(e)}", exc_info=True)
         return JSONResponse(content={"error": "Something went wrong"}, status_code=500)
-
-LLM_URL = "http://localhost:8000/v1/chat/completions"
-MODEL_NAME = "Qwen/Qwen3-32B-FP8"
 
 MAX_CONCURRENCY = 32  # для веб‑сервиса можно поменьше, чем в оффлайн‑скрипте
 
@@ -6331,52 +7229,34 @@ async def generate_answer_single(
         messages.append({"role": "system", "content": system_line})
     messages.append({"role": "user", "content": user_content})
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "stream": False,
-        "temperature": TEMPERATURE,
-        "top_p": TOP_P,
-        "max_tokens": MAX_NEW_TOKENS,
-        "do_sample": False,
-        "enable_thinking": False
-    }
+    from mlops.gateway import GatewayError, achat
 
+    extra = {"top_p": TOP_P, "stream": False}
     if USE_STREAMING:
-        payload["stream"] = True
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+        extra["stream"] = True
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            async with session.post(LLM_URL, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
-                        continue
-                    return f"Ошибка API: {resp.status}"
-
-                if USE_STREAMING:
-                    raw_answer = await read_streaming_response(resp)
-                else:
-                    raw_answer = await read_non_stream_response(resp)
-
-                normalized = normalize_answer(raw_answer)  # Теперь функция будет определена
-                return normalized if normalized else "Модель не ответила"
-
-        except asyncio.TimeoutError:
+            result = await achat(
+                provider="vllm",
+                messages=messages,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_NEW_TOKENS,
+                timeout=TOTAL_TIMEOUT,
+                extra=extra,
+            )
+            normalized = normalize_answer(result.content)
+            return normalized if normalized else "Модель не ответила"
+        except GatewayError as e:
+            if e.status_code == 0 and "timeout" in str(e).lower():
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
+                    continue
+                return "Timeout ошибка"
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
                 continue
-            return "Timeout ошибка"
-        except aiohttp.ClientError as e:
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
-                continue
-            return f"HTTP ошибка: {str(e)}"
+            return f"Ошибка API: {e.status_code or str(e)}"
         except Exception as e:
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(BASE_BACKOFF * (2 ** attempt))
@@ -6639,6 +7519,7 @@ async def get_texts(user_id: int, folder_name: str, file_name: str, session: Asy
         raise HTTPException(status_code=404, detail="File not found.")
     with open(file_path, 'rb') as f:
         texts = pickle.load(f)  # Файл предполагается, что содержит список текстов
+    _, texts = unpack_saved_llm_labels(texts)
     return texts
 
 def cosine_similarity_vectors(vec1: np.ndarray, norm1: float,
@@ -7093,6 +7974,7 @@ async def llm_analyze_excel(user_id: int, folder_name: str, file_name: str, all_
     
     with open(thematics_path.replace('_datamapplot', ''), 'rb') as f:
         texts_thematics = pickle.load(f)
+    _, texts_thematics = unpack_saved_llm_labels(texts_thematics)
     df_join.insert(1, 'Тематика текста', texts_thematics)
 
     output_path = os.path.join('/home/dev/tellscope_app/tellscope_backend/data/files', (file_name.capitalize() + 'aggregated_table.xlsx').replace('.html', '_') 
@@ -7368,14 +8250,20 @@ def ai_question():
     return f'Да, пришел запрос, вот мой ответ!'
 
 
-from openai import OpenAI
+from mlops.gateway import GatewayChatClient
+from mlops.lock import external_cfg
 
-client = OpenAI(
-    api_key="sk-aitunnel-PrKMg8fNFewHciI2DvmAHGaD8g7cSyjD", # Ключ из нашего сервиса
-    base_url="https://api.aitunnel.ru/v1/",
-)
-# ai_model="deepseek-chat"
-ai_model = "gpt-4.1-mini"
+client = GatewayChatClient(provider="aitunnel", profile="dashboard_qa")
+ai_model = external_cfg("dashboard_qa")["model"]
+
+
+def _dashboard_prompt(lock_name: str, default_id: str) -> str:
+    try:
+        from mlops.lock import prompt_id as lock_prompt_id
+        from mlops.prompts import render_prompt
+        return render_prompt(lock_prompt_id(lock_name, default_id))
+    except Exception:
+        return "Ты аналитик социальных медиа. Отвечай только по входным данным. Не выдумывай цифры."
 
 # Вариант 2: Если вы не знаете структуру данных заранее 
 @app.post("/ai-question-raw", tags=['data analytics'])
@@ -7390,32 +8278,7 @@ async def ai_question_raw(request: Request):
         # Обработка данных в зависимости от current_tab
         processed_data = process_data_by_tab(body_json)
 
-        system_prompt = """
-            Ты — аналитик социальных медиа. Форматируй ответы в источниках строго по следующим правилам:
-
-            ### **1. Структура ответа**
-            ---
-            ## 📊 [Заголовок анализа]  
-            [Используй иконки: 🔍 для выводов, ⚠️ для особенностей, 📌 для ключевых точек]  
-
-            ### **2. Обязательные блоки**  
-            - **Источники негатива или позитива** (таблица с метриками)  
-            - **График/визуализация** (если есть данные)  
-            - **Рекомендации** (маркированный список)  
-
-            ### **3. Требования к оформлению**  
-            ```markdown
-            ### 🔍 Концентрация негатива или позитива 
-            {текст}  
-
-            | Метрика       | Значение | На сообщение |  
-            |---------------|----------|--------------|  
-            | Сообщения     | X        | —            |  
-
-            ⚠️ **Особенности:**  
-            - {пункт}  
-            - {пункт}  
-        """
+        system_prompt = _dashboard_prompt("dashboard_qa_raw", "dashboard_qa_raw_v1")
 
         question = processed_data["question"]
         data = processed_data["data"]
@@ -7440,10 +8303,7 @@ async def ai_question_raw(request: Request):
             print(processed_data)
             # Отладочный вывод структуры данных
             
-            system_prompt = """
-            Ты — senior-аналитик социальных медиа. Проводишь комплексный анализ тональности авторов с привязкой к контексту платформы.
-            Помоги ответить на поставленный вопрос на основе сообщени йиз базы знаний, приведи ссылки на сообщения в своем ответе.
-            """
+            system_prompt = _dashboard_prompt("dashboard_qa_tonality", "dashboard_qa_tonality_v1")
 
             chat_result = client.chat.completions.create(
                 messages=[{"role": "user", "content": f"{system_prompt}, {question}: {data} Примеры текстов: {texts_examples}"}],
@@ -7659,36 +8519,7 @@ async def ai_question_information_graph(request: Request):
     filters = body_json.get('filters', {})
     
     # Формируем структурированное сообщение для LLM
-    system_prompt = """
-    Ты — senior-аналитик социальных медиа с опытом работы более 10 лет. 
-    Ты анализируешь данные из социальных сетей и предоставляешь детальный анализ.
-    Твоя задача - дать глубокий анализ предоставленных данных, выделить ключевые тренды, 
-    паттерны и инсайты, соответствующие запросу пользователя.
-    
-    Структура данных:
-    - author: информация об авторе сообщения
-      - fullname: имя автора
-      - url: ссылка на сообщение
-      - author_type: тип автора (Личный профиль, Сообщество и т.д.)
-      - hub: источник сообщения (telegram.org, vk.com и т.д.)
-      - sex: пол автора
-      - age: возраст автора (если известен)
-      - audienceCount: количество подписчиков/размер аудитории
-      - er: показатель вовлеченности
-      - viewsCount: количество просмотров
-      - timeCreate: время создания сообщения (Unix timestamp)
-    - reposts: массив репостов данного сообщения
-    
-    Используй эти данные для формирования своего анализа.
-
-    Всегда структурируй ответы следующим образом:
-    - Используй Markdown для форматирования
-    - Разделяй длинный текст на параграфы (не более 3-4 предложений)
-    - Используй заголовки второго уровня (##) для основных разделов
-    - Используй заголовки третьего уровня (###) для подразделов
-    - Для списков используй маркированные списки (-)
-    - Выделяй важные моменты **жирным шрифтом**
-    """
+    system_prompt = _dashboard_prompt("dashboard_qa_graph", "dashboard_qa_graph_v1")
     
     # Обработка данных
     filtered_data = data.get('values', [])
@@ -7930,29 +8761,7 @@ async def ai_question_media_rating(request: Request):
     filters = body_json.get('filters', {})
 
     # Формируем структурированное сообщение для LLM
-    system_prompt = """
-    Ты — senior-аналитик социальных медиа с опытом работы более 10 лет. 
-    Ты анализируешь данные из социальных сетей и предоставляешь детальный анализ.
-    Твоя задача - дать глубокий анализ предоставленных данных, выделить ключевые тренды, 
-    паттерны и инсайты, соответствующие запросу пользователя.
-
-    Структура данных:
-    - В первой графе собраны данные по негативной и позитивной активности в СМ.
-    Каждая запись включает имя ресурса, индекс и количество сообщений:
-        - negative_smi: массив с негативными ссылками
-        - positive_smi: массив с позитивными ссылками
-    - Во второй графе находятся уникальные ссылки на ресурсы, упомянутые в данных.
-    
-    Используй эти данные для формирования своего анализа.
-
-    Всегда структурируй ответы следующим образом:
-    - Используй Markdown для форматирования
-    - Разделяй длинный текст на параграфы (не более 3-4 предложений)
-    - Используй заголовки второго уровня (##) для основных разделов
-    - Используй заголовки третьего уровня (###) для подразделов
-    - Для списков используй маркированные списки (-)
-    - Выделяй важные моменты **жирным шрифтом**
-    """
+    system_prompt = _dashboard_prompt("dashboard_qa_media", "dashboard_qa_media_v1")
 
     # Формируем user_message с анализом данных из графов
     first_graph_stats = f"""## Статистика по негативным и позитивным упоминаниям
@@ -8239,10 +9048,7 @@ async def ai_question_voice(request: Request):
         Если представлены релевантные тексты — обязательно используй их при анализе и выводах.
         """
 
-        system_prompt = (
-            "Ты — senior-аналитик социальных медиа. Даёшь структурированный, лаконичный и информативный вывод по анализу обсуждений. "
-            "Выделяй важное **жирным**. Не пиши лишнего, но добавляй краткие пояснения по вопросам пользователя."
-        )
+        system_prompt = _dashboard_prompt("dashboard_qa_voice", "dashboard_qa_voice_v1")
 
         chat_result = client.chat.completions.create(
             messages=[
@@ -9015,11 +9821,7 @@ async def ai_question_analysis(request: Request):
 Структурируй ответ логично и выдели ключевые моменты.
 """
 
-        system_prompt = (
-            "Ты — эксперт-аналитик данных. Твоя задача — дать точный, обоснованный ответ на основе предоставленных материалов. "
-            "Используй только факты из представленных документов. Структурируй ответ четко, выделяй важное **жирным**. "
-            "Если данных недостаточно для полного ответа — честно об этом скажи."
-        )
+        system_prompt = _dashboard_prompt("dashboard_qa_bot", "dashboard_qa_bot_v1")
 
         try:
             chat_result = client.chat.completions.create(
@@ -9071,11 +9873,8 @@ async def ai_question_analysis(request: Request):
         )
 
     
-# Инициализация клиента OpenAI
-client = OpenAI(
-    api_key="sk-aitunnel-PrKMg8fNFewHciI2DvmAHGaD8g7cSyjD",
-    base_url="https://api.aitunnel.ru/v1/",
-)
+# Инициализация клиента через mlops.gateway (ключи только из .env)
+client = GatewayChatClient(provider="aitunnel", profile="dashboard_qa")
 
 # Модель запроса
 class ChatRequest(BaseModel):
@@ -9115,6 +9914,7 @@ async def get_models():
             "claude-sonnet-4.5", 
             "gpt-5.1-codex-max",
             "gemini-2.5-pro",
+            "claude-sonnet-4.6",
         ]
     }
 
@@ -10230,6 +11030,11 @@ async def run_agent_task(task_id: str, user_query: str, input_file: str, user_id
                 error_msg = "Client failed to connect via WebSocket within 15 seconds."
                 await logger.log(error_msg, "error")
                 active_tasks[task_id].update({"status": "failed", "error": error_msg})
+                try:
+                    from mlops.runtime import register_smart_agent
+                    register_smart_agent(task_id, user_query, "failed", user_id=str(user_id or ""))
+                except Exception:
+                    pass
                 return
 
         await logger.log("Инициализация интеллектуального агента...", "status")
@@ -10256,6 +11061,17 @@ async def run_agent_task(task_id: str, user_query: str, input_file: str, user_id
         # 5. Обновление статуса задачи по завершении
         active_tasks[task_id]["report_path"] = report_path
         active_tasks[task_id]["status"] = "completed"
+        try:
+            from mlops.runtime import finish_smart_agent
+            finish_smart_agent(
+                task_id,
+                user_query,
+                "done",
+                user_id=str(user_id or ""),
+                artifact_path=str(active_tasks[task_id].get("report_path") or ""),
+            )
+        except Exception:
+            pass
         await logger.log("Отчет успешно создан!", "complete", report_url=f"/api/download-report/{task_id}")
         await asyncio.sleep(1) # Небольшая задержка для отправки сообщения
 
@@ -10265,6 +11081,11 @@ async def run_agent_task(task_id: str, user_query: str, input_file: str, user_id
         traceback.print_exc()
         await logger.log(error_msg, "error")
         active_tasks[task_id].update({"status": "failed", "error": str(e)})
+        try:
+            from mlops.runtime import register_smart_agent
+            register_smart_agent(task_id, user_query, "failed", user_id=str(user_id or ""))
+        except Exception:
+            pass
         await asyncio.sleep(1)
 
 
@@ -10274,6 +11095,13 @@ async def run_smart_agent(
     request: SmartAgentRequest
 ):
     """Запуск умного агента для анализа данных"""
+    try:
+        from mlops.runtime import GpuBusy, assert_can_start
+        assert_can_start("smart-agent")
+    except GpuBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        pass
     
     task_id = str(uuid.uuid4())
     
@@ -10309,6 +11137,11 @@ async def run_smart_agent(
         
         active_tasks[task_id]["input_file"] = str(input_file)
         active_tasks[task_id]["status"] = "pending"
+        try:
+            from mlops.runtime import register_smart_agent
+            register_smart_agent(task_id, request.user_query, "pending", user_id=str(request.user_id or ""))
+        except Exception:
+            pass
         
         # Передаем user_id в фоновую задачу
         background_tasks.add_task(
@@ -10445,6 +11278,11 @@ async def get_agent_status(task_id: str):
         "has_report": task.get("report_path") is not None
     }
     
+
+from mosinform_api import router as mosinform_router
+app.include_router(mosinform_router)
+from mlops_api import router as mlops_router
+app.include_router(mlops_router)
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
