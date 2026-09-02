@@ -40,6 +40,7 @@ prompts:
   dashboard_qa_raw: dashboard_qa_raw_v1
   dashboard_qa_tonality: dashboard_qa_tonality_v1
   dashboard_qa_graph: dashboard_qa_graph_v1
+  dashboard_qa_cluster: dashboard_qa_cluster_v1
   dashboard_qa_media: dashboard_qa_media_v1
   dashboard_qa_voice: dashboard_qa_voice_v1
   dashboard_qa_bot: dashboard_qa_bot_v1
