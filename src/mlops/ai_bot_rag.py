@@ -369,10 +369,9 @@ def user_prompt(
 ) -> str:
     lens = TOPIC_LENS.get(topic) or "Ответь по задаче аналитика медиаполя."
     filter_note = (
-        "К поиску применён фильтр по метаданным: цифры «фильтр» и «по запросу» уже это учитывают. "
-        "Не обобщай отфильтрованные цифры на весь корпус без блока «Корпус темы»."
+        "К поиску применён фильтр по метаданным: цифры «фильтр» и «по запросу» уже это учитывают."
         if filtered
-        else "Цифры объёма и тональности бери из блока Elasticsearch. Цитаты [n] не равны всей теме."
+        else "Цифры объёма и тональности бери из блока статистики. Сюжеты и формулировки — из цитат [n]."
     )
     hist = history_block(history)
     instr = ""
@@ -387,7 +386,7 @@ def user_prompt(
     memo = ""
     if str(deep_memo or "").strip():
         memo = f"""
-**Мемо глубокого разбора Qwen (стратифицированная выборка текстов, не все сообщения):**
+**Сводка глубокого разбора темы:**
 {str(deep_memo).strip()[:8000]}
 """
     stats = evidence_md or ""
@@ -400,12 +399,12 @@ def user_prompt(
 {docs_md}
 
 **Как отвечать:**
-- Объём, тональность, типы площадок, охват, период — только из блока статистики Elasticsearch. Их можно цитировать как расчёт по всем сообщениям.
-- Сюжеты, формулировки, авторы и URL — только из цитат [n]. Ссылайся как [1], [2].
+- Объём, тональность, типы площадок, охват, период — из блока статистики. Их можно называть как цифры по теме.
+- Сюжеты, формулировки, авторы и URL — из цитат [n]. Ссылайся как [1], [2].
 - {filter_note}
-- Не называй набор цитат всей темой и не считай доли по [n] вместо ES.
-- Структура: краткий вывод; цифры по корпусу; факты с цитатами [n]; смысл для PR/маркетинга; ограничения.
-- Если части вопроса нет в ES и в цитатах — скажи прямо.
+- Не пересчитывай доли по цитатам [n], если уже есть цифры статистики.
+- Структура: краткий вывод; цифры по теме; факты с цитатами [n]; смысл для PR/маркетинга.
+- Если части вопроса нет в статистике и в цитатах — скажи прямо.
 """
 
 
@@ -689,14 +688,7 @@ def coverage_payload(pack: dict | None, citations: int, cards: int, pool: int) -
     pack = pack or {}
     corpus_n = int((pack.get("corpus") or {}).get("count") or 0)
     hits_n = int((pack.get("query_hits") or {}).get("count") or 0)
-    label = (
-        f"Корпус: {_fmt(corpus_n)} · по запросу в ES: {_fmt(hits_n)} · "
-        f"цитаты для разбора: {cards}/{citations}"
-    )
-    note = (
-        "Цифры тональности и типов площадок — по всем сообщениям Elasticsearch. "
-        "Цитаты — ближайшие тексты для сюжетов, это не вся тема."
-    )
+    label = f"Корпус: {_fmt(corpus_n)} · по запросу: {_fmt(hits_n)} · источники: {cards}"
     return {
         "corpus_count": corpus_n,
         "query_hits": hits_n,
@@ -704,7 +696,7 @@ def coverage_payload(pack: dict | None, citations: int, cards: int, pool: int) -
         "cards": cards,
         "pool": pool,
         "label": label,
-        "note": note,
+        "note": "",
     }
 
 
@@ -824,6 +816,72 @@ def load_stored_memo(collections: list[str], filters: dict | None) -> str:
         return ""
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def mark_deep_progress(
+    job_id: str,
+    *,
+    message: str,
+    step: str,
+    current: int = 0,
+    total: int = 0,
+    sampled: int = 0,
+    status: str = "running",
+    **extra,
+) -> dict:
+    percent = 4
+    if status == "done":
+        percent = 100
+    elif status == "error":
+        percent = _as_int(extra.get("progress_percent"), 0)
+    elif step == "sample":
+        percent = 8
+    elif step == "read" and total:
+        percent = 12 + int(76 * min(current, total) / total)
+    elif step == "summary":
+        percent = 92
+    payload = {
+        "product": "ai-bot-deep",
+        "status": status,
+        "message": message,
+        "progress_step": step,
+        "progress_current": current,
+        "progress_total": total,
+        "progress_percent": percent,
+        "sampled": sampled,
+        **extra,
+    }
+    try:
+        from mlops.jobs import register
+
+        register(job_id, **payload)
+    except Exception:
+        pass
+    return payload
+
+
+def deep_progress_view(job: dict | None) -> dict:
+    job = job or {}
+    current = _as_int(job.get("progress_current"))
+    total = _as_int(job.get("progress_total"))
+    percent = _as_int(job.get("progress_percent"))
+    if not percent and total:
+        percent = min(99, int(100 * current / total))
+    return {
+        "step": str(job.get("progress_step") or ""),
+        "current": current,
+        "total": total,
+        "percent": percent,
+        "sampled": _as_int(job.get("sampled")),
+        "message": str(job.get("message") or ""),
+    }
+
+
 def gpu_ready() -> tuple[bool, list]:
     try:
         from mlops.runtime import running_batches
@@ -874,8 +932,6 @@ def _map_batch_prompt(batch: list[dict]) -> str:
 
 
 def run_deep_brief(es, indexes: dict, selected_databases: list[str], filters: dict | None, job_id: str, logger) -> str:
-    from mlops.jobs import register
-
     pack = evidence_pack(es, indexes, selected_databases, "", filters)
     collections = pack.get("collections") or []
     if not collections:
@@ -883,7 +939,12 @@ def run_deep_brief(es, indexes: dict, selected_databases: list[str], filters: di
     index = ",".join(collections)
     db_name = selected_databases[0]
     hubtypes = (pack.get("filtered") or pack.get("corpus") or {}).get("hubtypes") or []
-    register(job_id, product="ai-bot-deep", status="running", message="Собираем выборку по типам площадок…")
+    mark_deep_progress(
+        job_id,
+        message="Подбираем тексты по типам площадок…",
+        step="sample",
+        sampled=0,
+    )
     docs = sample_deep_docs(es, index, db_name, filters, hubtypes)
     if len(docs) < 8:
         extra = fetch_reach_docs(es, index, db_name, filters, [{"name": ""}], 40)
@@ -894,11 +955,21 @@ def run_deep_brief(es, indexes: dict, selected_databases: list[str], filters: di
     summaries = []
     batches = [docs[i : i + DEEP_BATCH] for i in range(0, len(docs), DEEP_BATCH)]
     for i, batch in enumerate(batches, 1):
-        register(
+        types = sorted(
+            {
+                str((item.get("source") or {}).get("hubtype") or "").strip()
+                for item in batch
+                if str((item.get("source") or {}).get("hubtype") or "").strip()
+            }
+        )
+        type_bit = f" · {', '.join(types[:3])}" if types else ""
+        mark_deep_progress(
             job_id,
-            product="ai-bot-deep",
-            status="running",
-            message=f"Qwen читает пачку {i}/{len(batches)} ({len(docs)} текстов, не весь корпус)…",
+            message=f"Читаем тексты: пачка {i} из {len(batches)}{type_bit}",
+            step="read",
+            current=i,
+            total=len(batches),
+            sampled=len(docs),
         )
         summary = _vllm_chat(
             [
@@ -913,8 +984,15 @@ def run_deep_brief(es, indexes: dict, selected_databases: list[str], filters: di
         if summary:
             summaries.append(f"Пачка {i}: {summary}")
     if not summaries:
-        raise RuntimeError("Qwen не вернул разбор пачек")
-    register(job_id, product="ai-bot-deep", status="running", message="Собираем мемо темы…")
+        raise RuntimeError("Не удалось разобрать тексты")
+    mark_deep_progress(
+        job_id,
+        message="Собираем сводку по теме…",
+        step="summary",
+        current=len(batches),
+        total=len(batches),
+        sampled=len(docs),
+    )
     memo = _vllm_chat(
         [
             {
@@ -936,15 +1014,17 @@ def run_deep_brief(es, indexes: dict, selected_databases: list[str], filters: di
         timeout=180,
     )
     if not memo:
-        raise RuntimeError("Qwen не собрал мемо")
+        raise RuntimeError("Не удалось собрать сводку")
     store_memo(collections, filters, memo)
-    register(
+    mark_deep_progress(
         job_id,
-        product="ai-bot-deep",
-        status="done",
-        message=f"Готово: {len(docs)} текстов, корпус {_fmt((pack.get('corpus') or {}).get('count'))}",
-        memo=memo,
+        message="Разбор готов",
+        step="done",
+        current=len(batches),
+        total=len(batches) or 1,
         sampled=len(docs),
+        status="done",
+        memo=memo,
         corpus_count=(pack.get("corpus") or {}).get("count") or 0,
     )
     if logger:
@@ -1250,7 +1330,7 @@ async def handle_deep_brief(request, *, es, load_indexes, logger) -> JSONRespons
         return JSONResponse(
             status_code=503,
             content={
-                "error": "GPU занят другой задачей. Запустите глубокий разбор, когда очередь пуста.",
+                "error": "Сейчас выполняется другая задача. Попробуйте через несколько минут.",
                 "jobs": holders,
                 "busy": first.get("product") or "",
             },
@@ -1269,7 +1349,9 @@ async def handle_deep_brief(request, *, es, load_indexes, logger) -> JSONRespons
             job_id,
             product="ai-bot-deep",
             status="running",
-            message="Готовим стратифицированную выборку…",
+            message="Запускаем разбор…",
+            progress_step="start",
+            progress_percent=4,
         )
     except Exception:
         pass
@@ -1292,7 +1374,8 @@ async def handle_deep_brief(request, *, es, load_indexes, logger) -> JSONRespons
             "job_id": job_id,
             "status": "running",
             "eta_min": "3–8",
-            "warning": "Qwen прочитает около 80–120 текстов по типам площадок, не все сообщения темы. Цифры по-прежнему из Elasticsearch.",
+            "message": "Запускаем разбор…",
+            "progress": {"step": "start", "current": 0, "total": 0, "percent": 4, "sampled": 0, "message": "Запускаем разбор…"},
         }
     )
 
@@ -1314,13 +1397,15 @@ async def handle_deep_brief_status(request) -> JSONResponse:
     if not job:
         return JSONResponse(status_code=404, content={"error": "Задача не найдена", "job_id": job_id})
     status = str(job.get("status") or "running")
+    progress = deep_progress_view(job)
     return JSONResponse(
         content={
             "job_id": job_id,
             "status": status,
-            "message": job.get("message") or "",
+            "message": progress["message"] or (job.get("message") or ""),
+            "progress": progress,
             "memo": (job.get("memo") or "") if status == "done" else "",
-            "sampled": job.get("sampled"),
+            "sampled": progress["sampled"],
             "corpus_count": job.get("corpus_count"),
             "error": job.get("message") if status == "error" else "",
         }

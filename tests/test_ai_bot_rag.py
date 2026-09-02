@@ -121,7 +121,7 @@ def test_evidence_pack_query_and_filters():
         evidence_md=md,
     )
     assert "Elasticsearch" in prompt
-    assert "не всю тему" in prompt.lower() or "не равны всей теме" in prompt.lower()
+    assert "цифры объёма" in prompt.lower() or "статистик" in prompt.lower()
 
 
 def test_es_bool_query_shapes():
@@ -147,6 +147,25 @@ def test_stratify_keeps_hubtypes():
     assert types == {"Соцсети", "Блоги", "Форумы"}
 
 
+def test_deep_progress_percent():
+    from mlops.ai_bot_rag import deep_progress_view, mark_deep_progress
+
+    payload = mark_deep_progress(
+        "job-test",
+        message="Читаем тексты: пачка 3 из 12",
+        step="read",
+        current=3,
+        total=12,
+        sampled=96,
+    )
+    assert payload["progress_percent"] == 12 + int(76 * 3 / 12)
+    view = deep_progress_view(payload)
+    assert view["current"] == 3
+    assert view["total"] == 12
+    assert view["percent"] == payload["progress_percent"]
+    assert "Qwen" not in view["message"]
+
+
 def test_coverage_label_has_corpus_not_percent():
     pack = {
         "corpus": {"count": 26844},
@@ -155,6 +174,6 @@ def test_coverage_label_has_corpus_not_percent():
     cov = coverage_payload(pack, 24, 12, 50)
     assert "26844" in cov["label"].replace("\u00a0", "").replace(" ", "")
     assert "4321" in cov["label"].replace("\u00a0", "").replace(" ", "")
-    assert "12/24" in cov["label"]
+    assert "источники: 12" in cov["label"]
     assert "%" not in cov["label"]
-    assert "Elasticsearch" in cov["note"]
+    assert "Qwen" not in (cov.get("note") or "")
