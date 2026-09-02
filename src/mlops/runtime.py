@@ -10,7 +10,7 @@ from .lineage import build_run, write_run
 from .lock import generate_cfg
 from .timeutil import is_placeholder_ts
 
-BATCH_PRODUCTS = ("mosinform", "llm-run", "smart-agent")
+BATCH_PRODUCTS = ("mosinform", "llm-run", "smart-agent", "ai-bot-deep")
 ACTIVE = {"running", "queued", "pending", "in_progress", "llm_processing", "initializing"}
 STALE_SEC = 2 * 3600
 
