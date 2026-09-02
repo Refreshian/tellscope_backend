@@ -26,9 +26,67 @@ _THINK_TAG = re.compile(r"</?think>", re.I)
 _TOKEN = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{4,}")
 
 LINK_TYPES = ("exact", "similar", "same_hub", "reprint", "co_time")
+LINK_TYPE_LABELS = {
+    "exact": "точные темы",
+    "similar": "похожие темы",
+    "same_hub": "одна площадка",
+    "reprint": "перепечатки",
+    "co_time": "близко по времени",
+}
+LINK_TYPE_EXPLAIN = {
+    "exact": "Точные темы — авторы пишут об одном и том же сюжете, формулировки похожи",
+    "similar": "Похожие темы — сюжеты близкие, но не дословно совпадают",
+    "same_hub": "Одна площадка — одинаковый тип источника (телеграм, соцсети, блоги)",
+    "reprint": "Перепечатки — одно сообщение разошлось по разным авторам",
+    "co_time": "Близко по времени — публиковали примерно в один период",
+}
+HEADING_EMOJI = (
+    (re.compile(r"^#{1,6}\s*кто в кластере\s*:?\s*$", re.I | re.M), "👥 Кто в кластере"),
+    (re.compile(r"^#{1,6}\s*о ч[её]м пишут\s*:?\s*$", re.I | re.M), "💬 О чём пишут"),
+    (re.compile(r"^#{1,6}\s*чем связаны\s*:?\s*$", re.I | re.M), "🔗 Чем связаны"),
+    (re.compile(r"^#{1,6}\s*на что обратить внимание\s*:?\s*$", re.I | re.M), "⚠️ На что обратить внимание"),
+)
+_HEADING_FALLBACK = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.M)
+_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_HTTP = re.compile(r"^https?://", re.I)
 MAX_TOPICS = 8
 MAX_EXTRA_DEGREE = 6
 PRODUCT = "graph-cluster"
+
+
+def link_type_label(name: str) -> str:
+    key = str(name or "").strip()
+    return LINK_TYPE_LABELS.get(key, key.replace("_", " "))
+
+
+def polish_cluster_memo(memo: str, nodes: list[dict] | None = None, cluster: dict | None = None) -> str:
+    text = _clean_llm(memo)
+    for key, label in LINK_TYPE_LABELS.items():
+        text = re.sub(rf"\b{re.escape(key)}\b", label, text, flags=re.I)
+    for pattern, heading in HEADING_EMOJI:
+        text = pattern.sub(heading, text)
+    text = _HEADING_FALLBACK.sub(lambda match: f"📌 {match.group(1).strip()}", text)
+    text = drop_attention_section(text)
+    text = replace_links_section(text, (cluster or {}).get("edge_types"))
+    text = link_topic_phrases(text, collect_topic_examples(nodes or []))
+    names = []
+    for node in nodes or []:
+        name = str(node.get("label") or node.get("id") or "").strip()
+        url = str(node.get("primary_url") or node.get("url") or "").strip()
+        if name and _HTTP.match(url):
+            names.append((name, url))
+    names.sort(key=lambda item: len(item[0]), reverse=True)
+
+    def _bold(match: re.Match) -> str:
+        inner = match.group(1).strip()
+        for name, url in names:
+            if inner.lower() == name.lower():
+                return f"[{inner}]({url})"
+        return match.group(0)
+
+    if names:
+        text = _BOLD.sub(_bold, text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 def _clean_llm(text: str) -> str:
@@ -36,6 +94,229 @@ def _clean_llm(text: str) -> str:
     cleaned = _THINK_OPEN.sub("", cleaned)
     cleaned = _THINK_TAG.sub("", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+_TOPIC_PREFIX = re.compile(
+    r"^(тематика(\s+текста)?|тема(\s+текста)?|topic)\s*[:\-—–]\s*",
+    re.I,
+)
+_TOPIC_THIS = re.compile(r"^это\s+", re.I)
+_VACANCY_MARK = re.compile(
+    r"ваканси|требуется\s+сотруд|ищем\s+сотруд|соискател|резюме|на работу\s+сотруд",
+    re.I,
+)
+_AD_MARK = re.compile(
+    r"реклам|скидк|промокод|прайс|акци[яи]|купить|заказать|услуги по|оплате штрафов|"
+    r"проездн(ых|ые)\s+сбор",
+    re.I,
+)
+
+
+def strip_topic_prefix(text: str) -> str:
+    cleaned = _safe(text)
+    cleaned = _TOPIC_PREFIX.sub("", cleaned)
+    cleaned = _TOPIC_THIS.sub("", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip(" ;,.-")
+
+
+def _topic_rank(text: str) -> int:
+    if _VACANCY_MARK.search(text or ""):
+        return 2
+    if _AD_MARK.search(text or ""):
+        return 1
+    return 0
+
+
+def _as_sentence(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip(" ;,")
+    if not cleaned:
+        return ""
+    cleaned = cleaned.rstrip(".!:;")
+    return cleaned[0].upper() + cleaned[1:] + "."
+
+
+def _lower_first(text: str) -> str:
+    if not text:
+        return ""
+    return text[0].lower() + text[1:]
+
+
+def _topic_tokens(text: str) -> set[str]:
+    return {tok for tok in re.findall(r"[а-яёa-z0-9]{4,}", (text or "").lower())}
+
+
+def _too_similar(text: str, existing: list[str]) -> bool:
+    tokens = _topic_tokens(text)
+    if len(tokens) < 3:
+        return False
+    for prev in existing:
+        other = _topic_tokens(prev)
+        if len(other) < 3:
+            continue
+        overlap = len(tokens & other) / max(1, min(len(tokens), len(other)))
+        if overlap >= 0.55:
+            return True
+    return False
+
+
+def compose_cluster_about(topics: list) -> str:
+    """Join raw topic labels into one readable paragraph; ads/vacancies go last."""
+    items: list[tuple[int, int, str]] = []
+    kept: list[str] = []
+    for index, raw in enumerate(topics or []):
+        if isinstance(raw, (tuple, list)) and raw:
+            text, count = str(raw[0]), -int(raw[1] if len(raw) > 1 else 0)
+        else:
+            text, count = str(raw or ""), index
+        cleaned = strip_topic_prefix(text)
+        if len(cleaned) < 8:
+            continue
+        if _too_similar(cleaned, kept):
+            continue
+        kept.append(cleaned)
+        items.append((_topic_rank(cleaned), count, cleaned))
+    if not items:
+        return ""
+    items.sort(key=lambda item: (item[0], item[1]))
+    primary = [_as_sentence(text) for rank, _count, text in items if rank == 0][:3]
+    ads = [_as_sentence(text) for rank, _count, text in items if rank == 1][:2]
+    jobs = [_as_sentence(text) for rank, _count, text in items if rank == 2][:2]
+    chunks: list[str] = []
+    if primary:
+        first, *rest = primary
+        if rest:
+            chunks.append(first + " Также " + _lower_first(" ".join(rest)))
+        else:
+            chunks.append(first)
+    if ads:
+        joined = " ".join(ads)
+        chunks.append(("Также " + _lower_first(joined)) if chunks else joined)
+    if jobs:
+        joined = " ".join(jobs)
+        chunks.append(("В стороне от основной темы — " + _lower_first(joined)) if chunks else joined)
+    return " ".join(chunk for chunk in chunks if chunk)
+
+
+_MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_ATTENTION_SEC = re.compile(
+    r"^(?:⚠️\s*)?на что обратить внимание\s*:?\s*\n.*?(?=^(?:👥|💬|🔗|⚠️|📌)\s|\Z)",
+    re.I | re.M | re.S,
+)
+_LINKS_SEC = re.compile(
+    r"(^🔗 Чем связаны\s*\n)(.*?)(?=^(?:👥|💬|🔗|⚠️|📌)\s|\Z)",
+    re.M | re.S,
+)
+
+
+def collect_topic_examples(nodes: list[dict], limit: int = 12) -> list[tuple[str, str]]:
+    seen_url: set[str] = set()
+    kept: list[str] = []
+    out: list[tuple[str, str]] = []
+    for node in nodes or []:
+        fallback = str(node.get("primary_url") or node.get("url") or "").strip()
+        for topic in node.get("topics") or []:
+            if isinstance(topic, str):
+                text, url = topic, fallback
+            else:
+                text = str(topic.get("text") or "")
+                url = str(topic.get("url") or fallback).strip()
+            cleaned = strip_topic_prefix(text)
+            if len(cleaned) < 12 or not _HTTP.match(url) or url in seen_url:
+                continue
+            if _too_similar(cleaned, kept):
+                continue
+            seen_url.add(url)
+            kept.append(cleaned)
+            out.append((cleaned, url))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def describe_cluster_links(edge_types: dict | None) -> str:
+    if not edge_types:
+        return "Явных повторяющихся связей мало."
+    parts = []
+    for key, count in sorted(edge_types.items(), key=lambda item: -int(item[1] or 0)):
+        try:
+            number = int(count or 0)
+        except (TypeError, ValueError):
+            number = 0
+        if number <= 0:
+            continue
+        expl = LINK_TYPE_EXPLAIN.get(str(key), link_type_label(key))
+        parts.append(f"{expl} ({number}).")
+    return " ".join(parts) or "Явных повторяющихся связей мало."
+
+
+def drop_attention_section(text: str) -> str:
+    return _ATTENTION_SEC.sub("", text or "").strip()
+
+
+def replace_links_section(text: str, edge_types: dict | None) -> str:
+    body = describe_cluster_links(edge_types)
+    if _LINKS_SEC.search(text or ""):
+        return _LINKS_SEC.sub(lambda match: match.group(1) + body + "\n\n", text)
+    return (text or "").rstrip() + f"\n\n🔗 Чем связаны\n{body}"
+
+
+def _phrase_windows(text: str) -> list[str]:
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё\-]+", text or "")
+    chunks = []
+    if len(text or "") >= 16:
+        chunks.append(text)
+    for size in range(min(8, len(words)), 2, -1):
+        for start in range(0, len(words) - size + 1):
+            piece = " ".join(words[start : start + size])
+            if len(piece) >= 14:
+                chunks.append(piece)
+    seen: set[str] = set()
+    ordered = []
+    for item in sorted(chunks, key=len, reverse=True):
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(item)
+    return ordered
+
+
+def link_topic_phrases(text: str, examples: list[tuple[str, str]], limit: int = 8) -> str:
+    if not text or not examples:
+        return text
+    slots: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        slots.append(match.group(0))
+        return f"@@L{len(slots) - 1}@@"
+
+    protected = _MD_LINK.sub(_stash, text)
+    linked = 0
+    used_urls: set[str] = set()
+    for phrase, url in examples:
+        if linked >= limit or url in used_urls:
+            continue
+        for window in _phrase_windows(phrase):
+            pattern = re.compile(re.escape(window), re.I)
+            match = pattern.search(protected)
+            if not match:
+                continue
+            start = match.start()
+            before = protected[:start]
+            if "@@L" in protected[max(0, start - 6) : start + 1]:
+                continue
+            if before.rfind("[") > before.rfind("]"):
+                continue
+            original = match.group(0)
+            token = f"@@L{len(slots)}@@"
+            slots.append(f"[{original}]({url})")
+            protected = protected[:start] + token + protected[match.end() :]
+            used_urls.add(url)
+            linked += 1
+            break
+    for index, raw in enumerate(slots):
+        protected = protected.replace(f"@@L{index}@@", raw)
+    return protected
 
 
 def _safe(value: Any, default: str = "") -> str:
@@ -422,7 +703,8 @@ def detect_clusters(graph_data: dict) -> list[dict]:
             "authors": [node.get("label") or node.get("id") for node in authors[:8]],
             "author_ids": [str(node.get("id")) for node in authors],
             "hubtypes": [{"name": name, "count": count} for name, count in hubtypes.most_common(4)],
-            "topics": [text for text, _count in topics.most_common(5)],
+            "topics": [strip_topic_prefix(text) for text, _count in topics.most_common(5) if strip_topic_prefix(text)],
+            "about": compose_cluster_about(topics.most_common(12)),
             "period_start": min(starts) if starts else "",
             "period_end": max(ends) if ends else "",
             "edge_types": dict(edge_types),
@@ -539,21 +821,30 @@ def _cluster_prompt(cluster: dict, nodes: list[dict], links: list[dict]) -> str:
             text = topic if isinstance(topic, str) else topic.get("text")
             if text:
                 topics.append(str(text)[:140])
+        url = _safe(node.get("primary_url") or node.get("url"))
         authors.append(
             f"- {node.get('label') or node.get('id')}: {node.get('hubtype') or 'площадка?'} · "
             f"охват {node.get('audience') or 0} · постов {node.get('posts_count') or 0}"
             + (f" · {'; '.join(topics)}" if topics else "")
+            + (f" · сообщение: {url}" if url else "")
         )
-    edge_line = ", ".join(f"{name} {count}" for name, count in (cluster.get("edge_types") or {}).items())
+    edge_line = "; ".join(
+        f"{LINK_TYPE_EXPLAIN.get(str(name), link_type_label(name))} — {count}"
+        for name, count in (cluster.get("edge_types") or {}).items()
+    )
     hubs = ", ".join(f"{item.get('name')} {item.get('count')}" for item in cluster.get("hubtypes") or [])
+    examples = collect_topic_examples(nodes, limit=10)
+    example_lines = "\n".join(f"{idx}. {phrase} — {url}" for idx, (phrase, url) in enumerate(examples, 1))
     return (
         f"Кластер {cluster.get('id')}: {cluster.get('size')} авторов, суммарный охват {cluster.get('audience')}.\n"
         f"Период: {cluster.get('period_start') or '—'} — {cluster.get('period_end') or '—'}\n"
         f"Площадки: {hubs or 'нет'}\n"
         f"Связи внутри: {edge_line or 'нет'}\n"
-        f"Темы: {'; '.join(cluster.get('topics') or []) or 'нет'}\n\n"
+        f"О чём: {cluster.get('about') or '; '.join(cluster.get('topics') or []) or 'нет'}\n\n"
         f"Авторы:\n" + "\n".join(authors) + "\n\n"
-        f"Число связей в выборке: {len(links)}"
+        f"Примеры сообщений (для ссылок [фраза](url) бери только эти URL):\n"
+        + (example_lines or "нет")
+        + f"\n\nЧисло связей в выборке: {len(links)}"
     )
 
 
@@ -579,12 +870,12 @@ def run_cluster_summary(body: dict, job_id: str) -> str:
             {"role": "user", "content": user},
         ],
         temperature=0.1,
-        max_tokens=700,
+        max_tokens=800,
         timeout=90,
         extra={"chat_template_kwargs": {"enable_thinking": False}},
         profile="dashboard_qa_graph",
     )
-    memo = _clean_llm(unescape(str(result.content or "")))
+    memo = polish_cluster_memo(unescape(str(result.content or "")), nodes, cluster=cluster)
     if not memo:
         raise RuntimeError("Модель вернула пустую сводку")
     _progress(job_id, "Сводка готова", "done", 100, status="done", memo=memo)

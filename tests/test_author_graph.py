@@ -5,8 +5,11 @@ import pandas as pd
 from mlops.author_graph import (
     add_structural_links,
     collect_author_meta,
+    compose_cluster_about,
     detect_clusters,
     enhance_author_graph,
+    link_type_label,
+    polish_cluster_memo,
 )
 
 
@@ -123,3 +126,105 @@ def test_no_duplicate_existing_edges():
     assert extras == []
     clusters = detect_clusters({**graph, "links": graph["links"]})
     assert clusters[0]["size"] == 2
+
+
+def test_link_type_labels_are_russian():
+    assert link_type_label("exact") == "точные темы"
+    assert link_type_label("same_hub") == "одна площадка"
+    assert link_type_label("co_time") == "близко по времени"
+
+
+def test_polish_cluster_memo_headings_and_authors():
+    memo = (
+        "👥 Кто в кластере\n"
+        "**Artem** входит в ядро кластера.\n\n"
+        "🔗 Чем связаны\n"
+        "Связи внутри кластера: exact 101, same_hub 285, co_time 61.\n\n"
+        "⚠️ На что обратить внимание\n"
+        "- ничего важного"
+    )
+    out = polish_cluster_memo(
+        memo,
+        [{"label": "Artem", "primary_url": "https://t.me/artem/12"}],
+        cluster={"edge_types": {"exact": 101, "same_hub": 285, "co_time": 61}},
+    )
+    assert "##" not in out
+    assert "На что обратить внимание" not in out
+    assert "одинаковый тип источника" in out
+    assert "одном и том же" in out
+    assert "🔗 Чем связаны" in out
+    assert "[Artem](https://t.me/artem/12)" in out
+
+
+def test_polish_links_topic_phrases_to_sources():
+    memo = (
+        "💬 О чём пишут\n"
+        "Основная тема — введение платного проезда на обходе Нижнекамска и Челнов.\n\n"
+        "🔗 Чем связаны\n"
+        "Связи: exact 2."
+    )
+    out = polish_cluster_memo(
+        memo,
+        [{
+            "label": "ТАСС",
+            "primary_url": "https://t.me/tass/1",
+            "topics": [{
+                "text": "Тематика текста: введение платного проезда на обходе Нижнекамска и Челнов",
+                "url": "https://t.me/tass/10",
+            }],
+        }],
+        cluster={"edge_types": {"exact": 2}},
+    )
+    assert "https://t.me/tass/10" in out
+    assert out.count("https://t.me/tass/10") == 1
+    assert "[[[" not in out
+    assert "На что обратить внимание" not in out
+    assert "похож" in out
+
+
+def test_polish_does_not_nest_same_phrase_links():
+    memo = (
+        "💬 О чём пишут\n"
+        "Основная тема — введение платного проезда на обходе Нижнекамска и Челнов.\n"
+    )
+    nodes = [
+        {
+            "label": f"A{i}",
+            "primary_url": f"https://t.me/a/{i}",
+            "topics": [{
+                "text": "введение платного проезда на обходе Нижнекамска и Челнов",
+                "url": f"https://t.me/post/{i}",
+            }],
+        }
+        for i in range(1, 6)
+    ]
+    out = polish_cluster_memo(memo, nodes, cluster={"edge_types": {"exact": 1}})
+    assert out.count("](https://t.me/post/") == 1
+    assert "[[" not in out
+
+
+def test_compose_cluster_about_joins_and_puts_jobs_last():
+    text = compose_cluster_about(
+        [
+            "Тематика текста: введение платного проезда на обходе Нижнекамска и Челнов",
+            "Тематика текста — это вакансия на работу сотрудника транспортной безопасности с указанием условий, адресов объектов и оплаты",
+            "Тематика текста — оказание услуг по оплате штрафов, проездных сборов и оформлению разрешений для транспорта на границах стран, включая Казахстан, Узбекистан, Россию, Китай и Европу",
+        ]
+    )
+    assert "Тематика текста" not in text
+    assert "платного проезда" in text
+    assert text.index("платного проезда") < text.index("штрафов")
+    assert text.index("штрафов") < text.index("вакансия")
+    assert "; Тематика" not in text
+
+
+def test_compose_cluster_about_drops_near_duplicates():
+    text = compose_cluster_about(
+        [
+            "Тематика текста: введение платного проезда на обходе Нижнекамска и Челнов",
+            "Тематика текста — введение платного обхода Нижнекамска и Челнов с автоматизированной системой оплаты",
+            "Тематика текста — реклама автошколы, предлагающей обучение водителей",
+        ]
+    )
+    assert text.lower().count("нижнекамска") == 1
+    assert "реклама автошколы" in text.lower()
