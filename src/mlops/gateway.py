@@ -25,6 +25,7 @@ class ChatResult:
     model: str
     status_code: int = 200
     raw: dict = field(default_factory=dict)
+    finish_reason: str = ""
 
 
 class GatewayError(RuntimeError):
@@ -131,13 +132,15 @@ def _parse(resp: httpx.Response, provider: str, model_id: str) -> ChatResult:
         payload = resp.json()
     except Exception as exc:
         raise GatewayError(f"{provider} invalid JSON") from exc
-    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+    choice = (payload.get("choices") or [{}])[0] or {}
+    content = ((choice.get("message") or {}).get("content")) or ""
     return ChatResult(
         content=content,
         provider=provider,
         model=model_id,
         status_code=resp.status_code,
         raw=payload if isinstance(payload, dict) else {},
+        finish_reason=str(choice.get("finish_reason") or ""),
     )
 
 

@@ -12,7 +12,12 @@ _FILTER_RULE = (
     "Отвечай только по переданной выборке. Если данные уже отфильтрованы — опирайся "
     "на эти цифры и объекты, не восстанавливай то, что скрыто фильтром. "
     "Не выдумывай ссылки, авторов и числа. Если выборки мало — скажи об этом прямо. "
-    "Пиши по-русски, кратко, готовым текстом."
+    "Пиши по-русски готовым текстом. Всегда доводи ответ до конца: последнее "
+    "предложение должно быть законченным, markdown — закрытым."
+)
+_CONTINUE = (
+    "/no_think\nПродолжи ответ с того места, где он оборвался. "
+    "Допиши до конца, не повторяя уже сказанное. Закрой markdown, если он остался открытым."
 )
 
 
@@ -289,7 +294,15 @@ def _system(prompt_id: str, fallback: str) -> str:
     return "/no_think\n" + text + "\n\n" + _FILTER_RULE
 
 
-def ask_vllm(prompt_id: str, question: str, context: str, fallback: str, max_tokens: int = 700) -> str:
+def _finish_reason(result) -> str:
+    reason = str(getattr(result, "finish_reason", "") or "")
+    if reason:
+        return reason
+    choice = ((getattr(result, "raw", None) or {}).get("choices") or [{}])[0] or {}
+    return str(choice.get("finish_reason") or "")
+
+
+def ask_vllm(prompt_id: str, question: str, context: str, fallback: str, max_tokens: int = 2200) -> str:
     from mlops.gateway import chat
 
     user = (
@@ -297,19 +310,32 @@ def ask_vllm(prompt_id: str, question: str, context: str, fallback: str, max_tok
         f"Вопрос: {question.strip()}\n\n"
         f"Данные выборки:\n{context}"
     )
-    result = chat(
-        provider="vllm",
-        messages=[
-            {"role": "system", "content": _system(prompt_id, fallback)},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.1,
-        max_tokens=max_tokens,
-        timeout=90,
-        extra={"chat_template_kwargs": {"enable_thinking": False}},
-        profile="dashboard_qa",
-    )
-    memo = _clean_llm(str(result.content or ""))
+    messages = [
+        {"role": "system", "content": _system(prompt_id, fallback)},
+        {"role": "user", "content": user},
+    ]
+    parts: list[str] = []
+    for _step in range(2):
+        result = chat(
+            provider="vllm",
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+            timeout=180,
+            extra={"chat_template_kwargs": {"enable_thinking": False}},
+            profile="dashboard_qa",
+        )
+        chunk = str(result.content or "")
+        if not chunk.strip() and not parts:
+            raise RuntimeError("Модель вернула пустой ответ")
+        parts.append(chunk)
+        if _finish_reason(result) != "length":
+            break
+        messages = messages + [
+            {"role": "assistant", "content": chunk},
+            {"role": "user", "content": _CONTINUE},
+        ]
+    memo = _clean_llm("".join(parts))
     if not memo:
         raise RuntimeError("Модель вернула пустой ответ")
     return memo

@@ -117,3 +117,45 @@ def test_compact_graph_uses_filtered_counts_and_cluster():
     assert "Платный проезд" in text
     assert "Альфа" in text
     assert "альф" in text
+
+
+class _ChatStub:
+    def __init__(self, content: str, finish_reason: str):
+        self.content = content
+        self.finish_reason = finish_reason
+        self.raw = {"choices": [{"finish_reason": finish_reason, "message": {"content": content}}]}
+
+
+def test_ask_vllm_continues_when_cut_by_length(monkeypatch):
+    from mlops import dashboard_qa
+
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return _ChatStub("kommersant.ru — лидер в позитивной активности с **", "length")
+        return _ChatStub("11 упоминаниями.", "stop")
+
+    monkeypatch.setattr("mlops.gateway.chat", fake_chat)
+    text = dashboard_qa.ask_vllm("dashboard_qa_media_v1", "кто лидирует?", "позитив: kommersant.ru 11", "аналитик")
+    assert text.endswith("11 упоминаниями.")
+    assert "лидер в позитивной активности" in text
+    assert len(calls) == 2
+    assert calls[0]["max_tokens"] == 2200
+    assert calls[0]["timeout"] == 180
+
+
+def test_ask_vllm_stops_when_model_finishes(monkeypatch):
+    from mlops import dashboard_qa
+
+    calls = []
+
+    def fake_chat(**kwargs):
+        calls.append(kwargs)
+        return _ChatStub("Полный ответ.", "stop")
+
+    monkeypatch.setattr("mlops.gateway.chat", fake_chat)
+    text = dashboard_qa.ask_vllm("dashboard_qa_media_v1", "кто лидирует?", "позитив: kommersant.ru 11", "аналитик")
+    assert text == "Полный ответ."
+    assert len(calls) == 1
