@@ -7043,7 +7043,14 @@ async def get_user_folders(
                     if index_number is not None:
                         file_info["index_number"] = index_number
                         
-                    json_folders[folder_name].append(file_info)
+                                                try:
+                                _fpath = os.path.join('/home/dev/tellscope_app/tellscope_backend/data', str(user_id), 'json_files_directory', folder_name, file_name_stripped + '.json')
+                                if os.path.exists(_fpath):
+                                    file_info['created'] = os.path.getmtime(_fpath)
+                            except Exception:
+                                pass
+
+json_folders[folder_name].append(file_info)
                 except Exception as e:
                     print(f"Error processing file {file_name_stripped}: {str(e)}")
                     continue
