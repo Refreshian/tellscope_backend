@@ -3286,7 +3286,18 @@ def load_file(user_id: str, file_type: str, folder_name: str, file_name: str, us
         raise HTTPException(status_code=400, detail="Invalid file type. Use 'projector_files_directory', 'bertopic_files_directory' or 'json_files_directory'.")
     
 
-    # Проверка существования файла
+    # Проверка существования файла (с учётом регистра имени на диске)
+    if not os.path.isfile(file_path) and file_type == 'json_files_directory':
+        try:
+            _low = os.path.basename(file_path).lower()
+            _base = os.path.dirname(file_path)
+            if os.path.isdir(_base):
+                for _cand in os.listdir(_base):
+                    if _cand.lower() == _low:
+                        file_path = os.path.join(_base, _cand)
+                        break
+        except Exception:
+            pass
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
