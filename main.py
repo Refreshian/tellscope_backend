@@ -6439,10 +6439,13 @@ from tasks import process_file_task
 
 @app.post("/add-file/{user_id}/{folder_name}", tags=["data & folders"])
 async def add_file(
-    user_id: str, 
-    folder_name: str, 
-    uploaded_file: UploadFile = File(..., max_size=50*1024*1024*1024), methods=["POST"]
+    user_id: str,
+    folder_name: str,
+    uploaded_file: UploadFile = File(..., max_size=50*1024*1024*1024),
+    methods=["POST"],
+    user: User = Depends(current_user),
 ):
+    _folder_guard(user_id, folder_name, user, need_write=True)
     if not folder_name:
         raise HTTPException(status_code=400, detail="Необходимо указать имя папки")
 
@@ -6595,7 +6598,8 @@ async def check_files(user_id: str, folder_name: str):
 
 # Удаление папки
 @app.delete("/delete-folder/{user_id}/{directory_type}/{folder_name}", tags=['data & folders'])
-async def delete_folder(user_id: str, directory_type: str, folder_name: str):
+async def delete_folder(user_id: str, directory_type: str, folder_name: str, user: User = Depends(current_user)):
+    _folder_guard(user_id, folder_name, user, need_write=True)
     # Получаем текущее содержимое для указанного пользователя
     json_folders = await redis_db.hget(user_id, directory_type)
     
@@ -6658,7 +6662,8 @@ async def delete_folder(user_id: str, directory_type: str, folder_name: str):
 
 # Удаление файла
 @app.delete("/delete-file/{user_id}/{directory_type}/{directory_name}/{file_name}", tags=['data & folders'])
-async def delete_file(user_id: str, directory_type: str, directory_name: str, file_name: str):
+async def delete_file(user_id: str, directory_type: str, directory_name: str, file_name: str, user: User = Depends(current_user)):
+    _folder_guard(user_id, directory_name, user, need_write=True)
     # Получаем директории для указанного user_id
     folders = await redis_db.hgetall(user_id)
     # Преобразуем байтовые строки в обычные строки и десериализуем JSON
@@ -10898,6 +10903,32 @@ class AdminShareBody(BaseModel):
     folder: str
     user_id: int
     access: str = "read"
+
+
+def _folder_allowed(owner_user_id, folder, user, need_write=False):
+    """Owner / superuser всегда имеют доступ; иначе — запись в реестре shares."""
+    try:
+        if str(user.id) == str(owner_user_id):
+            return True
+        if getattr(user, "is_superuser", False):
+            return True
+    except Exception:
+        return False
+    if not folder:
+        return False
+    for it in _load_shares():
+        if (int(it.get("owner_user_id", -1)) == int(owner_user_id)
+                and it.get("folder") == folder
+                and int(it.get("user_id", -1)) == int(user.id)):
+            if need_write and it.get("access", "read") != "write":
+                return False
+            return True
+    return False
+
+
+def _folder_guard(owner_user_id, folder, user, need_write=False):
+    if not _folder_allowed(owner_user_id, folder, user, need_write=need_write):
+        raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
 
 current_superuser = fastapi_users.current_user(active=True, superuser=True)
 
