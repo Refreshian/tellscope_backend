@@ -35,3 +35,14 @@ celery -A celery_app worker --loglevel=info --pool=solo --concurrency=1
 ```
 
 Деплой на сервере выполняется через supervisor (программа `fastapi_app`), фронтенд собирается и раздаётся nginx.
+
+
+## Скриншоты и демо
+
+Анимированное демо разделов (Тональный ландшафт, Информационный граф, Голос клиента):
+
+![Демо разделов](docs/screenshots/demo.gif)
+
+| Тональный ландшафт | Информационный граф | Голос клиента |
+|---|---|---|
+| ![Тональный ландшафт](docs/screenshots/tonality.png) | ![Информационный граф](docs/screenshots/information.png) | ![Голос клиента](docs/screenshots/voice.png) |
