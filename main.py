@@ -3207,6 +3207,13 @@ async def create_data_projector(user_id: str, folder_name: str, file_name: str, 
 
 @app.get('/file-load/{user_id}/{file_type}/{folder_name}/{file_name}', tags=['files'])
 def load_file(user_id: str, file_type: str, folder_name: str, file_name: str, user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not user.is_superuser:
+        _allowed = [it for it in _load_shares()
+                    if it["owner_user_id"] == int(user_id)
+                    and it["folder"] == folder_name
+                    and it["user_id"] == user.id]
+        if not _allowed:
+            raise HTTPException(status_code=403, detail="Нет доступа к файлам этого пользователя")
     # Логируем параметры запроса для отладки
     print(f"Received request with parameters: user_id={user_id}, file_type={file_type}, folder_name={folder_name}, file_name={file_name}")
 
