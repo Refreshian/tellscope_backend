@@ -259,6 +259,7 @@ class PositiveHub(BaseModel):
 class ModelAuthorsTonalityLandscape(BaseModel):
     negative_hubs: List[NegativeHub]
     positive_hubs: List[PositiveHub]
+    neutral_hubs: List[NegativeHub] = Field(default_factory=list)
 
 class TextData(BaseModel):
     hub: str
@@ -303,6 +304,18 @@ class AuthorInfGraph(BaseModel):
     viewsCount: Union[int, str]
     timeCreate: str
     es_id: Union[int, str]
+    text: Optional[str] = ''
+    commentsCount: Optional[int] = 0
+    likesCount: Optional[int] = 0
+
+    @validator("commentsCount", "likesCount", pre=True)
+    def convert_engagement_counts(cls, value):
+        if value in ('', '-', None):
+            return 0
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return 0
 
     @validator("timeCreate", pre=True)
     def convert_time_create(cls, value):
@@ -348,6 +361,8 @@ class RepostInfGraph(BaseModel):
     viewsCount: str
     timeCreate: str
     es_id: Union[int, str]
+    commentsCount: Optional[int] = 0
+    likesCount: Optional[int] = 0
 
     @validator("audienceCount", pre=True)
     def convert_audience_count(cls, value):
@@ -355,6 +370,15 @@ class RepostInfGraph(BaseModel):
             return 0
         try:
             return int(value)
+        except (ValueError, TypeError):
+            return 0
+
+    @validator("commentsCount", "likesCount", pre=True)
+    def convert_repost_engagement(cls, value):
+        if value in ('', '-', None):
+            return 0
+        try:
+            return int(float(value))
         except (ValueError, TypeError):
             return 0
     
@@ -428,6 +452,8 @@ class SunkeyDatum(BaseModel):
     audienceCount: int
     repostsCount: int
     viewsCount: int
+    likesCount: int = 0
+    author_type: str = ""
     elastic_id: Any # str или List[str]
 
 class VoiceModel(BaseModel):
@@ -465,6 +491,8 @@ class SecondGraphItemMediaRating(BaseModel):
     url: str
     color: str
     elastic_id: Union[int, str]  # Заменяем _id на id
+    categoryName: Optional[str] = ""
+    duplicateCount: Optional[int] = 1
 
 
 class MediaRatingModel(BaseModel):
@@ -840,6 +868,7 @@ async def tonality_landscape(
 
     pos = [entry for entry in data if entry.get('toneMark') == 1]
     neg = [entry for entry in data if entry.get('toneMark') == -1]
+    neutral = [entry for entry in data if int(entry.get('toneMark', 0) or 0) == 0]
 
     print(len(pos))
     print(len(neg))
@@ -905,6 +934,8 @@ async def tonality_landscape(
 
     neg_hub_response = prepare_hub_response(neg_hub_metrics)
     pos_hub_response = prepare_hub_response(pos_hub_metrics)
+    neutral_hub_metrics = aggregate_metrics(neutral)
+    neutral_hub_response = prepare_hub_response(neutral_hub_metrics)
 
     def process_author_object(entry):
         if 'authorObject' in entry and entry['authorObject']:
@@ -1050,7 +1081,8 @@ async def tonality_landscape(
         ),
         tonality_hubs_values=ModelAuthorsTonalityLandscape(
             negative_hubs=neg_hub_response,
-            positive_hubs=pos_hub_response
+            positive_hubs=pos_hub_response,
+            neutral_hubs=neutral_hub_response
         ),
         negative_authors_values=negative_authors_values,
         positive_authors_values=positive_authors_values,
@@ -1156,7 +1188,7 @@ async def information_graph(# user: User = Depends(current_user),
 
     # Проверяем и создаем недостающие столбцы для модели Pydantic
     required_columns = ['id', 'fullname', 'url', 'author_type', 'hub', 'sex', 'age',
-                       'audienceCount', 'er', 'viewsCount', 'timeCreate', '_id']
+                       'audienceCount', 'er', 'viewsCount', 'commentsCount', 'likesCount', 'timeCreate', '_id']
 
     # Добавляем столбец 'id', если его нет в df_meta
     if 'id' not in df_meta.columns:
@@ -1164,7 +1196,7 @@ async def information_graph(# user: User = Depends(current_user),
 
     for col in required_columns:
         if col not in df_meta.columns:
-            if col in ['audienceCount', 'er', 'viewsCount']:
+            if col in ['audienceCount', 'er', 'viewsCount', 'commentsCount', 'likesCount']:
                 df_meta[col] = 0
             else:
                 df_meta[col] = ''
@@ -1201,6 +1233,13 @@ async def information_graph(# user: User = Depends(current_user),
         except (ValueError, TypeError):
             author_data['er'] = 0
 
+        for _metric in ('commentsCount', 'likesCount'):
+            try:
+                raw = author_data.get(_metric, 0)
+                author_data[_metric] = int(raw) if raw not in ['', '-', None] else 0
+            except (ValueError, TypeError):
+                author_data[_metric] = 0
+
         # Создаем структуру author для выходного формата
         author_struct = {
             "fullname": author_data['fullname'],
@@ -1213,7 +1252,10 @@ async def information_graph(# user: User = Depends(current_user),
             "er": author_data['er'],
             "viewsCount": author_data['viewsCount'],
             "timeCreate": author_data['timeCreate'],
-            "es_id": author_data['_id']
+            "es_id": author_data['_id'],
+            "commentsCount": author_data.get('commentsCount', 0),
+            "likesCount": author_data.get('likesCount', 0),
+            "text": str(df.loc[key, 'text'] if 'text' in df.columns else '')[:2500]
         }
 
         author_dct['author'] = author_struct
@@ -1242,6 +1284,13 @@ async def information_graph(# user: User = Depends(current_user),
                 except (ValueError, TypeError):
                     repost_data['er'] = 0
 
+                for _metric in ('commentsCount', 'likesCount'):
+                    try:
+                        raw = repost_data.get(_metric, 0)
+                        repost_data[_metric] = int(raw) if raw not in ['', '-', None] else 0
+                    except (ValueError, TypeError):
+                        repost_data[_metric] = 0
+
                 # Создаем структуру repost для выходного формата
                 repost_struct = {
                     "fullname": repost_data['fullname'],
@@ -1254,7 +1303,9 @@ async def information_graph(# user: User = Depends(current_user),
                     "er": repost_data['er'],
                     "viewsCount": repost_data['viewsCount'],
                     "timeCreate": repost_data['timeCreate'],
-                    "es_id": repost_data['_id']
+                    "es_id": repost_data['_id'],
+                    "commentsCount": repost_data.get('commentsCount', 0),
+                    "likesCount": repost_data.get('likesCount', 0)
                 }
 
                 author_dct['reposts'].append(repost_struct)
@@ -1410,130 +1461,115 @@ async def voice_analize(
 ) -> ModelVoice:
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
-    search = query_str.split(',')
+    raw = (query_str or "").strip()
+    if raw.lower() in ("", "all", "yes", "none", "null"):
+        terms = ["all"]
+        labels = ["Все сообщения"]
+    else:
+        terms = [part.strip() for part in raw.split(",") if part.strip()] or ["all"]
+        labels = ["Все сообщения" if term.lower() == "all" else term for term in terms]
     topn = 20
     values = []
 
-    for i in range(len(search)):
-        data = elastic_query(theme_index=indexes[index], query_str=search[i])
-        # Оставляем только нужные по timeCreate
-        data = [x for x in data if x.get('timeCreate') is not None and min_date <= x['timeCreate'] <= max_date]
+    def _n(value):
+        try:
+            if value is None or value == "":
+                return 0
+            return int(float(value))
+        except Exception:
+            return 0
 
-        # Заполнение недостающих полей
+    def _tone(mark):
+        text_mark = str(mark)
+        if text_mark in ("1", "1.0"):
+            return "Позитив"
+        if text_mark in ("-1", "-1.0"):
+            return "Негатив"
+        return "Нейтрал"
+
+    for term, label in zip(terms, labels):
+        data = elastic_query(theme_index=indexes[index], query_str=term)
+        data = [
+            item for item in data
+            if item.get("timeCreate") is not None and min_date <= item["timeCreate"] <= max_date
+        ]
         for item in data:
-            if 'toneMark' not in item:
-                item['toneMark'] = 0
-            if 'type' not in item:
-                item['type'] = "other"
+            if "toneMark" not in item:
+                item["toneMark"] = 0
+            if not item.get("type"):
+                item["type"] = "other"
+            if item.get("hub") == "telegram.org":
+                item["hub"] = "telegram.me"
 
-        search_name = search[i].strip()
-
-        # --- Для tonality: собираем elastic_id для каждого источника и тональности
-        # source_ids_by_tonality: {source: {Тональность: [id, id, ...]}}
         source_ids_by_tonality = defaultdict(lambda: defaultdict(list))
-        for x in data:
-            source = x['hub']
-            tonality = str(x['toneMark']).replace('0', 'Нейтрал').replace('-1', 'Негатив').replace('1', 'Позитив')
-            _id = x.get('_id')
-            source_ids_by_tonality[source][tonality].append(_id)
+        grouped = defaultdict(lambda: {
+            "count": 0,
+            "comments": 0,
+            "audience": 0,
+            "reposts": 0,
+            "views": 0,
+            "likes": 0,
+            "author_types": Counter(),
+            "elastic_ids": [],
+        })
+        hub_counts = Counter()
+        for item in data:
+            hub = item.get("hub") or "unknown"
+            typ = item.get("type") or "other"
+            tone = _tone(item.get("toneMark", 0))
+            _id = item.get("_id")
+            author_type = (item.get("author_type") or "").strip() or "не указан"
+            source_ids_by_tonality[hub][tone].append(_id)
+            bucket = grouped[(hub, typ, tone)]
+            bucket["count"] += 1
+            bucket["comments"] += _n(item.get("commentsCount"))
+            bucket["audience"] += _n(item.get("audienceCount"))
+            bucket["reposts"] += _n(item.get("repostsCount"))
+            bucket["views"] += _n(item.get("viewsCount"))
+            bucket["likes"] += _n(item.get("likesCount"))
+            bucket["author_types"][author_type] += 1
+            if _id is not None:
+                bucket["elastic_ids"].append(_id)
+            hub_counts[hub] += 1
 
         dcts = []
-        for source in source_ids_by_tonality:
-            dct = {
-                'source': source,
-                'Нейтрал': len(source_ids_by_tonality[source].get('Нейтрал', [])),
-                'Позитив': len(source_ids_by_tonality[source].get('Позитив', [])),
-                'Негатив': len(source_ids_by_tonality[source].get('Негатив', [])),
-                'elastic_id': (
-                    source_ids_by_tonality[source].get('Нейтрал', []) +
-                    source_ids_by_tonality[source].get('Позитив', []) +
-                    source_ids_by_tonality[source].get('Негатив', [])
-                )
-            }
-            dcts.append(dct)
-        # заполняем отсутствующие тональности и elastic_id для всех известных хабов
-        all_sources = set(x['hub'] for x in data)
-        for dct in dcts:
-            for key in ('Нейтрал', 'Позитив', 'Негатив'):
-                if key not in dct:
-                    dct[key] = 0
-            if 'elastic_id' not in dct:
-                dct['elastic_id'] = []
+        for source, tones in source_ids_by_tonality.items():
+            ids = tones.get("Нейтрал", []) + tones.get("Позитив", []) + tones.get("Негатив", [])
+            dcts.append({
+                "source": source,
+                "Нейтрал": len(tones.get("Нейтрал", [])),
+                "Позитив": len(tones.get("Позитив", [])),
+                "Негатив": len(tones.get("Негатив", [])),
+                "elastic_id": ids,
+            })
 
-        # ---- Для sunkey_data: собираем elastic_id ровно по hub/type/тональность
-        # map: (hub, type, tonality) -> [id, ...]
-        sunkey_map = defaultdict(list)
-        for x in data:
-            hub = x['hub']
-            typ = x['type']
-            tonality = str(x['toneMark']).replace('0', 'Нейтрал').replace('-1', 'Негатив').replace('1', 'Позитив')
-            _id = x.get('_id')
-            sunkey_map[(hub, typ, tonality)].append(_id)
-
-        # Далее идет подсчет всех нужных metrics как раньше, только надо elastic_id добавить:
-        hubs = Counter([x['hub'] for x in data])
-        hubs = dict(sorted(hubs.items(), key=lambda x: x[1], reverse=True)[:topn])
-        list_topn_hubs = list(hubs.keys())
-
-        message_tonality_type = [
-            [
-                x['hub'],
-                x['type'],
-                str(x['toneMark']).replace('0', 'Нейтрал').replace('-1', 'Негатив').replace('1', 'Позитив'),
-                x.get('commentsCount', 0),
-                x.get('audienceCount', 0),
-                x.get('repostsCount', 0),
-                x.get('viewsCount', 0) if x.get('viewsCount') is not None and x.get('viewsCount') != '' else 0
-            ]
-            for x in data if x['hub'] in list_topn_hubs
-        ]
-
-        dct_tonality_hubs = Counter([', '.join(x[:3]) for x in message_tonality_type])
+        list_topn_hubs = [hub for hub, _ in hub_counts.most_common(topn)]
         hub_tonality_type_list = []
-        for x in list(dct_tonality_hubs.items()):
-            split_hub = x[0].split(',')
-            if len(split_hub) >= 3:
-                hub_val, type_val, tonality_val = [v.strip() for v in split_hub[:3]]
-                # Поиск metrics
-                comments_count = 0
-                audience_count = 0
-                reposts_count = 0
-                views_count = 0
-                for msg in message_tonality_type:
-                    if msg[0] == hub_val and msg[1] == type_val and msg[2] == tonality_val:
-                        comments_count = msg[3]
-                        audience_count = msg[4]
-                        reposts_count = msg[5]
-                        views_count = msg[6]
-                        break
-                # Соберём elastic_id для этой тройки:
-                elastic_ids = sunkey_map.get((hub_val, type_val, tonality_val), [])
-                # Если сообщений несколько, можно возвращать или список, или один элемент. Вернуть список:
-                hub_tonality_type_list.append({
-                    "hub": hub_val,
-                    "type": type_val,
-                    "tonality": tonality_val,
-                    "count": x[1],
-                    "search": search_name,
-                    "commentsCount": comments_count,
-                    "audienceCount": audience_count,
-                    "repostsCount": reposts_count,
-                    "viewsCount": views_count,
-                    "elastic_id": elastic_ids if len(elastic_ids) != 1 else elastic_ids[0]
-                })
-            else:
-                print(f"Недостаточно значений для элемента: {x[0]}")
-
-        hub_tonality_type_list = sorted(hub_tonality_type_list, key=lambda x: x['count'], reverse=True)
-
-        # --- Собираем финальный вид
-        values_search = {
-            'name': search_name,
-            'tonality': dcts,
-            'sunkey_data': hub_tonality_type_list,
-        }
-        values.append(values_search)
-
+        for (hub_val, type_val, tonality_val), bucket in grouped.items():
+            if hub_val not in list_topn_hubs:
+                continue
+            author_type = bucket["author_types"].most_common(1)[0][0] if bucket["author_types"] else ""
+            ids = bucket["elastic_ids"]
+            hub_tonality_type_list.append({
+                "hub": hub_val,
+                "type": type_val,
+                "tonality": tonality_val,
+                "count": bucket["count"],
+                "search": label,
+                "commentsCount": bucket["comments"],
+                "audienceCount": bucket["audience"],
+                "repostsCount": bucket["reposts"],
+                "viewsCount": bucket["views"],
+                "likesCount": bucket["likes"],
+                "author_type": author_type,
+                "elastic_id": ids if len(ids) != 1 else (ids[0] if ids else []),
+            })
+        hub_tonality_type_list = sorted(hub_tonality_type_list, key=lambda row: row["count"], reverse=True)
+        values.append({
+            "name": label,
+            "tonality": dcts,
+            "sunkey_data": hub_tonality_type_list,
+        })
 
     return ModelVoice(values=values)
 
@@ -1583,6 +1619,9 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None) 
         available.append("citeIndex")
         # обязательно захватываем _id
         available.append("_id")
+        for extra in ("categoryName", "duplicateCount"):
+            if extra in dff.columns:
+                available.append(extra)
 
         df_meta_smi_only = dff[available].copy()
         df_meta_smi_only["fullname"] = df_meta_smi_only["hub"]
@@ -1623,10 +1662,14 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None) 
             smi["timeCreate"] = smi["timeCreate"].apply(
                 lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
             )
-            smi_df = smi[[
+            smi_cols = [
                 "timeCreate", "hub", "toneMark", "audienceCount",
                 "url", "er", "hubtype", "text", "citeIndex", "_id"
-            ]].copy()
+            ]
+            for extra in ("categoryName", "duplicateCount"):
+                if extra in smi.columns:
+                    smi_cols.append(extra)
+            smi_df = smi[smi_cols].copy()
             smi_df["fullname"] = smi_df["hub"]
             smi_df["author_type"] = "Онлайн-СМИ"
             smi_df["type"] = "Онлайн-СМИ"
@@ -1738,13 +1781,25 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None) 
             id = int(row["_id"])
         except:
             id = row["_id"]
+        cat = row["categoryName"] if "categoryName" in row.index else ""
+        if pd.isna(cat):
+            cat = ""
+        dup = row["duplicateCount"] if "duplicateCount" in row.index else 1
+        try:
+            dup = int(dup) if pd.notna(dup) else 1
+        except Exception:
+            dup = 1
+        if dup < 1:
+            dup = 1
         bobble.append({
             "name": row["hub"],
             "time": times[i],
-            "index": int(row.get("citeIndex", 0)),
+            "index": int(row.get("citeIndex", 0) or 0),
             "url": row["url"],
             "color": color,
-            "elastic_id": id
+            "elastic_id": id,
+            "categoryName": str(cat) if cat else "",
+            "duplicateCount": dup,
         })
 
     # 10. Собираем итог и возвращаем
@@ -8268,6 +8323,8 @@ def _dashboard_prompt(lock_name: str, default_id: str) -> str:
 # Вариант 2: Если вы не знаете структуру данных заранее 
 @app.post("/ai-question-raw", tags=['data analytics'])
 async def ai_question_raw(request: Request):
+    from mlops.dashboard_qa import handle_question_raw
+    return await handle_question_raw(request)
     # Получаем тело запроса в виде байтов
     body_bytes = await request.body()
     
@@ -8507,6 +8564,8 @@ qdrant_client = QdrantClient(
 
 @app.post("/ai-question-information-graph", tags=['data analytics'])
 async def ai_question_information_graph(request: Request):
+    from mlops.dashboard_qa import handle_question_information
+    return await handle_question_information(request)
     # Получаем тело запроса в виде байтов
     body_bytes = await request.body()
     
@@ -8748,6 +8807,8 @@ async def ai_question_information_graph(request: Request):
 
 @app.post("/ai-question-media-rating", tags=['data analytics'])
 async def ai_question_media_rating(request: Request):
+    from mlops.dashboard_qa import handle_question_media
+    return await handle_question_media(request)
     # Получаем тело запроса в виде байтов
     body_bytes = await request.body()
     
@@ -9326,553 +9387,48 @@ async def convert_file_mlg(file: UploadFile = File(...)):
 
 @app.post("/ai-question-analysis", tags=['data analytics'])
 async def ai_question_analysis(request: Request):
-    try:
-        print("Received request")
-        
-        body_json = await request.json()
-        print(f"Request JSON: {body_json}")
+    from mlops.ai_bot_rag import handle_question_analysis
+    return await handle_question_analysis(
+        request,
+        es=es,
+        qdrant_client=qdrant_client,
+        model_manager=model_manager,
+        models=models,
+        client=client,
+        ai_model=ai_model,
+        logger=logger,
+        load_indexes=lambda: load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'),
+        system_prompt=_dashboard_prompt("dashboard_qa_bot", "dashboard_qa_bot_v1"),
+    )
 
-        question = body_json.get('question', '')
-        topic = body_json.get('topic', '')
-        selected_databases = body_json.get('selected_databases', [])
-        user_id = body_json.get('userId', '')
-        folder_name = body_json.get('folderName', '')
-        
-        # Валидация
-        if not question.strip():
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Вопрос не может быть пустым"}
-            )
-        
-        if not selected_databases:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Необходимо выбрать хотя бы одну тему для анализа"}
-            )
 
-        print('=====================Request Data==========================')
-        print(f'Question: {question}')
-        print(f'Selected databases: {selected_databases}')
+@app.post("/ai-bot/corpus-summary", tags=['data analytics'])
+async def ai_bot_corpus_summary(request: Request):
+    from mlops.ai_bot_rag import handle_corpus_summary
+    return await handle_corpus_summary(
+        request,
+        es=es,
+        load_indexes=lambda: load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'),
+        logger=logger,
+    )
 
-        # ============================================================
-        # 🔥 ШАГ 1: ОПРЕДЕЛЕНИЕ НОРМАЛИЗАЦИИ КОЛЛЕКЦИЙ
-        # ============================================================
-        
-        logger.info("=" * 80)
-        logger.info("🔬 ШАГ 1: АНАЛИЗ НОРМАЛИЗАЦИИ КОЛЛЕКЦИЙ")
-        logger.info("=" * 80)
-        
-        # Загружаем индексы
-        try:
-            indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-            logger.info(f"✅ Загружено {len(indexes)} индексов")
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки индексов: {e}")
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Ошибка при загрузке индексов", "details": str(e)}
-            )
-        
-        # Находим первую доступную коллекцию для проверки
-        first_collection = None
-        for db_name in selected_databases:
-            for idx, name in indexes.items():
-                if name == db_name or db_name in name:
-                    first_collection = name
-                    break
-            if first_collection:
-                break
-        
-        if not first_collection:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "Не найдена ни одна коллекция для выбранных баз данных"}
-            )
-        
-        # Проверяем нормализацию коллекции
-        collection_normalized = False
-        avg_collection_norm = 1.0
-        
-        try:
-            logger.info(f"🔍 Проверка коллекции: {first_collection}")
-            
-            sample_points = qdrant_client.scroll(
-                collection_name=first_collection,
-                limit=10,
-                with_vectors=True
-            )[0]
-            
-            if sample_points:
-                norms = [np.linalg.norm(p.vector) for p in sample_points]
-                avg_collection_norm = np.mean(norms)
-                std_norm = np.std(norms)
-                
-                logger.info(f"📊 Статистика векторов коллекции:")
-                logger.info(f"   Средняя норма: {avg_collection_norm:.6f}")
-                logger.info(f"   Стд. отклонение: {std_norm:.6f}")
-                
-                collection_normalized = abs(avg_collection_norm - 1.0) < 0.05
-                
-                if collection_normalized:
-                    logger.info("✅ Коллекция НОРМАЛИЗОВАНА (норма ≈ 1.0)")
-                else:
-                    logger.info(f"✅ Коллекция НЕ нормализована (норма ≈ {avg_collection_norm:.3f})")
-            else:
-                logger.warning("⚠️ Не удалось получить sample, используем нормализацию по умолчанию")
-                collection_normalized = True  # Безопасное значение по умолчанию
-                
-        except Exception as check_error:
-            logger.warning(f"⚠️ Ошибка проверки нормализации: {check_error}")
-            collection_normalized = True  # Fallback
-        
-        # ============================================================
-        # 🔥 ШАГ 2: СОЗДАНИЕ QUERY EMBEDDING С ПРАВИЛЬНОЙ НОРМАЛИЗАЦИЕЙ
-        # ============================================================
-        
-        logger.info("=" * 80)
-        logger.info("🔬 ШАГ 2: СОЗДАНИЕ QUERY EMBEDDING")
-        logger.info("=" * 80)
-        
-        try:
-            # Создаём embedding с нормализацией, соответствующей коллекции
-            query_embedding = model_manager.encode_texts(
-                [question],
-                batch_size=1,
-                normalize_embeddings=collection_normalized  # 👈 Ключевой параметр!
-            )
-            
-            # Конвертируем в правильный формат
-            if isinstance(query_embedding, np.ndarray):
-                if query_embedding.ndim == 2:
-                    query_embedding = query_embedding[0]
-                query_embedding = query_embedding.astype(np.float32)
-            
-            if query_embedding is None or len(query_embedding) == 0:
-                raise ValueError("Получен пустой эмбеддинг")
-            
-            query_norm = np.linalg.norm(query_embedding)
-            
-            logger.info(f"✅ Query embedding создан:")
-            logger.info(f"   Размерность: {len(query_embedding)}")
-            logger.info(f"   Норма: {query_norm:.6f}")
-            logger.info(f"   Нормализован: {'ДА' if collection_normalized else 'НЕТ'}")
-            
-            # 🔥 ПРОВЕРКА СООТВЕТСТВИЯ
-            if collection_normalized:
-                if abs(query_norm - 1.0) > 0.01:
-                    logger.error(f"❌ ОШИБКА: Query должен быть нормализован, но норма = {query_norm:.6f}")
-                    # Принудительная нормализация
-                    query_embedding = query_embedding / query_norm
-                    logger.info(f"✅ Применена принудительная нормализация: {np.linalg.norm(query_embedding):.6f}")
-            else:
-                # Если коллекция не нормализована, проверяем соответствие норм
-                if abs(query_norm - avg_collection_norm) > avg_collection_norm * 0.5:
-                    logger.warning(f"⚠️ Норма query ({query_norm:.3f}) сильно отличается от коллекции ({avg_collection_norm:.3f})")
-            
-            # 🔥 Преобразуем в список для Qdrant
-            query_vector = query_embedding.tolist()
-            
-            logger.info(f"✅ query_vector готов к использованию (тип: {type(query_vector)})")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка при создании эмбеддинга: {e}", exc_info=True)
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Ошибка при создании эмбеддинга", "details": str(e)}
-            )
 
-        # ============================================================
-        # 🔥 ШАГ 3: ПОИСК ПО БАЗАМ ДАННЫХ
-        # ============================================================
-        
-        logger.info("=" * 80)
-        logger.info("🔍 ШАГ 3: ПОИСК ПО БАЗАМ ДАННЫХ")
-        logger.info("=" * 80)
+@app.post("/ai-bot/deep-brief", tags=['data analytics'])
+async def ai_bot_deep_brief(request: Request):
+    from mlops.ai_bot_rag import handle_deep_brief
+    return await handle_deep_brief(
+        request,
+        es=es,
+        load_indexes=lambda: load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'),
+        logger=logger,
+    )
 
-        all_relevant_texts = []
-        search_results_summary = []
 
-        for db_name in selected_databases:
-            collection_name = None
-            
-            try:
-                # Находим коллекцию
-                for idx, name in indexes.items():
-                    if name == db_name or db_name in name:
-                        collection_name = name
-                        break
-                
-                if not collection_name:
-                    logger.warning(f"⚠️ Коллекция не найдена для: {db_name}")
-                    search_results_summary.append({
-                        "database": db_name,
-                        "error": "Коллекция не найдена"
-                    })
-                    continue
+@app.get("/ai-bot/deep-brief", tags=['data analytics'])
+async def ai_bot_deep_brief_status(request: Request):
+    from mlops.ai_bot_rag import handle_deep_brief_status
+    return await handle_deep_brief_status(request)
 
-                logger.info(f"\n📦 Поиск в: {collection_name}")
-
-                # ============================================================
-                # 🔥 ДИАГНОСТИКА КОЛЛЕКЦИИ (опционально, для отладки)
-                # ============================================================
-                
-                try:
-                    collection_info = qdrant_client.get_collection(collection_name=collection_name)
-                    
-                    logger.info(f"   Векторов: {collection_info.points_count}")
-                    logger.info(f"   Размерность: {collection_info.config.params.vectors.size}")
-                    
-                    if collection_info.points_count == 0:
-                        logger.error("   ❌ Коллекция пустая!")
-                        search_results_summary.append({
-                            "database": db_name,
-                            "status": "empty_collection",
-                            "error": "Коллекция не содержит векторов"
-                        })
-                        continue
-                    
-                    # Проверка размерности
-                    expected_dim = len(query_vector)
-                    actual_dim = collection_info.config.params.vectors.size
-                    
-                    if expected_dim != actual_dim:
-                        logger.error(f"   ❌ Несовпадение размерности: {expected_dim} != {actual_dim}")
-                        search_results_summary.append({
-                            "database": db_name,
-                            "status": "dimension_mismatch",
-                            "error": f"Размерность {actual_dim} != {expected_dim}"
-                        })
-                        continue
-                    
-                except Exception as info_error:
-                    logger.warning(f"   ⚠️ Не удалось получить информацию о коллекции: {info_error}")
-
-                # ============================================================
-                # 🔥 ОСНОВНОЙ ПОИСК
-                # ============================================================
-                
-                search_params = models.SearchParams(
-                    hnsw_ef=128,
-                    exact=False
-                )
-
-                logger.info(f"   🔍 Выполняем поиск (норма query: {np.linalg.norm(query_vector):.6f})...")
-
-                # Первая попытка: порог 0.3
-                search_result = qdrant_client.search(
-                    collection_name=collection_name,
-                    query_vector=query_vector,  # 👈 ИСПОЛЬЗУЕМ query_vector!
-                    limit=50,
-                    with_payload=True,
-                    score_threshold=0.3,
-                    search_params=search_params,
-                    with_vectors=False
-                )
-
-                logger.info(f"   ✅ Порог 0.3: найдено {len(search_result)} результатов")
-
-                # Если мало - понижаем порог
-                if len(search_result) < 5:
-                    logger.info(f"   ⚠️ Мало результатов, понижаем порог до 0.1...")
-                    
-                    search_result = qdrant_client.search(
-                        collection_name=collection_name,
-                        query_vector=query_vector,
-                        limit=50,
-                        with_payload=True,
-                        score_threshold=0.1,
-                        search_params=search_params,
-                        with_vectors=False
-                    )
-                    logger.info(f"   ✅ Порог 0.1: найдено {len(search_result)} результатов")
-
-                # Если все равно 0 - пробуем без порога
-                if not search_result:
-                    logger.warning(f"   ⚠️ Пробуем БЕЗ порога...")
-                    
-                    search_result = qdrant_client.search(
-                        collection_name=collection_name,
-                        query_vector=query_vector,
-                        limit=10,
-                        with_payload=True,
-                        with_vectors=False
-                    )
-                    
-                    if search_result:
-                        best_score = search_result[0].score
-                        logger.info(f"   ✅ БЕЗ порога: {len(search_result)} результатов, лучший score: {best_score:.6f}")
-                        
-                        if best_score < 0.1:
-                            logger.error("   ❌ Scores слишком низкие - требуется переиндексация!")
-                    else:
-                        logger.error("   ❌ НЕТ РЕЗУЛЬТАТОВ даже без порога!")
-
-                # Показываем топ результаты
-                if search_result:
-                    logger.info(f"   📋 Топ-3:")
-                    for i, point in enumerate(search_result[:3], 1):
-                        logger.info(f"      {i}. Score: {point.score:.4f}")
-
-                # ============================================================
-                # ИЗВЛЕЧЕНИЕ HASH И ЗАПРОС К ELASTICSEARCH
-                # ============================================================
-                
-                hash_values = []
-                for point in search_result:
-                    try:
-                        if hasattr(point, 'payload') and point.payload:
-                            hash_value = None
-                            
-                            if "metadata" in point.payload and isinstance(point.payload["metadata"], dict):
-                                hash_value = point.payload["metadata"].get("hash")
-                            elif "hash" in point.payload:
-                                hash_value = point.payload.get("hash")
-                            
-                            if hash_value:
-                                hash_values.append(hash_value)
-                    except Exception as hash_error:
-                        continue
-
-                logger.info(f"   📎 Извлечено {len(hash_values)} hash-значений")
-
-                if not hash_values:
-                    logger.warning(f"   ⚠️ Hash не найдены, используем Fallback на Qdrant")
-                    
-                    texts_from_qdrant = []
-                    for point in search_result:
-                        try:
-                            payload = point.payload if hasattr(point, 'payload') else {}
-                            
-                            text_item = {
-                                "text": payload.get("content", ""),
-                                "title": payload.get("metadata", {}).get("title", "") if isinstance(payload.get("metadata"), dict) else "",
-                                "hash": str(point.id),
-                                "source": {
-                                    "hub": payload.get("metadata", {}).get("hub", "") if isinstance(payload.get("metadata"), dict) else "",
-                                    "url": payload.get("metadata", {}).get("url", "") if isinstance(payload.get("metadata"), dict) else "",
-                                    "database": db_name,
-                                    "author": "",
-                                    "timeCreate": "",
-                                    "audienceCount": 0
-                                },
-                                "score": point.score
-                            }
-                            texts_from_qdrant.append(text_item)
-                        except:
-                            continue
-                    
-                    all_relevant_texts.extend(texts_from_qdrant)
-                    search_results_summary.append({
-                        "database": db_name,
-                        "found_documents": len(texts_from_qdrant),
-                        "collection_name": collection_name,
-                        "source": "qdrant_only"
-                    })
-                    continue
-
-                # Запрос к Elasticsearch
-                elastic_query = {
-                    "query": {
-                        "terms": {
-                            "hash": hash_values
-                        }
-                    },
-                    "size": len(hash_values),
-                    "_source": ["text", "title", "hub", "url", "hash", "authorObject", "timeCreate", "audienceCount"]
-                }
-
-                try:
-                    elastic_response = es.search(
-                        index=collection_name,
-                        body=elastic_query
-                    )
-                    
-                    logger.info(f"   📄 Elasticsearch: {len(elastic_response['hits']['hits'])} документов")
-                    
-                    # Маппинг hash -> score
-                    hash_to_score = {}
-                    for point in search_result:
-                        try:
-                            if hasattr(point, 'payload') and point.payload:
-                                hash_value = None
-                                if "metadata" in point.payload and isinstance(point.payload["metadata"], dict):
-                                    hash_value = point.payload["metadata"].get("hash")
-                                elif "hash" in point.payload:
-                                    hash_value = point.payload.get("hash")
-                                
-                                if hash_value:
-                                    hash_to_score[hash_value] = point.score
-                        except:
-                            continue
-
-                    texts_from_elastic = []
-                    for hit in elastic_response['hits']['hits']:
-                        source = hit['_source']
-                        hash_value = source.get('hash', '')
-                        relevance_score = hash_to_score.get(hash_value, 0.0)
-                        
-                        text_item = {
-                            "text": source.get("text", ""),
-                            "title": source.get("title", ""),
-                            "hash": hash_value,
-                            "source": {
-                                "hub": source.get("hub", ""),
-                                "url": source.get("url", ""),
-                                "database": db_name,
-                                "author": source.get("authorObject", {}).get("fullname", "") if source.get("authorObject") else "",
-                                "timeCreate": source.get("timeCreate", ""),
-                                "audienceCount": source.get("audienceCount", 0)
-                            },
-                            "score": relevance_score
-                        }
-                        texts_from_elastic.append(text_item)
-                    
-                    all_relevant_texts.extend(texts_from_elastic)
-                    search_results_summary.append({
-                        "database": db_name,
-                        "found_documents": len(texts_from_elastic),
-                        "collection_name": collection_name,
-                        "source": "elasticsearch"
-                    })
-                    
-                except Exception as elastic_error:
-                    logger.error(f"   ❌ Elasticsearch error: {elastic_error}")
-                    # Используем Fallback...
-                    # (код аналогичен выше)
-
-            except Exception as db_error:
-                logger.error(f"❌ Ошибка в базе {db_name}: {db_error}", exc_info=True)
-                search_results_summary.append({
-                    "database": db_name,
-                    "error": str(db_error)
-                })
-
-        # ============================================================
-        # ФИНАЛЬНАЯ ОБРАБОТКА РЕЗУЛЬТАТОВ
-        # ============================================================
-        
-        all_relevant_texts.sort(key=lambda x: x.get("score", 0), reverse=True)
-        top_texts = all_relevant_texts[:15]
-
-        logger.info("=" * 80)
-        logger.info(f"📊 ИТОГИ ПОИСКА:")
-        logger.info(f"   Всего найдено: {len(all_relevant_texts)}")
-        logger.info(f"   Отобрано для анализа: {len(top_texts)}")
-        logger.info("=" * 80)
-
-        if not top_texts:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "answer": "По вашему запросу не найдено релевантных материалов...",
-                    "sources": selected_databases,
-                    "confidence": 0.0,
-                    "status": "no_results",
-                    "topic": topic,
-                    "search_summary": search_results_summary
-                }
-            )
-
-        # Создаем markdown
-        relevant_texts_md = f"""## Найденные релевантные материалы
-
-По запросу "{question}" найдено {len(top_texts)} релевантных документов.
-
-### Распределение по базам данных:
-"""
-
-        for summary in search_results_summary:
-            if "error" not in summary:
-                relevant_texts_md += f"- **{summary['database']}**: {summary['found_documents']} документов (источник: {summary.get('source', 'unknown')})\n"
-
-        relevant_texts_md += "\n### Наиболее релевантные тексты:\n\n"
-
-        for i, text_item in enumerate(top_texts, 1):
-            text_preview = text_item.get("text", "")
-            if len(text_preview) > 400:
-                text_preview = text_preview[:400] + "..."
-            
-            author_info = text_item.get("source", {}).get("author", "")
-            author_text = f"**Автор**: {author_info}\n" if author_info else ""
-            
-            relevant_texts_md += f"""
-#### Документ {i} (Релевантность: {text_item.get('score', 0):.3f})
-- **База данных**: {text_item.get("source", {}).get("database", "неизвестно")}
-- **Источник**: {text_item.get("source", {}).get("hub", "неизвестно")}
-{author_text}- **Заголовок**: {text_item.get("title", "без заголовка")}
-- **Текст**: {text_preview}
-- **URL**: {text_item.get("source", {}).get("url", "")}
-
----
-"""
-
-        # ======= Запрос к LLM =======
-        user_message = f"""
-**Запрос пользователя:** {question}
-**Тема анализа:** {topic}
-**Выбранные базы данных:** {', '.join(selected_databases)}
-
-{relevant_texts_md}
-
-**Задача:** Проанализируй найденные материалы и дай развернутый ответ на вопрос пользователя. 
-Обязательно используй конкретные факты и цитаты из представленных документов. 
-Если есть противоречивые мнения - отметь это. 
-Структурируй ответ логично и выдели ключевые моменты.
-"""
-
-        system_prompt = _dashboard_prompt("dashboard_qa_bot", "dashboard_qa_bot_v1")
-
-        try:
-            chat_result = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                model=ai_model,
-                max_tokens=2000,
-                temperature=0.7
-            )
-
-            answer = chat_result.choices[0].message.content
-            
-            # Рассчитываем confidence
-            avg_score = sum(text.get("score", 0) for text in top_texts) / len(top_texts) if top_texts else 0
-            confidence = min(0.95, avg_score * 0.8 + (len(top_texts) / 50) * 0.2)
-
-            logger.info(f'✅ Успешно обработано {len(top_texts)} документов')
-            logger.info(f'📊 Средний score: {avg_score:.3f}, Confidence: {confidence:.2f}')
-
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "answer": answer,
-                    "sources": selected_databases,
-                    "confidence": round(confidence, 2),
-                    "status": "success",
-                    "topic": topic,
-                    "search_summary": search_results_summary,
-                    "documents_analyzed": len(top_texts),
-                    "total_documents_found": len(all_relevant_texts),
-                    "average_relevance": round(avg_score, 3)
-                }
-            )
-
-        except Exception as llm_error:
-            logger.error(f"Ошибка LLM: {llm_error}", exc_info=True)
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Ошибка при генерации ответа", "details": str(llm_error)}
-            )
-        
-    except json.JSONDecodeError as e:
-        logger.error(f'JSON Decode Error: {str(e)}')
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Неверный формат данных", "details": str(e)}
-        )
-
-    
 # Инициализация клиента через mlops.gateway (ключи только из .env)
 client = GatewayChatClient(provider="aitunnel", profile="dashboard_qa")
 
@@ -10663,6 +10219,13 @@ class GraphBuilder:
         
         return stats
 
+# tellscope:author-graph-enhance
+try:
+    from mlops.author_graph import patch_graph_builder
+    patch_graph_builder(GraphBuilder)
+except Exception as exc:
+    print('author_graph patch skipped:', exc)
+
 def load_csv_data(file_path: str) -> pd.DataFrame:
     """Загрузка CSV с обработкой ошибок"""
     try:
@@ -10881,6 +10444,8 @@ async def build_graph(data: dict):
 
 @app.post("/analyze")
 async def analyze_graph(query: GraphQuery):
+    from mlops.dashboard_qa import handle_analyze_graph
+    return await handle_analyze_graph(query.question, query.graph_data)
     """AI анализ графа"""
     print(f"=== ANALYZE REQUEST ===")
     print(f"Question: {query.question[:100]}...")
@@ -11283,6 +10848,19 @@ from mosinform_api import router as mosinform_router
 app.include_router(mosinform_router)
 from mlops_api import router as mlops_router
 app.include_router(mlops_router)
+from information_summary import router as information_summary_router
+app.include_router(information_summary_router)
+
+@app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
+async def graph_cluster_summary(request: Request):
+    from mlops.author_graph import handle_cluster_summary
+    return await handle_cluster_summary(request)
+
+@app.get("/graph-analysis/cluster-summary/status", tags=['data analytics'])
+async def graph_cluster_summary_status(request: Request):
+    from mlops.author_graph import handle_cluster_summary_status
+    return await handle_cluster_summary_status(request)
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
