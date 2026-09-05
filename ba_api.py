@@ -161,6 +161,20 @@ def ensure_theme_folders(user_id: str):
     if changed:
         REDIS.hset(str(user_id), "json_files_directory", json.dumps(folders, ensure_ascii=False))
 
+def _range_includes_today(date_to: str) -> bool:
+    """True, если период выгрузки покрывает текущий день (или дата не указана)."""
+    if not date_to or not str(date_to).strip():
+        return True
+    try:
+        to = int(float(str(date_to)))
+    except Exception:
+        return True
+    import time as _t
+    now = _t.localtime()
+    today_start = int(_t.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1)))
+    return to >= today_start
+
+
 class ImportBody(BaseModel):
     theme_id: str
     user_id: str = Field(default=os.environ.get("BA_USER_ID", "1"))
@@ -228,10 +242,10 @@ def _run_import(job_id: str, body: ImportBody):
 async def import_data(body: ImportBody):
     if body.theme_id not in THEMES:
         raise HTTPException(400, "Неизвестная тема: %s (допустимые: %s)" % (body.theme_id, ", ".join(THEMES)))
-    if not body.force:
+    if not body.force and not _range_includes_today(body.date_to):
         for rec in load_registry():
             if rec.get("theme_id") == body.theme_id and rec.get("user_id") == str(body.user_id) and rec.get("date_from", "") == body.date_from and rec.get("date_to", "") == body.date_to:
-                raise HTTPException(409, "Такая выгрузка уже есть (файл %s). Повторите с force=true" % rec.get("file"))
+                raise HTTPException(409, "Данные за этот период уже выгружены (файл %s). Для уже завершившихся дней повторная загрузка не выполняется; если период включает текущий день, запустите ещё раз — свежие сообщения добавятся." % rec.get("file"))
     job_id = uuid.uuid4().hex[:12]
     _jid(job_id, status="queued", message="поставлено в очередь", progress="0")
     threading.Thread(target=_run_import, args=(job_id, body), daemon=True).start()
