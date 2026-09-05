@@ -10964,5 +10964,28 @@ async def my_access(user: User = Depends(current_user)):
     return {"shares": items}
 
 
+
+@app.get("/my-datasets")
+async def my_datasets(user: User = Depends(current_user)):
+    """Свои папки + папки, расшаренные мне (read/write)."""
+    def folders_of(uid):
+        raw = _redis_s.hget(str(uid), "json_files_directory")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    own = [{"name": k, "files": v or []} for k, v in folders_of(user.id).items()]
+    shares = [it for it in _load_shares() if it["user_id"] == user.id]
+    shared = []
+    for it in shares:
+        fo = folders_of(it["owner_user_id"])
+        files = fo.get(it["folder"], [])
+        shared.append({"owner_user_id": it["owner_user_id"], "folder": it["folder"],
+                       "access": it.get("access", "read"), "files": files or []})
+    return {"own": own, "shared": shared}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
