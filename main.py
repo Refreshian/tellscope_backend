@@ -845,12 +845,55 @@ def elastic_query(
     return list(all_results.values())
 
 
+
+def _allowed_dataset_stems(user_id):
+    import redis as _rds
+    _r = _rds.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    stems = set()
+    raw = _r.hget(str(user_id), 'json_files_directory')
+    if raw:
+        try:
+            for files in json.loads(raw).values():
+                for fn in files or []:
+                    stems.add(str(fn).lower().rsplit('.', 1)[0])
+        except Exception:
+            pass
+    try:
+        for it in _load_shares():
+            if str(it.get('user_id')) == str(user_id):
+                raw2 = _r.hget(str(it.get('owner_user_id')), 'json_files_directory')
+                if raw2:
+                    try:
+                        for fn in json.loads(raw2).get(it.get('folder'), []) or []:
+                            stems.add(str(fn).lower().rsplit('.', 1)[0])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return stems
+
+
+def _guard_index_access(user, index):
+    if not index:
+        return
+    if getattr(user, 'is_superuser', False):
+        return
+    _idx = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+    name = str(_idx.get(int(index), '') or '').lower().rsplit('.', 1)[0]
+    if not name:
+        raise HTTPException(status_code=404, detail='Индекс не найден')
+    if name not in _allowed_dataset_stems(getattr(user, 'id', None)):
+        raise HTTPException(status_code=403, detail='Нет доступа к этому набору данных')
+
+
 @app.get("/tonality_landscape", tags=['data analytics'])
 async def tonality_landscape(
+    user: User = Depends(current_user),
     index: int = None,
     min_date: Optional[int] = None,
     max_date: Optional[int] = None
 ) -> Model_TonalityLandscape:
+    _guard_index_access(user, index)
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
     data = elastic_query(theme_index=indexes[index], min_date=min_date, max_date=max_date, query_str='all')
@@ -1091,11 +1134,13 @@ async def tonality_landscape(
 
 
 @app.get('/information_graph', tags=['data analytics'])
-async def information_graph(# user: User = Depends(current_user),
+async def information_graph(
+                          user: User = Depends(current_user),
                           index: int=None,
                           min_date: int=None, max_date: int=None, query_str: Optional[str] = 'карта',
                           post: Optional[bool] = None, repost: Optional[bool] = None,
                           SMI: Optional[bool] = None) -> ModelInfGraph:
+    _guard_index_access(user, index)
     # Путь к файлу с темами
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     # Загрузка словаря с темами
@@ -1454,11 +1499,13 @@ async def information_graph(# user: User = Depends(current_user),
 
 @app.get("/voice", tags=['data analytics'])
 async def voice_analize(
+    user: User = Depends(current_user),
     index: int = None,
     min_date: int = None,
     max_date: int = None,
     query_str: str = None
 ) -> ModelVoice:
+    _guard_index_access(user, index)
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
     raw = (query_str or "").strip()
@@ -1575,7 +1622,8 @@ async def voice_analize(
 
 
 @app.get("/media-rating", tags=["data analytics"])
-def media_rating(index: int = None, min_date: int = None, max_date: int = None) -> MediaRatingModel:
+def media_rating(index: int = None, min_date: int = None, max_date: int = None, user: User = Depends(current_user)) -> MediaRatingModel:
+    _guard_index_access(user, index)
     # 1. Загружаем словарь с темами
     file_path = "/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl"
     indexes = load_dict_from_pickle(file_path)
@@ -1821,6 +1869,7 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None) 
 
 @app.get('/ai-analytics', tags=['ai analytics'])
 async def ai_analytics_get(
+    user: User = Depends(current_user),
     index: int = None,
     min_date: int = None,
     max_date: int = None,
