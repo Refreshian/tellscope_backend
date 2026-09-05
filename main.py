@@ -11025,5 +11025,49 @@ async def my_datasets(user: User = Depends(current_user)):
     return {"own": own, "shared": shared}
 
 
+class AdminUserPatch(BaseModel):
+    is_active: Optional[bool] = None
+    is_superuser: Optional[bool] = None
+    role_id: Optional[int] = None
+    password: Optional[str] = None
+
+
+@app.get("/me")
+async def whoami(user: User = Depends(current_user)):
+    return {"id": user.id, "email": user.email, "username": user.username,
+            "role_id": user.role_id, "is_active": bool(user.is_active),
+            "is_superuser": bool(user.is_superuser), "is_verified": bool(user.is_verified)}
+
+
+@app.patch("/admin/users/{user_id}")
+async def admin_patch_user(user_id: int, body: AdminUserPatch, admin: User = Depends(current_superuser)):
+    from auth.manager import UserManager
+    from auth.database import SQLAlchemyUserDatabase
+    async with async_session_maker() as session:
+        user = await session.get(AuthUser, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        if admin.id == user_id:
+            if body.is_active is False:
+                raise HTTPException(status_code=400, detail="Нельзя деактивировать собственную учётную запись")
+        if body.is_active is not None:
+            user.is_active = bool(body.is_active)
+        if body.is_superuser is not None and user_id != admin.id:
+            user.is_superuser = bool(body.is_superuser)
+        if body.role_id is not None:
+            user.role_id = body.role_id
+        if body.password:
+            if len(body.password) < 6:
+                raise HTTPException(status_code=400, detail="Пароль слишком короткий (минимум 6 символов)")
+            udb = SQLAlchemyUserDatabase(session, AuthUser)
+            mgr = UserManager(udb)
+            user.hashed_password = mgr.password_helper.hash(body.password)
+        await session.commit()
+        await session.refresh(user)
+        return {"id": user.id, "email": user.email, "username": user.username,
+                "role_id": user.role_id, "is_active": bool(user.is_active),
+                "is_superuser": bool(user.is_superuser)}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
