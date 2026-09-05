@@ -10848,6 +10848,8 @@ from mosinform_api import router as mosinform_router
 app.include_router(mosinform_router)
 from mlops_api import router as mlops_router
 app.include_router(mlops_router)
+from ba_api import router as ba_router
+app.include_router(ba_router)
 from information_summary import router as information_summary_router
 app.include_router(information_summary_router)
 
@@ -10860,6 +10862,105 @@ async def graph_cluster_summary(request: Request):
 async def graph_cluster_summary_status(request: Request):
     from mlops.author_graph import handle_cluster_summary_status
     return await handle_cluster_summary_status(request)
+
+
+# ================= Admin & Access (P1 multiuser) =================
+import redis as _redis_sync
+_redis_s = _redis_sync.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+_SHARES_FILE = '/home/dev/tellscope_app/tellscope_backend/data/shares.json'
+
+def _load_shares():
+    import os
+    if os.path.exists(_SHARES_FILE):
+        try:
+            with open(_SHARES_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def _save_shares(items):
+    import os
+    os.makedirs(os.path.dirname(_SHARES_FILE), exist_ok=True)
+    with open(_SHARES_FILE, 'w', encoding='utf-8') as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+
+class AdminShareBody(BaseModel):
+    owner_user_id: int
+    folder: str
+    user_id: int
+    access: str = "read"
+
+current_superuser = fastapi_users.current_user(active=True, superuser=True)
+
+@app.get("/admin/users")
+async def admin_users(admin: User = Depends(current_superuser)):
+    async with async_session_maker() as session:
+        res = await session.execute(select(User).order_by(User.id))
+        users = res.scalars().all()
+    return [{
+        "id": u.id, "email": u.email, "username": u.username,
+        "role_id": u.role_id, "is_superuser": bool(u.is_superuser),
+        "is_active": bool(u.is_active), "is_verified": bool(u.is_verified),
+    } for u in users]
+
+@app.post("/admin/users")
+async def admin_create_user(body: UserCreate, admin: User = Depends(current_superuser)):
+    from auth.manager import UserManager
+    from auth.database import SQLAlchemyUserDatabase
+    async with async_session_maker() as session:
+        udb = SQLAlchemyUserDatabase(session, User)
+        mgr = UserManager(udb)
+        try:
+            user = await mgr.create(body, safe=False, request=None)
+        except Exception as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        return {"id": user.id, "email": user.email, "username": user.username,
+                "is_superuser": bool(user.is_superuser), "role_id": body.role_id}
+
+@app.get("/admin/folders/{owner_id}")
+async def admin_owner_folders(owner_id: int, admin: User = Depends(current_superuser)):
+    raw = _redis_s.hget(str(owner_id), "json_files_directory")
+    if not raw:
+        return {"owner_id": owner_id, "folders": []}
+    try:
+        folders = json.loads(raw)
+    except Exception:
+        folders = {}
+    return {"owner_id": owner_id, "folders": [{"name": k, "files": len(v or [])} for k, v in folders.items()]}
+
+@app.post("/admin/shares")
+async def admin_add_share(body: AdminShareBody, admin: User = Depends(current_superuser)):
+    if body.access not in ("read", "write"):
+        raise HTTPException(400, "access должен быть read или write")
+    items = _load_shares()
+    for it in items:
+        if it["owner_user_id"] == body.owner_user_id and it["folder"] == body.folder and it["user_id"] == body.user_id:
+            it["access"] = body.access
+            it["updated"] = datetime.now().isoformat()
+            _save_shares(items)
+            return {"status": "updated", **body.__dict__}
+    items.append({"owner_user_id": body.owner_user_id, "folder": body.folder, "user_id": body.user_id,
+                  "access": body.access, "created": datetime.now().isoformat()})
+    _save_shares(items)
+    return {"status": "ok", **body.__dict__}
+
+@app.delete("/admin/shares")
+async def admin_remove_share(body: AdminShareBody, admin: User = Depends(current_superuser)):
+    items = _load_shares()
+    n = len(items)
+    items = [it for it in items if not (it["owner_user_id"] == body.owner_user_id and it["folder"] == body.folder and it["user_id"] == body.user_id)]
+    _save_shares(items)
+    return {"removed": n - len(items)}
+
+@app.get("/admin/shares")
+async def admin_list_shares(admin: User = Depends(current_superuser)):
+    return {"shares": _load_shares()}
+
+@app.get("/access")
+async def my_access(user: User = Depends(current_user)):
+    items = [it for it in _load_shares() if it["user_id"] == user.id]
+    return {"shares": items}
 
 
 if __name__ == "__main__":
