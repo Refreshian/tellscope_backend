@@ -10864,6 +10864,7 @@ async def graph_cluster_summary_status(request: Request):
     return await handle_cluster_summary_status(request)
 
 
+from auth.database import User as AuthUser
 # ================= Admin & Access (P1 multiuser) =================
 import redis as _redis_sync
 _redis_s = _redis_sync.Redis(host='localhost', port=6379, db=0, decode_responses=True)
@@ -10896,7 +10897,7 @@ current_superuser = fastapi_users.current_user(active=True, superuser=True)
 @app.get("/admin/users")
 async def admin_users(admin: User = Depends(current_superuser)):
     async with async_session_maker() as session:
-        res = await session.execute(select(User).order_by(User.id))
+        res = await session.execute(select(AuthUser).order_by(AuthUser.id))
         users = res.scalars().all()
     return [{
         "id": u.id, "email": u.email, "username": u.username,
@@ -10909,7 +10910,7 @@ async def admin_create_user(body: UserCreate, admin: User = Depends(current_supe
     from auth.manager import UserManager
     from auth.database import SQLAlchemyUserDatabase
     async with async_session_maker() as session:
-        udb = SQLAlchemyUserDatabase(session, User)
+        udb = SQLAlchemyUserDatabase(session, AuthUser)
         mgr = UserManager(udb)
         try:
             user = await mgr.create(body, safe=False, request=None)
