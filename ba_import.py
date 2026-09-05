@@ -42,12 +42,12 @@ def creds() -> dict:
                 out[k.strip()] = v.strip()
     return out
 
-def run_ba_export(theme_id: str, out_dir: Path, tsf: str, tst: str) -> Path:
+def run_ba_export(theme_id: str, out_dir: Path, tsf: str, tst: str, login=None, passw=None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     c = creds()
-    env["BA_LOGIN"] = c["BA_LOGIN"]
-    env["BA_PASS"] = c["BA_PASS"]
+    env["BA_LOGIN"] = login or c["BA_LOGIN"]
+    env["BA_PASS"] = passw or c["BA_PASS"]
     env["NODE_PATH"] = env.get("NODE_PATH", "/tmp/tshot/node_modules")
     script = BE / "ba_worker" / "export_cli.js"
     cmd = ["node", str(script), theme_id, str(out_dir), tsf, tst]
@@ -154,6 +154,30 @@ def cmd_export(args) -> int:
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
 
+
+def cmd_index(args) -> int:
+    user_id = str(args.user)
+    folder = args.folder
+    filename = args.file
+    folder_dir = DATA / user_id / "json_files_directory" / folder
+    if not (folder_dir / filename).exists():
+        print(json.dumps({"status": "error", "error": "file not found: %s" % (folder_dir / filename)}, ensure_ascii=False))
+        return 1
+    indexes = load_indexes()
+    nk = None
+    base = filename.replace(".json", "").lower()
+    for k, v in indexes.items():
+        if v == base:
+            nk = k
+            break
+    try:
+        res = index_file(user_id, folder, filename, folder_dir, nk)
+        print(json.dumps({"status": "ok", "index_name": base, "index_key": nk, "result": res.get("result")}, ensure_ascii=False))
+        return 0
+    except Exception as e:
+        print(json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False))
+        return 1
+
 def main() -> int:
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -164,9 +188,15 @@ def main() -> int:
     ex.add_argument("--tsf", default="")
     ex.add_argument("--tst", default="")
     ex.add_argument("--no-index", action="store_true")
+    ix = sub.add_parser("index")
+    ix.add_argument("--user", default=os.environ.get("BA_USER_ID", "1"))
+    ix.add_argument("--folder", required=True)
+    ix.add_argument("--file", required=True)
     args = p.parse_args()
     if args.cmd == "export":
         return cmd_export(args)
+    if args.cmd == "index":
+        return cmd_index(args)
     return 1
 
 if __name__ == "__main__":
