@@ -53,11 +53,41 @@ def save_accounts(accounts: dict):
     try: os.chmod(ACCOUNTS_FILE, 0o600)
     except Exception: pass
 
+def _fernet():
+    from cryptography.fernet import Fernet
+    key_file = ACCOUNTS_FILE.parent / ".ba_creds_key"
+    if key_file.exists():
+        key = key_file.read_bytes()
+    else:
+        key = Fernet.generate_key()
+        key_file.write_bytes(key)
+        try: os.chmod(key_file, 0o600)
+        except Exception: pass
+    return Fernet(key)
+
+
+def _enc_secret(v) -> str:
+    if not v:
+        return v if v is not None else ""
+    return "enc:" + _fernet().encrypt(str(v).encode("utf-8")).decode("ascii")
+
+
+def _dec_secret(v) -> str:
+    if not v:
+        return ""
+    if isinstance(v, str) and v.startswith("enc:"):
+        try:
+            return _fernet().decrypt(v[4:].encode("ascii")).decode("utf-8")
+        except Exception:
+            return ""
+    return str(v)
+
+
 def account_creds(user_id: str) -> dict:
     acc = load_accounts().get(str(user_id), {})
     c = creds()
-    return {"BA_LOGIN": acc.get("login") or c["BA_LOGIN"],
-            "BA_PASS": acc.get("password") or c["BA_PASS"]}
+    return {"BA_LOGIN": _dec_secret(acc.get("login")) or c["BA_LOGIN"],
+            "BA_PASS": _dec_secret(acc.get("password")) or c["BA_PASS"]}
 
 def ensure_theme_folders(user_id: str):
     """Создаёт в папках пользователя папки по темам BA, если их ещё нет."""
@@ -158,7 +188,7 @@ async def save_account(body: AccountBody):
     accounts = load_accounts()
     if not body.login.strip():
         raise HTTPException(400, "Введите логин Brand Analytics")
-    accounts[str(body.user_id)] = {"login": body.login.strip(), "password": body.password}
+    accounts[str(body.user_id)] = {"login": _enc_secret(body.login.strip()), "password": _enc_secret(body.password)}
     save_accounts(accounts)
     if body.create_folders:
         ensure_theme_folders(str(body.user_id))
@@ -189,7 +219,7 @@ def themes(user_id: str = "1"):
             last[r["theme_id"]] = r
     acc = load_accounts().get(str(user_id))
     items = [{"theme_id": k, "title": v, "last_import": last.get(k)} for k, v in THEMES.items()]
-    return {"themes": items, "account_configured": bool(acc and acc.get("login"))}
+    return {"themes": items, "account_configured": bool(acc and _dec_secret(acc.get("login")))}
 
 @router.get("/registry")
 def registry():
