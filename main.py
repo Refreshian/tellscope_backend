@@ -6295,7 +6295,9 @@ async def history_search(user_id: int):
 
 # Добавление папки
 @app.get("/add-folder/{user_id}/{folder_name}", tags=['data & folders'])
-async def add_folder(user_id: str, folder_name: str):
+async def add_folder(user_id: str, folder_name: str, me: User = Depends(current_user)):
+    if str(me.id) != str(user_id) and not me.is_superuser:
+        raise HTTPException(status_code=403, detail="Создавать папки можно только в своих данных")
     print(f'user_id: {user_id}, folder_name: {folder_name}')
     
     json_files_directory = f"/home/dev/tellscope_app/tellscope_backend/data/{user_id}/json_files_directory"
@@ -6885,15 +6887,34 @@ def get_elasticsearch():
 
 @app.get("/user-folders/{user_id}", tags=['data & folders'])
 async def get_user_folders(
-    user_id: str, 
-    es: Elasticsearch = Depends(get_elasticsearch)
+    user_id: str,
+    es: Elasticsearch = Depends(get_elasticsearch),
+    me: User = Depends(current_user),
 ):
     import os
     from pathlib import Path
-    
+
     user = get_user_profile(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Доступ к чужим папкам: только суперпользователю или через реестр shares
+    if str(me.id) != str(user_id) and not me.is_superuser:
+        _shared_folders = [it["folder"] for it in _load_shares()
+                           if int(it["owner_user_id"]) == int(user_id) and int(it["user_id"]) == int(me.id)]
+        if not _shared_folders:
+            raise HTTPException(status_code=403, detail="Нет доступа к данным этого пользователя")
+        raw = await redis_db.hget(str(user_id), "json_files_directory")
+        jd = {}
+        if raw:
+            try:
+                jd = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+            except Exception:
+                jd = {}
+        want = set(_shared_folders)
+        return {"user_id": user_id, "shared_only": True,
+                "json_files_directory": {k: v for k, v in jd.items() if k in want},
+                "bertopic_files_directory": {}, "csv_files_directory": {}}
     
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
