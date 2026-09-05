@@ -41,18 +41,73 @@ def append_registry(rec):
     with REGISTRY.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+_ACCOUNTS_LOCK = None
+
+def _accounts_lock():
+    global _ACCOUNTS_LOCK
+    import threading
+    if _ACCOUNTS_LOCK is None:
+        _ACCOUNTS_LOCK = threading.Lock()
+    return _ACCOUNTS_LOCK
+
+def _accounts_db():
+    import psycopg2
+    from config import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT or 5432, dbname=DB_NAME, user=DB_USER, password=DB_PASS, connect_timeout=5)
+
+def _accounts_init(cur):
+    cur.execute("CREATE TABLE IF NOT EXISTS tellscope_ba_accounts (user_id INTEGER PRIMARY KEY, login TEXT NOT NULL DEFAULT '', password TEXT NOT NULL DEFAULT '', updated TEXT)")
+
 def load_accounts() -> dict:
-    if ACCOUNTS_FILE.exists():
-        try: return json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
-        except Exception: return {}
-    return {}
+    with _accounts_lock():
+        try:
+            conn = _accounts_db()
+            cur = conn.cursor()
+            _accounts_init(cur)
+            conn.commit()
+            cur.execute("SELECT user_id, login, password, COALESCE(updated, '') FROM tellscope_ba_accounts ORDER BY user_id")
+            rows = {str(r[0]): {'login': r[1], 'password': r[2], 'updated': r[3]} for r in cur.fetchall()}
+            cur.close()
+            conn.close()
+            if not rows and ACCOUNTS_FILE.exists():
+                try:
+                    frows = json.loads(ACCOUNTS_FILE.read_text(encoding='utf-8'))
+                    if frows:
+                        save_accounts(frows)
+                        return frows
+                except Exception:
+                    pass
+            return rows
+        except Exception as e:
+            print('ba accounts: PG load unavailable, fallback file:', e)
+            if ACCOUNTS_FILE.exists():
+                try:
+                    return json.loads(ACCOUNTS_FILE.read_text(encoding='utf-8'))
+                except Exception:
+                    return {}
+            return {}
 
 def save_accounts(accounts: dict):
-    ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ACCOUNTS_FILE.write_text(json.dumps(accounts, ensure_ascii=False), encoding="utf-8")
-    try: os.chmod(ACCOUNTS_FILE, 0o600)
-    except Exception: pass
-
+    with _accounts_lock():
+        ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_FILE.write_text(json.dumps(accounts, ensure_ascii=False), encoding='utf-8')
+        try:
+            os.chmod(ACCOUNTS_FILE, 0o600)
+        except Exception:
+            pass
+        try:
+            conn = _accounts_db()
+            cur = conn.cursor()
+            _accounts_init(cur)
+            conn.commit()
+            cur.execute('DELETE FROM tellscope_ba_accounts')
+            for uid, acc in accounts.items():
+                cur.execute('INSERT INTO tellscope_ba_accounts (user_id, login, password, updated) VALUES (%s, %s, %s, %s)', (int(uid), acc.get('login') or '', acc.get('password') or '', acc.get('updated') or ''))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print('ba accounts: PG save unavailable, file only:', e)
 def _fernet():
     from cryptography.fernet import Fernet
     key_file = ACCOUNTS_FILE.parent / ".ba_creds_key"
