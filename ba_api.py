@@ -18,7 +18,7 @@ REGISTRY = ARCHIVE_DIR / "imports.jsonl"
 ACCOUNTS_FILE = DATA / "ba_accounts.json"
 VENV_PY = BE / "venv_py312_clean" / "bin" / "python3"
 
-def _jid(job_id, **fields):
+def _jid(jid, **fields):
     REDIS.hset(f"ba:job:{jid}", mapping={k: str(v) for k, v in fields.items()})
 
 def _jget(jid):
