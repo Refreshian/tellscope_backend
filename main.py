@@ -10881,23 +10881,66 @@ from auth.database import User as AuthUser
 import redis as _redis_sync
 _redis_s = _redis_sync.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 _SHARES_FILE = '/home/dev/tellscope_app/tellscope_backend/data/shares.json'
+_SHARES_LOCK = None
+
+def _shares_lock():
+    global _SHARES_LOCK
+    import threading
+    if _SHARES_LOCK is None:
+        _SHARES_LOCK = threading.Lock()
+    return _SHARES_LOCK
+
+def _shares_db():
+    import psycopg2
+    from config import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT or 5432, dbname=DB_NAME, user=DB_USER, password=DB_PASS, connect_timeout=5)
+
+def _shares_init(cur):
+    cur.execute("CREATE TABLE IF NOT EXISTS tellscope_shares (id BIGSERIAL PRIMARY KEY, owner_user_id INTEGER NOT NULL, folder TEXT NOT NULL, user_id INTEGER NOT NULL, access TEXT NOT NULL DEFAULT 'read', created TEXT, updated TEXT)")
+    cur.execute('CREATE INDEX IF NOT EXISTS ix_shares_user ON tellscope_shares(user_id)')
 
 def _load_shares():
     import os
-    if os.path.exists(_SHARES_FILE):
+    with _shares_lock():
         try:
-            with open(_SHARES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
+            conn = _shares_db()
+            cur = conn.cursor()
+            _shares_init(cur)
+            conn.commit()
+            cur.execute("SELECT owner_user_id, folder, user_id, access, COALESCE(created, ''), COALESCE(updated, '') FROM tellscope_shares ORDER BY id")
+            rows = [{'owner_user_id': r[0], 'folder': r[1], 'user_id': r[2], 'access': r[3], 'created': r[4], 'updated': r[5]} for r in cur.fetchall()]
+            cur.close()
+            conn.close()
+            return rows
+        except Exception as e:
+            print('shares: PG load unavailable, fallback file:', e)
+        if os.path.exists(_SHARES_FILE):
+            try:
+                with open(_SHARES_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
 
 def _save_shares(items):
     import os
-    os.makedirs(os.path.dirname(_SHARES_FILE), exist_ok=True)
-    with open(_SHARES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
-
+    with _shares_lock():
+        os.makedirs(os.path.dirname(_SHARES_FILE), exist_ok=True)
+        try:
+            conn = _shares_db()
+            cur = conn.cursor()
+            _shares_init(cur)
+            conn.commit()
+            cur.execute('DELETE FROM tellscope_shares')
+            for it in items:
+                cur.execute('INSERT INTO tellscope_shares (owner_user_id, folder, user_id, access, created, updated) VALUES (%s, %s, %s, %s, %s, %s)', (int(it['owner_user_id']), it['folder'], int(it['user_id']), it.get('access', 'read'), it.get('created') or '', it.get('updated') or ''))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            print('shares: PG save unavailable, keep file only:', e)
+        with open(_SHARES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
 class AdminShareBody(BaseModel):
     owner_user_id: int
     folder: str
