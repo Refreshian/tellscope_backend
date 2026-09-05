@@ -7044,7 +7044,7 @@ async def get_user_folders(
                         file_info["index_number"] = index_number
 
                     try:
-                        _fpath = os.path.join('/home/dev/tellscope_app/tellscope_backend/data', str(user_id), 'json_files_directory', folder_name, file_name_stripped + '.json')
+                        _fpath = os.path.join('/home/dev/tellscope_app/tellscope_backend/data', str(user_id), 'json_files_directory', folder_name, file_name if str(file_name).lower().endswith('.json') else str(file_name) + '.json')
                         if os.path.exists(_fpath):
                             file_info['created'] = os.path.getmtime(_fpath)
                     except Exception:
