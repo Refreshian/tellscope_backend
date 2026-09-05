@@ -39,10 +39,14 @@ celery -A celery_app worker --loglevel=info --pool=solo --concurrency=1
 
 ## Скриншоты и демо
 
-Анимированное демо разделов (Тональный ландшафт, Информационный граф, Голос клиента):
+Анимированное демо: тональный ландшафт (удаление и возврат источника кликом), график «Тональность авторов», вкладки связей авторов и ИИ-анализа:
 
 ![Демо разделов](docs/screenshots/demo.gif)
 
 | Тональный ландшафт | Информационный граф | Голос клиента |
 |---|---|---|
 | ![Тональный ландшафт](docs/screenshots/tonality.png) | ![Информационный граф](docs/screenshots/information.png) | ![Голос клиента](docs/screenshots/voice.png) |
+
+| Связи авторов | ИИ-анализ |
+|---|---|
+| ![Связи авторов](docs/screenshots/graph_analysis.png) | ![ИИ-анализ](docs/screenshots/ai_analytics.png) |
