@@ -11202,6 +11202,31 @@ async def admin_patch_user(user_id: int, body: AdminUserPatch, admin: User = Dep
                 "role_id": user.role_id, "is_active": bool(user.is_active),
                 "is_superuser": bool(user.is_superuser)}
 
+@app.delete("/admin/users/{user_id}")
+async def admin_delete_user(user_id: int, admin: User = Depends(current_superuser)):
+    if admin.id == user_id:
+        raise HTTPException(status_code=400, detail="Нельзя удалить собственную учётную запись")
+    async with async_session_maker() as session:
+        user = await session.get(AuthUser, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        await session.delete(user)
+        await session.commit()
+    items = [it for it in _load_shares()
+             if int(it["owner_user_id"]) != user_id and int(it["user_id"]) != user_id]
+    _save_shares(items)
+    try:
+        import shutil
+        import redis as _rds
+        r = _rds.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        r.delete(str(user_id))
+        base = "/home/dev/tellscope_app/tellscope_backend/data/" + str(user_id)
+        if os.path.isdir(base):
+            shutil.rmtree(base, ignore_errors=True)
+    except Exception as e:
+        print("cleanup user data error:", e)
+    return {"removed": user_id, "email": str(user_id)}
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
