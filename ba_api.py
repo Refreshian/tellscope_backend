@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 import redis
-from ba_import import BE, DATA, THEMES, creds, slug, run_ba_export, register_dataset, load_indexes
+from ba_import import BE, DATA, THEMES, creds, slug, run_ba_export, register_dataset, load_indexes, fetch_ba_themes
 
 router = APIRouter(prefix="/ba", tags=["brand analytics"])
 REDIS = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
@@ -276,7 +276,7 @@ def job_status(job_id: str):
     return out
 
 @router.get("/themes")
-def themes(user_id: str = "1"):
+def themes(user_id: str = "1", refresh: int = 0):
     regs = load_registry()
     last = {}
     for r in regs:
@@ -286,8 +286,18 @@ def themes(user_id: str = "1"):
         if not cur or r.get("created", "") > cur.get("created", ""):
             last[r["theme_id"]] = r
     acc = load_accounts().get(str(user_id))
+    refresh_error = None
+    if refresh and (acc or creds().get("BA_LOGIN")):
+        cc = account_creds(str(user_id))
+        try:
+            fetch_ba_themes(login=cc["BA_LOGIN"], passw=cc["BA_PASS"])
+        except Exception as exc:
+            refresh_error = str(exc)[:300]
     items = [{"theme_id": k, "title": v, "last_import": last.get(k)} for k, v in THEMES.items()]
-    return {"themes": items, "account_configured": bool(acc and _dec_secret(acc.get("login")))}
+    out = {"themes": items, "account_configured": bool(acc and _dec_secret(acc.get("login")))}
+    if refresh_error:
+        out["refresh_error"] = refresh_error
+    return out
 
 @router.get("/registry")
 def registry():

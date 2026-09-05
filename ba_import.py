@@ -67,6 +67,52 @@ def run_ba_export(theme_id: str, out_dir: Path, tsf: str, tst: str, login=None, 
 def slug(text: str) -> str:
     return re.sub(r"[^A-Za-zА-Яа-я0-9]+", "_", text).strip("_")[:60]
 
+
+THEMES_SNAPSHOT = DATA / "ba_themes.json"
+
+
+def merge_theme_snapshot():
+    try:
+        if THEMES_SNAPSHOT.exists():
+            snap = json.loads(THEMES_SNAPSHOT.read_text(encoding="utf-8"))
+            for k, v in (snap.items() if isinstance(snap, dict) else []):
+                if str(k) and v:
+                    THEMES[str(k)] = str(v)
+    except Exception as e:
+        log.warning("merge theme snapshot failed: %s", e)
+
+
+def fetch_ba_themes(login=None, passw=None) -> dict:
+    c = creds()
+    env = dict(os.environ)
+    env["BA_LOGIN"] = login or c["BA_LOGIN"]
+    env["BA_PASS"] = passw or c["BA_PASS"]
+    env["NODE_PATH"] = env.get("NODE_PATH", "/tmp/tshot/node_modules")
+    script = BE / "ba_worker" / "themes_cli.js"
+    r = subprocess.run(["node", str(script)], env=env, capture_output=True, text=True, timeout=300)
+    tail = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        raise RuntimeError("BA themes scrape failed: " + tail[-1500:])
+    out = {}
+    started = False
+    for line in (r.stdout or "").splitlines():
+        if line.strip() == "RESULT_JSON":
+            started = True
+            continue
+        if started and line.strip():
+            try:
+                data = json.loads(line)
+                out = {str(k): str(v) for k, v in data.items() if k and v}
+            except Exception:
+                pass
+            break
+    if not out:
+        raise RuntimeError("BA themes scrape: no data: " + tail[-1000:])
+    THEMES_SNAPSHOT.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    for k, v in out.items():
+        THEMES[k] = v
+    return out
+
 def load_indexes() -> dict:
     if INDEXES_PKL.exists():
         try:
@@ -198,6 +244,8 @@ def main() -> int:
     if args.cmd == "index":
         return cmd_index(args)
     return 1
+
+merge_theme_snapshot()
 
 if __name__ == "__main__":
     sys.exit(main())
