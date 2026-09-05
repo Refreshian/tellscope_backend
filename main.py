@@ -10882,7 +10882,7 @@ app.include_router(mosinform_router)
 from mlops_api import router as mlops_router
 app.include_router(mlops_router)
 from ba_api import router as ba_router
-app.include_router(ba_router)
+app.include_router(ba_router, dependencies=[Depends(current_user)])
 from information_summary import router as information_summary_router
 app.include_router(information_summary_router)
 
