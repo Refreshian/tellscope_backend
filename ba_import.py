@@ -75,9 +75,11 @@ def merge_theme_snapshot():
     try:
         if THEMES_SNAPSHOT.exists():
             snap = json.loads(THEMES_SNAPSHOT.read_text(encoding="utf-8"))
-            for k, v in (snap.items() if isinstance(snap, dict) else []):
-                if str(k) and v:
-                    THEMES[str(k)] = str(v)
+            if isinstance(snap, dict) and snap:
+                THEMES.clear()
+                for k, v in snap.items():
+                    if str(k) and v:
+                        THEMES[str(k)] = str(v)
     except Exception as e:
         log.warning("merge theme snapshot failed: %s", e)
 
@@ -109,6 +111,7 @@ def fetch_ba_themes(login=None, passw=None) -> dict:
     if not out:
         raise RuntimeError("BA themes scrape: no data: " + tail[-1000:])
     THEMES_SNAPSHOT.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    THEMES.clear()
     for k, v in out.items():
         THEMES[k] = v
     return out
