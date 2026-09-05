@@ -855,7 +855,7 @@ def _allowed_dataset_stems(user_id):
         try:
             for files in json.loads(raw).values():
                 for fn in files or []:
-                    stems.add(str(fn).lower().rsplit('.', 1)[0])
+                    stems.add(str(fn).lower()[:-5] if str(fn).lower().endswith('.json') else str(fn).lower())
         except Exception:
             pass
     try:
@@ -865,7 +865,7 @@ def _allowed_dataset_stems(user_id):
                 if raw2:
                     try:
                         for fn in json.loads(raw2).get(it.get('folder'), []) or []:
-                            stems.add(str(fn).lower().rsplit('.', 1)[0])
+                            stems.add(str(fn).lower()[:-5] if str(fn).lower().endswith('.json') else str(fn).lower())
                     except Exception:
                         pass
     except Exception:
@@ -879,7 +879,9 @@ def _guard_index_access(user, index):
     if getattr(user, 'is_superuser', False):
         return
     _idx = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-    name = str(_idx.get(int(index), '') or '').lower().rsplit('.', 1)[0]
+    name = str(_idx.get(int(index), '') or '').lower()
+    if name.endswith('.json'):
+        name = name[:-5]
     if not name:
         raise HTTPException(status_code=404, detail='Индекс не найден')
     if name not in _allowed_dataset_stems(getattr(user, 'id', None)):
