@@ -199,7 +199,7 @@ def _run_import(job_id: str, body: ImportBody):
     folder = body.folder or safe_folder(THEMES.get(body.theme_id, "BA theme"))
     cc = account_creds(body.user_id)
     try:
-        _jid(job_id, status="running", message="экспорт из Brand Analytics", progress="10", started=datetime.now().isoformat())
+        _jid(job_id, status="running", message="Экспорт данных", progress="10", started=datetime.now().isoformat())
         run_dir = Path("/tmp") / ("ba_run_" + job_id)
         raw = run_ba_export(body.theme_id, run_dir, body.date_from, body.date_to, login=cc["BA_LOGIN"], passw=cc["BA_PASS"])
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -211,13 +211,13 @@ def _run_import(job_id: str, body: ImportBody):
             arch_file = arch / (base_arc + ".json")
         shutil.copyfile(raw, arch_file)
 
-        _jid(job_id, status="running", message="регистрация датасета", progress="40")
+        _jid(job_id, status="running", message="Сохранение данных", progress="40")
         json_filename = "BA_%s_%s.json" % (slug(THEMES.get(body.theme_id, body.theme_id)), stamp)
         indexes = load_indexes()
         nk = max(indexes.keys()) + 1 if indexes else 1
         register_dataset(body.user_id, folder, json_filename, raw, nk)
 
-        _jid(job_id, status="running", message="индексация (Elasticsearch/Qdrant)", progress="55")
+        _jid(job_id, status="running", message="Обработка данных", progress="55")
         r = _index_subprocess(body.user_id, folder, json_filename)
         tail = (r.stdout or "") + (r.stderr or "")
         if r.returncode != 0:
@@ -232,7 +232,7 @@ def _run_import(job_id: str, body: ImportBody):
         }
         append_registry(rec)
         shutil.rmtree(run_dir, ignore_errors=True)
-        _jid(job_id, status="done", message="готово", progress="100", summary=json.dumps(rec, ensure_ascii=False))
+        _jid(job_id, status="done", message="Готово", progress="100", summary=json.dumps(rec, ensure_ascii=False))
     except Exception as e:
         _jid(job_id, status="error", message=str(e)[:500], progress="0")
     finally:
@@ -247,7 +247,7 @@ async def import_data(body: ImportBody):
             if rec.get("theme_id") == body.theme_id and rec.get("user_id") == str(body.user_id) and rec.get("date_from", "") == body.date_from and rec.get("date_to", "") == body.date_to:
                 raise HTTPException(409, "Данные за этот период уже выгружены (файл %s). Для уже завершившихся дней повторная загрузка не выполняется; если период включает текущий день, запустите ещё раз — свежие сообщения добавятся." % rec.get("file"))
     job_id = uuid.uuid4().hex[:12]
-    _jid(job_id, status="queued", message="поставлено в очередь", progress="0")
+    _jid(job_id, status="queued", message="Экспорт данных", progress="0")
     threading.Thread(target=_run_import, args=(job_id, body), daemon=True).start()
     return {"job_id": job_id}
 
