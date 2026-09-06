@@ -4361,18 +4361,35 @@ async def run_llm_query(task_data: dict):
         # 11. Обучение BERTopic
         try:
             topics, probs = topic_model.fit_transform(valid_data['texts'], valid_data['embeddings'])
-        except ValueError as e:
-            if "min_df" not in str(e) and "max_df" not in str(e):
-                raise
-            logging.warning(f"BERTopic vectorizer fallback after: {e}")
-            topic_model.vectorizer_model = CountVectorizer(
-                analyzer='word',
-                token_pattern=r'(?u)\b\w+\b',
-                lowercase=True,
-                min_df=1,
-                max_df=1.0,
-            )
-            topics, probs = topic_model.fit_transform(valid_data['texts'], valid_data['embeddings'])
+        except Exception as e:
+            logging.warning(f"BERTopic fit failed ({e}); пробую запасной вариант...")
+            try:
+                n_docs2 = max(2, len(valid_data['texts']))
+                umap2 = UMAP(n_neighbors=min(15, n_docs2 - 1), n_components=2,
+                             min_dist=0.0, metric='cosine', random_state=42, n_jobs=1)
+                hdb2 = HDBSCAN(min_cluster_size=2, metric='euclidean',
+                               cluster_selection_method='leaf', prediction_data=True,
+                               core_dist_n_jobs=1)
+                tm2 = BERTopic(
+                    embedding_model=None,
+                    umap_model=umap2,
+                    hdbscan_model=hdb2,
+                    vectorizer_model=CountVectorizer(
+                        analyzer='word',
+                        token_pattern=r'(?u)\b\w+\b',
+                        lowercase=True,
+                        min_df=1,
+                        max_df=1.0,
+                        ngram_range=(1, 1),
+                    ),
+                    min_topic_size=2,
+                    calculate_probabilities=False,
+                    verbose=False,
+                )
+                topics, probs = tm2.fit_transform(valid_data['texts'], valid_data['embeddings'])
+                topic_model = tm2
+            except Exception as e2:
+                raise RuntimeError("BERTopic ne smog postroit temy: %s / fallback: %s" % (e, e2)) from e
 
         # Обновляем статус
         await redis_db.hset(f"task:{task_data['task_id']}", mapping={
@@ -4887,6 +4904,8 @@ async def create_clustering_models_async(embeddings: np.ndarray, texts: List[str
         
         topic_model = BERTopic(
             embedding_model=None,
+            umap_model=umap_model,
+            hdbscan_model=hdbscan_model,
             verbose=True,
             representation_model=representation_model,
             vectorizer_model=vectorizer_model,
