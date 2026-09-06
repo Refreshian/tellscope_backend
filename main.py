@@ -11449,9 +11449,8 @@ async def _llm_usage_ctx_middleware(request, call_next):
             auth = (request.headers.get("authorization") or "")
             if auth.lower().startswith("bearer "):
                 try:
-                    strategy = auth_backend.get_strategy()
-                    user = await strategy.read_token(auth[7:].strip())
-                    uid = user.id if user else None
+                    payload = jwt.decode(auth[7:].strip(), SECRET, algorithms=["HS256"], audience="fastapi-users:auth")
+                    uid = payload.get("sub")
                 except Exception:
                     uid = None
             from mlops import usage as _usage_api
