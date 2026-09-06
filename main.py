@@ -11071,11 +11071,20 @@ async def admin_users(admin: User = Depends(current_superuser)):
     async with async_session_maker() as session:
         res = await session.execute(select(AuthUser).order_by(AuthUser.id))
         users = res.scalars().all()
-    return [{
-        "id": u.id, "email": u.email, "username": u.username,
-        "role_id": u.role_id, "is_superuser": bool(u.is_superuser),
-        "is_active": bool(u.is_active), "is_verified": bool(u.is_verified),
-    } for u in users]
+    stats = _stats_map()
+    out = []
+    for u in users:
+        info = stats.get(int(u.id)) or {}
+        out.append({
+            "id": u.id, "email": u.email, "username": u.username,
+            "role_id": u.role_id, "is_superuser": bool(u.is_superuser),
+            "is_active": bool(u.is_active), "is_verified": bool(u.is_verified),
+            "registered_at": (u.registered_at.isoformat() if getattr(u, "registered_at", None) else ""),
+            "login_count": int(info.get("login_count") or 0),
+            "last_login": info.get("last_login") or "",
+            "total_seconds": int(info.get("total_seconds") or 0),
+        })
+    return out
 
 @app.post("/admin/users")
 async def admin_create_user(body: UserCreate, admin: User = Depends(current_superuser)):
@@ -11230,3 +11239,93 @@ async def admin_delete_user(user_id: int, admin: User = Depends(current_superuse
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+# ==== статистика выдачи и активности аккаунтов ====
+def _stats_db():
+    import psycopg2
+    from config import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
+    return psycopg2.connect(host=DB_HOST, port=DB_PORT or 5432, dbname=DB_NAME, user=DB_USER, password=DB_PASS, connect_timeout=5)
+
+def _stats_init(cur):
+    cur.execute("CREATE TABLE IF NOT EXISTS tellscope_user_stats (user_id INTEGER PRIMARY KEY, login_count INTEGER NOT NULL DEFAULT 0, last_login TEXT DEFAULT '', last_seen TEXT DEFAULT '', total_seconds BIGINT NOT NULL DEFAULT 0)")
+
+def _stats_ensure():
+    try:
+        conn = _stats_db(); cur = conn.cursor(); _stats_init(cur); conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        print("user stats ensure err:", e)
+
+def _stats_login(username_email):
+    try:
+        conn = _stats_db(); cur = conn.cursor(); _stats_init(cur)
+        cur.execute('SELECT id FROM "user" WHERE email = %s OR username = %s LIMIT 1', (username_email, username_email))
+        row = cur.fetchone()
+        if row:
+            now = datetime.utcnow().isoformat()
+            cur.execute("INSERT INTO tellscope_user_stats (user_id, login_count, last_login) VALUES (%s, 1, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET login_count = tellscope_user_stats.login_count + 1, last_login = EXCLUDED.last_login",
+                        (int(row[0]), now))
+            conn.commit()
+        cur.close(); conn.close()
+    except Exception as e:
+        print("user stats login err:", e)
+
+def _stats_beat(user_id):
+    try:
+        import time as _t
+        conn = _stats_db(); cur = conn.cursor(); _stats_init(cur)
+        now = _t.time()
+        cur.execute("SELECT last_seen, total_seconds FROM tellscope_user_stats WHERE user_id = %s", (int(user_id),))
+        row = cur.fetchone()
+        if row:
+            last = row[0]; total = int(row[1] or 0)
+            delta = 0
+            if last:
+                try:
+                    last_f = float(last)
+                    if last_f > 0 and 0 <= (now - last_f) <= 120:
+                        delta = int(now - last_f)
+                except Exception:
+                    pass
+            cur.execute("UPDATE tellscope_user_stats SET last_seen = %s, total_seconds = %s WHERE user_id = %s",
+                        (str(now), total + delta, int(user_id)))
+        else:
+            cur.execute("INSERT INTO tellscope_user_stats (user_id, last_seen) VALUES (%s, %s)", (int(user_id), str(now)))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        print("user stats beat err:", e)
+
+def _stats_map():
+    out = {}
+    try:
+        conn = _stats_db(); cur = conn.cursor(); _stats_init(cur)
+        cur.execute("SELECT user_id, login_count, last_login, total_seconds FROM tellscope_user_stats")
+        for uid, lc, ll, ts in cur.fetchall():
+            out[int(uid)] = {"login_count": int(lc or 0), "last_login": ll or "", "total_seconds": int(ts or 0)}
+        cur.close(); conn.close()
+    except Exception as e:
+        print("user stats map err:", e)
+    return out
+
+_stats_ensure()
+
+@app.get("/heartbeat")
+async def heartbeat(user=Depends(current_user)):
+    _stats_beat(user.id)
+    return {"ok": True}
+
+@app.middleware("http")
+async def _track_login_mw(request, call_next):
+    try:
+        if request.method == "POST" and request.url.path.rstrip("/").endswith("/auth/jwt/login"):
+            raw = (await request.body()).decode("utf-8", "replace")
+            response = await call_next(request)
+            if response.status_code == 200:
+                import urllib.parse as _up
+                val = (_up.parse_qs(raw).get("username") or [""])[0].strip()
+                if val:
+                    _stats_login(val)
+            return response
+    except Exception:
+        pass
+    return await call_next(request)
+
