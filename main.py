@@ -11376,3 +11376,41 @@ def _stats_days(user_id):
 @app.get("/admin/user-days/{user_id}")
 async def admin_user_days(user_id: int, admin=Depends(current_superuser)):
     return {"user_id": user_id, "days": _stats_days(user_id)}
+@app.delete("/delete-csv-file")
+async def delete_csv_file(user_id: int, file_name: str, user=Depends(current_user)):
+    import os as _os, json as _json
+    if int(user_id) != int(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нельзя удалять файлы другого пользователя")
+    raw = await redis_db.hget(str(user_id), "csv_files_directory")
+    try:
+        data = _json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    removed = 0
+    for folder_key in list(data.keys()):
+        items = data.get(folder_key) or []
+        if not isinstance(items, list):
+            continue
+        keep = []
+        for it in items:
+            fp = str(it.get("full_path") or "")
+            fname = str(it.get("file") or "")
+            if fname == file_name or fp.endswith("/" + file_name):
+                path = _os.path.normpath(fp)
+                if (path.startswith("/home/dev/tellscope_app/tellscope_backend/data/")
+                        and path.endswith(".csv") and _os.path.exists(path)):
+                    try:
+                        _os.remove(path)
+                    except Exception as ex:
+                        print("delete csv file err:", ex)
+                removed += 1
+            else:
+                keep.append(it)
+        if keep:
+            data[folder_key] = keep
+        else:
+            data.pop(folder_key, None)
+    await redis_db.hset(str(user_id), "csv_files_directory", _json.dumps(data, ensure_ascii=False))
+    return {"removed": removed}
