@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 
 from .lock import external_cfg, generate_cfg
+from mlops import usage as _usage_tracker
 
 _async_client: httpx.AsyncClient | None = None
 _async_loop_id: int | None = None
@@ -25,6 +26,7 @@ class ChatResult:
     model: str
     status_code: int = 200
     raw: dict = field(default_factory=dict)
+    finish_reason: str = ""
 
 
 class GatewayError(RuntimeError):
@@ -131,13 +133,15 @@ def _parse(resp: httpx.Response, provider: str, model_id: str) -> ChatResult:
         payload = resp.json()
     except Exception as exc:
         raise GatewayError(f"{provider} invalid JSON") from exc
-    content = (((payload.get("choices") or [{}])[0].get("message") or {}).get("content")) or ""
+    choice = (payload.get("choices") or [{}])[0] or {}
+    content = ((choice.get("message") or {}).get("content")) or ""
     return ChatResult(
         content=content,
         provider=provider,
         model=model_id,
         status_code=resp.status_code,
         raw=payload if isinstance(payload, dict) else {},
+        finish_reason=str(choice.get("finish_reason") or ""),
     )
 
 
@@ -177,6 +181,8 @@ def chat(
     timeout: float = 180,
     extra: dict | None = None,
     profile: str = "dashboard_qa",
+
+    usage_ctx: dict | None = None,
 ) -> ChatResult:
     """OpenAI-compatible chat.completions. `provider` is vllm | aitunnel."""
     started = time.perf_counter()
@@ -200,6 +206,27 @@ def chat(
             raise GatewayError(f"{provider} HTTP error") from exc
         result = _parse(resp, provider, model_id)
         ok = True
+        try:
+            raw = result.raw or {}
+            _usg = raw.get("usage") or {}
+            _pt = int(_usg.get("prompt_tokens") or 0)
+            _ct = int(_usg.get("completion_tokens") or 0)
+            _tt = int(_usg.get("total_tokens") or 0)
+            if _pt or _ct or _tt:
+                _ctx = usage_ctx or {}
+                _usage_tracker.write(
+                    user_id=_ctx.get("user_id"),
+                    case=_ctx.get("case"),
+                    provider=provider,
+                    model=result.model,
+                    status="ok",
+                    prompt_tokens=_pt,
+                    completion_tokens=_ct,
+                    total_tokens=_tt,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                )
+        except Exception:
+            pass
         return result
     finally:
         _record_call(provider, profile, ok, (time.perf_counter() - started) * 1000)
@@ -215,6 +242,8 @@ async def achat(
     timeout: float = 180,
     extra: dict | None = None,
     profile: str = "dashboard_qa",
+
+    usage_ctx: dict | None = None,
 ) -> ChatResult:
     """Async variant of chat() for FastAPI llm-run / smart-agent."""
     started = time.perf_counter()
@@ -238,6 +267,27 @@ async def achat(
             raise GatewayError(f"{provider} HTTP error") from exc
         result = _parse(resp, provider, model_id)
         ok = True
+        try:
+            raw = result.raw or {}
+            _usg = raw.get("usage") or {}
+            _pt = int(_usg.get("prompt_tokens") or 0)
+            _ct = int(_usg.get("completion_tokens") or 0)
+            _tt = int(_usg.get("total_tokens") or 0)
+            if _pt or _ct or _tt:
+                _ctx = usage_ctx or {}
+                _usage_tracker.write(
+                    user_id=_ctx.get("user_id"),
+                    case=_ctx.get("case"),
+                    provider=provider,
+                    model=result.model,
+                    status="ok",
+                    prompt_tokens=_pt,
+                    completion_tokens=_ct,
+                    total_tokens=_tt,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                )
+        except Exception:
+            pass
         return result
     finally:
         _record_call(provider, profile, ok, (time.perf_counter() - started) * 1000)
@@ -311,6 +361,7 @@ class _Completions:
             timeout=float(timeout) if timeout is not None else 180,
             extra=extra or None,
             profile=self._owner.profile,
+            usage_ctx=usage_ctx,
         )
         return _CompatResponse(
             choices=[_CompatChoice(message=_CompatMessage(content=result.content))],

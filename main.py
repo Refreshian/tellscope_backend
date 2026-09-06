@@ -11414,3 +11414,7 @@ async def delete_csv_file(user_id: int, file_name: str, user=Depends(current_use
             data.pop(folder_key, None)
     await redis_db.hset(str(user_id), "csv_files_directory", _json.dumps(data, ensure_ascii=False))
     return {"removed": removed}
+@app.get("/admin/llm-usage")
+async def admin_llm_usage(admin=Depends(current_superuser)):
+    from mlops import usage as _usage_api
+    return {"rows": _usage_api.aggregate()}
