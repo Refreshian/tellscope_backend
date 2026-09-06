@@ -151,3 +151,37 @@ def reset_ctx(token):
 
 def current():
     return _CTX.get() or {}
+def aggregate_days(user_id=None, case=None, provider=None, model=None, days=30):
+    out = []
+    try:
+        conn = _db()
+        cur = conn.cursor()
+        _ensure_tables(cur)
+        sql = ("SELECT to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, "
+               "COALESCE(user_id, 0), COALESCE(case_id, ''), COALESCE(provider, ''), COALESCE(model, ''), "
+               "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
+               "COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) "
+               "FROM llm_usage WHERE ts >= now() - (%s || ' days')::interval ")
+        conds = []
+        params = [int(days or 30)]
+        if user_id is not None:
+            conds.append("user_id = %s"); params.append(int(user_id))
+        if case:
+            conds.append("case_id = %s"); params.append(case)
+        if provider:
+            conds.append("provider = %s"); params.append(provider)
+        if model:
+            conds.append("model = %s"); params.append(model)
+        if conds:
+            sql += " AND " + " AND ".join(conds)
+        sql += " GROUP BY 1,2,3,4,5 ORDER BY 1"
+        cur.execute(sql, params)
+        for r in cur.fetchall():
+            out.append({"day": r[0], "user_id": r[1], "case_id": r[2], "provider": r[3], "model": r[4],
+                        "requests": int(r[5]), "prompt_tokens": int(r[6]), "completion_tokens": int(r[7]),
+                        "total_tokens": int(r[8]), "cost_usd": round(float(r[9]), 6)})
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        print("llm usage days err:", exc)
+    return out

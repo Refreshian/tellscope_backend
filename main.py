@@ -11459,3 +11459,10 @@ async def _llm_usage_ctx_middleware(request, call_next):
     except Exception:
         pass
     return await call_next(request)
+@app.get("/admin/llm-usage/days")
+async def admin_llm_usage_days(user_id: int | None = None, case_id: str | None = None,
+                               provider: str | None = None, model: str | None = None,
+                               days: int = 30, admin=Depends(current_superuser)):
+    from mlops import usage as _usage_api
+    return {"rows": _usage_api.aggregate_days(user_id=user_id, case=case_id, provider=provider,
+                                              model=model, days=days)}
