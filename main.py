@@ -11247,6 +11247,7 @@ def _stats_db():
 
 def _stats_init(cur):
     cur.execute("CREATE TABLE IF NOT EXISTS tellscope_user_stats (user_id INTEGER PRIMARY KEY, login_count INTEGER NOT NULL DEFAULT 0, last_login TEXT DEFAULT '', last_seen TEXT DEFAULT '', total_seconds BIGINT NOT NULL DEFAULT 0)")
+    cur.execute("CREATE TABLE IF NOT EXISTS tellscope_user_daily (user_id INTEGER NOT NULL, day TEXT NOT NULL, seconds BIGINT NOT NULL DEFAULT 0, PRIMARY KEY (user_id, day))")
 
 def _stats_ensure():
     try:
@@ -11276,9 +11277,9 @@ def _stats_beat(user_id):
         now = _t.time()
         cur.execute("SELECT last_seen, total_seconds FROM tellscope_user_stats WHERE user_id = %s", (int(user_id),))
         row = cur.fetchone()
+        delta = 0
         if row:
             last = row[0]; total = int(row[1] or 0)
-            delta = 0
             if last:
                 try:
                     last_f = float(last)
@@ -11290,6 +11291,18 @@ def _stats_beat(user_id):
                         (str(now), total + delta, int(user_id)))
         else:
             cur.execute("INSERT INTO tellscope_user_stats (user_id, last_seen) VALUES (%s, %s)", (int(user_id), str(now)))
+        day = datetime.now().strftime("%Y-%m-%d")
+        cur.execute("SELECT 1 FROM tellscope_user_daily WHERE user_id = %s LIMIT 1", (int(user_id),))
+        exists = cur.fetchone()
+        seed = 0
+        if not exists:
+            cur.execute("SELECT total_seconds FROM tellscope_user_stats WHERE user_id = %s", (int(user_id),))
+            r2 = cur.fetchone()
+            if r2 and int(r2[0] or 0) > 0:
+                seed = int(r2[0])
+        cur.execute("INSERT INTO tellscope_user_daily (user_id, day, seconds) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (user_id, day) DO UPDATE SET seconds = tellscope_user_daily.seconds + EXCLUDED.seconds",
+                    (int(user_id), day, delta + seed))
         conn.commit(); cur.close(); conn.close()
     except Exception as e:
         print("user stats beat err:", e)
@@ -11328,4 +11341,19 @@ async def _track_login_mw(request, call_next):
     except Exception:
         pass
     return await call_next(request)
+def _stats_days(user_id):
+    out = []
+    try:
+        conn = _stats_db(); cur = conn.cursor(); _stats_init(cur)
+        cur.execute("SELECT day, seconds FROM tellscope_user_daily WHERE user_id = %s ORDER BY day", (int(user_id),))
+        for day, sec in cur.fetchall():
+            out.append({"day": day, "seconds": int(sec or 0)})
+        cur.close(); conn.close()
+    except Exception as e:
+        print("user stats days err:", e)
+    return out
 
+
+@app.get("/admin/user-days/{user_id}")
+async def admin_user_days(user_id: int, admin=Depends(current_superuser)):
+    return {"user_id": user_id, "days": _stats_days(user_id)}
