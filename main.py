@@ -11421,3 +11421,41 @@ async def delete_csv_file(user_id: int, file_name: str, user=Depends(current_use
 async def admin_llm_usage(admin=Depends(current_superuser)):
     from mlops import usage as _usage_api
     return {"rows": _usage_api.aggregate()}
+# ==== учёт токенов: контекст по путям с LLM ====
+_LLM_USAGE_CASE_MAP = {
+    "/ai-question": "ai_question",
+    "/ai-question-raw": "ai_question",
+    "/ai-question-information-graph": "information-graf",
+    "/ai-question-media-rating": "media-rating",
+    "/ai-question-voice": "voice-of-customer",
+    "/ai-question-analysis": "analysis-of-themes",
+    "/ai-bot/corpus-summary": "ai-bot",
+    "/ai-bot/deep-brief": "ai-bot",
+    "/run-smart-agent": "smart-agent",
+    "/lca-examples": "lca-examples",
+    "/analyze": "graph-analysis",
+    "/graph-analysis/cluster-summary": "graph-analysis",
+    "/llm-run/": "llm_run",
+    "/llm-run-multiple/": "llm_run",
+}
+
+
+@app.middleware("http")
+async def _llm_usage_ctx_middleware(request, call_next):
+    try:
+        case = _LLM_USAGE_CASE_MAP.get(request.url.path)
+        if case:
+            uid = None
+            auth = (request.headers.get("authorization") or "")
+            if auth.lower().startswith("bearer "):
+                try:
+                    strategy = auth_backend.get_strategy()
+                    user = await strategy.read_token(auth[7:].strip())
+                    uid = user.id if user else None
+                except Exception:
+                    uid = None
+            from mlops import usage as _usage_api
+            _usage_api.set_ctx(user_id=uid, case=case)
+    except Exception:
+        pass
+    return await call_next(request)
