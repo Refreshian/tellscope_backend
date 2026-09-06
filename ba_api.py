@@ -286,6 +286,10 @@ def themes(user_id: str = "1", refresh: int = 0):
         if not cur or r.get("created", "") > cur.get("created", ""):
             last[r["theme_id"]] = r
     acc = load_accounts().get(str(user_id))
+    configured = bool(acc and _dec_secret(acc.get("login")))
+    if not configured:
+        return {"themes": [], "account_configured": False,
+                "hint": "Укажите свой аккаунт Brand Analytics, чтобы увидеть доступные темы"}
     refresh_error = None
     if refresh and (acc or creds().get("BA_LOGIN")):
         cc = account_creds(str(user_id))
