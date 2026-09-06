@@ -4208,6 +4208,9 @@ async def run_llm_query(task_data: dict):
     """Оптимизированная обработка LLM-запроса"""
     print(f'🚀 НАЧАЛО ЗАДАЧИ: {task_data}')
     logging.info(f"🚀 Запуск задачи {task_data['task_id']}")
+
+    from mlops import usage as _usage_api
+    _usage_api.set_ctx(user_id=task_data.get('user_id'), case='llm_run')
     
     # Устанавливаем начальный статус
     await redis_db.hset(f"task:{task_data['task_id']}", mapping={

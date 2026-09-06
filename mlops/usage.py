@@ -5,8 +5,11 @@
 Gateway остаётся единственной точкой входа к моделям; здесь пишем usage после ответа.
 Если позже понадобится LiteLLM - его можно вставить за тем же gateway-интерфейсом.
 """
+import contextvars
 import json
 import threading
+
+_CTX = contextvars.ContextVar('llm_usage_ctx', default=None)
 
 _PRICES_LOCK = threading.Lock()
 _PRICES: dict = {}
@@ -135,3 +138,16 @@ def aggregate():
 
 
 ensure()
+def set_ctx(user_id=None, case=None):
+    return _CTX.set({"user_id": user_id, "case": case})
+
+
+def reset_ctx(token):
+    try:
+        _CTX.reset(token)
+    except Exception:
+        pass
+
+
+def current():
+    return _CTX.get() or {}

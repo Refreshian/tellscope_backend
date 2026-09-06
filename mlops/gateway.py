@@ -213,7 +213,7 @@ def chat(
             _ct = int(_usg.get("completion_tokens") or 0)
             _tt = int(_usg.get("total_tokens") or 0)
             if _pt or _ct or _tt:
-                _ctx = usage_ctx or {}
+                _ctx = usage_ctx or _usage_tracker.current()
                 _usage_tracker.write(
                     user_id=_ctx.get("user_id"),
                     case=_ctx.get("case"),
@@ -274,7 +274,7 @@ async def achat(
             _ct = int(_usg.get("completion_tokens") or 0)
             _tt = int(_usg.get("total_tokens") or 0)
             if _pt or _ct or _tt:
-                _ctx = usage_ctx or {}
+                _ctx = usage_ctx or _usage_tracker.current()
                 _usage_tracker.write(
                     user_id=_ctx.get("user_id"),
                     case=_ctx.get("case"),
