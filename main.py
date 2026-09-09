@@ -6528,6 +6528,7 @@ async def add_file(
     user_id: str,
     folder_name: str,
     uploaded_file: UploadFile = File(..., max_size=50*1024*1024*1024),
+    build_embeddings: Optional[str] = Form(None),  # "1"/"true" - форсировать эмбеддинги; "0"/"false" - только ES; None - авто
     methods=["POST"],
     user: User = Depends(current_user),
 ):
@@ -6585,7 +6586,8 @@ async def add_file(
             "original_filename": original_filename,
             "file_extension": file_extension,
             "created_at": datetime.now().isoformat(),
-            "next_key": str(next_key)
+            "next_key": str(next_key),
+            "build_embeddings": build_embeddings or ""
         }
     )
 
@@ -6599,7 +6601,8 @@ async def add_file(
             "json_filename": json_filename,
             "file_location": file_location,
             "file_extension": file_extension,
-            "next_key": next_key
+            "next_key": next_key,
+            "build_embeddings": (build_embeddings or "")
         }
     )
 
