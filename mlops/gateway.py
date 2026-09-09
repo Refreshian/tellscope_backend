@@ -361,7 +361,7 @@ class _Completions:
             timeout=float(timeout) if timeout is not None else 180,
             extra=extra or None,
             profile=self._owner.profile,
-            usage_ctx=usage_ctx,
+            usage_ctx=__import__("mlops.usage", fromlist=["_CTX"])._CTX.get(),
         )
         return _CompatResponse(
             choices=[_CompatChoice(message=_CompatMessage(content=result.content))],

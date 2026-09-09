@@ -4648,13 +4648,13 @@ async def load_elasticsearch_data(task_data: dict, indexes: dict) -> list:
     
     def _load_data():
         data = []
+        min_data = task_data.get('min_data') or task_data.get('min_date')
+        max_data = task_data.get('max_data') or task_data.get('max_date')
         if task_data['query_str'] and task_data['query_str'] != 'all':
             search = task_data['query_str'].split(',')
             for query in search:
-                data.extend(elastic_query(theme_index=indexes[int(task_data['index'])], query_str=query))
+                data.extend(elastic_query(theme_index=indexes[int(task_data['index'])], query_str=query, min_date=min_data, max_date=max_data))
         else:
-            min_data = task_data.get('min_data') or task_data.get('min_date')
-            max_data = task_data.get('max_data') or task_data.get('max_date')
             data = elastic_query(
                 theme_index=indexes[int(task_data['index'])],
                 query_str='all',
@@ -11421,9 +11421,9 @@ async def delete_csv_file(user_id: int, file_name: str, user=Depends(current_use
     await redis_db.hset(str(user_id), "csv_files_directory", _json.dumps(data, ensure_ascii=False))
     return {"removed": removed}
 @app.get("/admin/llm-usage")
-async def admin_llm_usage(admin=Depends(current_superuser)):
+async def admin_llm_usage(date_from: str | None = None, date_to: str | None = None, admin=Depends(current_superuser)):
     from mlops import usage as _usage_api
-    return {"rows": _usage_api.aggregate()}
+    return {"rows": _usage_api.aggregate(date_from=date_from, date_to=date_to)}
 # ==== учёт токенов: контекст по путям с LLM ====
 _LLM_USAGE_CASE_MAP = {
     "/ai-question": "ai_question",
@@ -11464,7 +11464,8 @@ async def _llm_usage_ctx_middleware(request, call_next):
 @app.get("/admin/llm-usage/days")
 async def admin_llm_usage_days(user_id: int | None = None, case_id: str | None = None,
                                provider: str | None = None, model: str | None = None,
-                               days: int = 30, admin=Depends(current_superuser)):
+                               days: int = 30, date_from: str | None = None, date_to: str | None = None,
+                               admin=Depends(current_superuser)):
     from mlops import usage as _usage_api
     return {"rows": _usage_api.aggregate_days(user_id=user_id, case=case_id, provider=provider,
-                                              model=model, days=days)}
+                                              model=model, days=days, date_from=date_from, date_to=date_to)}
