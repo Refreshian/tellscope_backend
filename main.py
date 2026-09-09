@@ -4246,15 +4246,19 @@ async def run_llm_query(task_data: dict):
             min_data = task_data['min_date']
             max_data = task_data['max_date']
 
-        # 2. Параллельная загрузка данных
+                # 2. Загрузка данных: Elasticsearch + попытка Qdrant (если коллекция есть)
         logging.info("🔍 Загрузка данных из Elasticsearch и Qdrant...")
-        elasticsearch_task = asyncio.create_task(load_elasticsearch_data(task_data, indexes))
-        qdrant_task = asyncio.create_task(load_qdrant_data(indexes[int(task_data['index'])]))
-        
-        data, (embeddings, qdrant_hashes, texts_from_qdrant) = await asyncio.gather(
-            elasticsearch_task, qdrant_task
-        )
-        logging.info(f"✅ Загружено: {len(data)} документов, {len(embeddings)} эмбеддингов")
+        data = await load_elasticsearch_data(task_data, indexes)
+        qdrant_ok = False
+        embeddings_full = []
+        qdrant_hashes = []
+        try:
+            embeddings_full, qdrant_hashes, _qt = await load_qdrant_data(indexes[int(task_data['index'])])
+            if qdrant_hashes:
+                qdrant_ok = True
+        except Exception as exc:
+            logging.warning(f"⚠️ Qdrant-коллекция недоступна/пуста ({exc}); переключаюсь на эмбеддинги на лету")
+        logging.info(f"✅ Загружено из ES: {len(data)} документов; qdrant_ok={qdrant_ok} ({len(embeddings_full)} эмбеддингов)")
 
         # Обновляем статус
         await redis_db.hset(f"task:{task_data['task_id']}", mapping={
@@ -4262,14 +4266,17 @@ async def run_llm_query(task_data: dict):
             "progress": 10
         })
 
-        # 3. Быстрая фильтрация
+        # 3. Фильтрация данных
         logging.info("🔧 Фильтрация данных...")
-        qdrant_hash_set = set(qdrant_hashes)
-        filtered_data = [x for x in data if x.get('hash') in qdrant_hash_set]
-        
+        if qdrant_ok:
+            qdrant_hash_set = set(qdrant_hashes)
+            filtered_data = [x for x in data if x.get('hash') in qdrant_hash_set]
+        else:
+            filtered_data = data
+
         if not filtered_data:
             raise ValueError("Нет данных для обработки после фильтрации")
-        
+
         logging.info(f"✅ После фильтрации: {len(filtered_data)} документов")
 
         # 4. Подготовка данных
@@ -4278,7 +4285,7 @@ async def run_llm_query(task_data: dict):
         texts = [x['text'] for x in filtered_data][:maxdata]
         urls = [x.get('url', '') for x in filtered_data][:maxdata]
         total_texts = len(texts)
-        
+
         logging.info(f"✅ Подготовлено {total_texts} текстов")
 
         # Обновляем статус
@@ -4288,22 +4295,35 @@ async def run_llm_query(task_data: dict):
             "total_texts": total_texts
         })
 
-        # 5. Фильтрация эмбеддингов
-        logging.info("🧮 Фильтрация эмбеддингов...")
-        hash_to_idx = {hash_val: idx for idx, hash_val in enumerate(qdrant_hashes)}
-        filtered_embeddings = []
-        
-        for x in filtered_data[:maxdata]:
-            hash_val = x.get('hash')
-            if hash_val in hash_to_idx:
-                idx = hash_to_idx[hash_val]
-                if idx < len(embeddings):
-                    filtered_embeddings.append(embeddings[idx])
+        # 5. Эмбеддинги: из Qdrant, либо считаем на лету по уникальным текстам
+        logging.info("🧮 Подготовка эмбеддингов...")
+        if qdrant_ok:
+            hash_to_idx = {hash_val: idx for idx, hash_val in enumerate(qdrant_hashes)}
+            filtered_embeddings = []
+            for x in filtered_data[:maxdata]:
+                hash_val = x.get('hash')
+                if hash_val in hash_to_idx:
+                    idx = hash_to_idx[hash_val]
+                    if idx < len(embeddings_full):
+                        filtered_embeddings.append(embeddings_full[idx])
+            min_len = min(len(texts), len(filtered_embeddings))
+            texts, filtered_embeddings, urls = texts[:min_len], filtered_embeddings[:min_len], urls[:min_len]
+            embeddings = np.array(filtered_embeddings)
+        else:
+            # эмбеддинги на лету: только уникальные тексты, затем размножаем на дубликаты
+            if len(texts) > 200_000:
+                raise ValueError("Выборка слишком большая для расчёта эмбеддингов на лету: сузьте период или запрос")
+            dedup_map = {}
+            for _idx, _t in enumerate(texts):
+                dedup_map.setdefault(_t, []).append(_idx)
+            _uniq = list(dedup_map.keys())
+            def _encode_batch(ts):
+                return model_manager.encode_texts(ts, batch_size=64)
+            _vecs = await loop.run_in_executor(executor, _encode_batch, _uniq)
+            _emb_by_text = {_t: _vecs[_i] for _i, _t in enumerate(_uniq)}
+            filtered_embeddings = [_emb_by_text[t] for t in texts]
+            embeddings = np.array(filtered_embeddings)
 
-        min_len = min(len(texts), len(filtered_embeddings))
-        texts, filtered_embeddings, urls = texts[:min_len], filtered_embeddings[:min_len], urls[:min_len]
-        embeddings = np.array(filtered_embeddings)
-        
         logging.info(f"✅ Эмбеддинги готовы: {embeddings.shape}")
 
         # Обновляем статус

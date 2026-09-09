@@ -1135,41 +1135,51 @@ def analyze_question(
             search_results_summary.append({"database": db_name, "error": "Коллекция не найдена"})
             continue
         try:
-            info = qdrant_client.get_collection(collection_name=collection_name)
-            if getattr(info, "points_count", 0) == 0:
-                search_results_summary.append({"database": db_name, "status": "empty_collection", "error": "Коллекция не содержит векторов"})
-                continue
-            search_result = qdrant_client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=50,
-                with_payload=True,
-                score_threshold=0.3,
-                search_params=search_params,
-                with_vectors=False,
-            )
-            if len(search_result) < 5:
-                search_result = qdrant_client.search(
-                    collection_name=collection_name,
-                    query_vector=query_vector,
-                    limit=50,
-                    with_payload=True,
-                    score_threshold=0.1,
-                    search_params=search_params,
-                    with_vectors=False,
-                )
-            if not search_result:
-                search_result = qdrant_client.search(
-                    collection_name=collection_name,
-                    query_vector=query_vector,
-                    limit=10,
-                    with_payload=True,
-                    with_vectors=False,
-                )
+            search_result = []
+            semantic_ok = False
+            try:
+                info = qdrant_client.get_collection(collection_name=collection_name)
+                semantic_ok = bool(getattr(info, "points_count", 0))
+            except Exception as qexc:
+                logger.warning("Коллекция %s недоступна (%s): полнотекстовый режим", collection_name, qexc)
+            if semantic_ok:
+                try:
+                    search_result = qdrant_client.search(
+                        collection_name=collection_name,
+                        query_vector=query_vector,
+                        limit=50,
+                        with_payload=True,
+                        score_threshold=0.3,
+                        search_params=search_params,
+                        with_vectors=False,
+                    )
+                    if len(search_result) < 5:
+                        search_result = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=query_vector,
+                            limit=50,
+                            with_payload=True,
+                            score_threshold=0.1,
+                            search_params=search_params,
+                            with_vectors=False,
+                        )
+                    if not search_result:
+                        search_result = qdrant_client.search(
+                            collection_name=collection_name,
+                            query_vector=query_vector,
+                            limit=10,
+                            with_payload=True,
+                            with_vectors=False,
+                        )
+                except Exception as sexc:
+                    logger.warning("Qdrant search failed (%s): полнотекстовый режим", sexc)
+                    search_result = []
+            else:
+                logger.info("Эмбеддингов нет — AI-бот отвечает через полнотекстовый поиск по ES")
 
             vector_hashes = _vector_hashes(search_result)
             lexical_hashes = bm25_hashes(es, collection_name, question)
-            merged_hashes = rrf_merge([vector_hashes, lexical_hashes])[:50] or vector_hashes
+            merged_hashes = rrf_merge([vector_hashes, lexical_hashes])[:50] or (vector_hashes or lexical_hashes)
             hash_to_score = {}
             for point in search_result or []:
                 value = payload_hash(getattr(point, "payload", None) or {})
@@ -1212,7 +1222,7 @@ def analyze_question(
                     "database": db_name,
                     "found_documents": len(texts),
                     "collection_name": collection_name,
-                    "source": "hybrid" if lexical_hashes else "qdrant",
+                    "source": "lexical" if (lexical_hashes and not vector_hashes) else ("hybrid" if lexical_hashes else "qdrant"),
                     "filtered": bool(es_filter_clauses(filters)) and used_filter,
                 }
             )
