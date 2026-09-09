@@ -6556,7 +6556,7 @@ async def add_file(
     save_dict_to_pickle(file_path, indexes)
 
     max_file_size_admin = 50 * 1024 * 1024 * 1024 # 50 GB
-    max_file_size_non_admin = 500 * 1024 * 1024 # 500 MB
+    max_file_size_non_admin = 10 * 1024 * 1024 * 1024 # 10 GB (единый лимит для всех пользователей)
     size = uploaded_file.size if hasattr(uploaded_file, 'size') else 0
 
     if user_id in ('1', '3', '13'):

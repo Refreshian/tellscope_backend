@@ -3,6 +3,7 @@ load_dotenv()
 
 import time
 import json
+import ijson
 import uuid
 import numpy as np
 import tiktoken
@@ -60,6 +61,8 @@ MAX_TOKENS = 6000
 OVERLAP = 150
 EMBED_BATCH_SIZE = 256
 QDRANT_BATCH_SIZE = 200
+# Большие файлы: если док-тов больше лимита - эмбеддинги пропускаем (только ES)
+EMBEDDING_MAX_DOCS = 150000
 ES_BATCH_SIZE = 2000
 
 encoding = tiktoken.get_encoding("cl100k_base")
@@ -674,7 +677,7 @@ def reindex_existing_collection(collection_name):
         logger.error(f"❌ Ошибка переиндексации: {e}", exc_info=True)
         return False
 
-def load_file_to_elstic(filename, path=None, task_id=None):
+def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None):
     """Загрузка файла с детальным логированием"""
     
     if task_id is None:
@@ -726,86 +729,60 @@ def load_file_to_elstic(filename, path=None, task_id=None):
             return {"status": "failed", "error": "Ошибка создания индекса"}
         
         logger.info(f"Загрузка данных из {file_name}")
-        with open(file_name, 'r', encoding='utf-8') as file:
-            data = json.load(file)
 
-        if not isinstance(data, list) or not data:
-            return {"status": "failed", "error": "Некорректный формат JSON"}
-
-        # 🔍 ДЕТАЛЬНАЯ ПРОВЕРКА ИСХОДНЫХ ДАННЫХ
-        logger.info("=" * 50)
-        logger.info("ПРОВЕРКА ИСХОДНЫХ ДАННЫХ ИЗ JSON")
-        logger.info("=" * 50)
-        
-        for i, doc in enumerate(data[:5]):  # Проверяем первые 5 документов
-            if isinstance(doc, dict):
-                logger.info(f"\nДокумент {i}:")
-                for field in ["timeCreate", "audienceCount"]:
-                    if field in doc:
-                        value = doc[field]
-                        logger.info(f"  {field}: {value} (type: {type(value).__name__})")
-                        
-                        # Проверка на None
-                        if value is None:
-                            logger.error(f"  ❌ НАЙДЕН None В ИСХОДНОМ JSON!")
-                        
-                        # Проверка на возможность сравнения
-                        try:
-                            _ = value < 0
-                            logger.info(f"  ✅ Сравнение возможно")
-                        except TypeError as te:
-                            logger.error(f"  ❌ Ошибка сравнения: {te}")
-
-        # Предварительная очистка
-        cleaned_data = []
-        for idx, doc in enumerate(data):
-            if isinstance(doc, dict):
-                # Логируем ДО валидации
-                if idx < 3:
-                    logger.info(f"\nОчистка документа {idx} ДО валидации:")
-                    logger.info(f"  timeCreate: {doc.get('timeCreate')} (type: {type(doc.get('timeCreate')).__name__})")
-                    logger.info(f"  audienceCount: {doc.get('audienceCount')} (type: {type(doc.get('audienceCount')).__name__})")
-                
-                doc = validate_document_numeric_fields(doc)
-                
-                # Логируем ПОСЛЕ валидации
-                if idx < 3:
-                    logger.info(f"  ПОСЛЕ валидации:")
-                    logger.info(f"  timeCreate: {doc.get('timeCreate')} (type: {type(doc.get('timeCreate')).__name__})")
-                    logger.info(f"  audienceCount: {doc.get('audienceCount')} (type: {type(doc.get('audienceCount')).__name__})")
-                
-                cleaned_data.append(doc)
+        # ✅ ПОТОКОВОЕ чтение большого JSON (ijson): память больше не зависит от числа записей.
+        def iter_json_docs(path):
+            with open(path, 'r', encoding='utf-8') as probe:
+                first = ''
+                while True:
+                    ch = probe.read(1)
+                    if not ch:
+                        break
+                    if not ch.isspace():
+                        first = ch
+                        break
+            if first == '[':
+                with open(path, 'r', encoding='utf-8') as fh:
+                    yield from ijson.items(fh, 'item')
             else:
-                logger.warning(f"Пропущен документ {idx} неверного типа: {type(doc)}")
+                with open(path, 'r', encoding='utf-8') as fh:
+                    data = json.load(fh)
+                if isinstance(data, list):
+                    yield from data
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            yield from v
+                            return
+                    yield data
 
-        data = cleaned_data
-        logger.info(f"После очистки осталось {len(data)} валидных документов")
-        
-        # Загрузка в Elasticsearch
+        es_indexed = 0
+        cleaned_meta_count = 0
+
+        def action_stream():
+            nonlocal es_indexed, cleaned_meta_count
+            for doc in iter_json_docs(file_name):
+                if not isinstance(doc, dict):
+                    continue
+                try:
+                    doc = validate_document_numeric_fields(dict(doc))
+                except Exception as e:
+                    logger.warning(f"Пропуск документа (валидация): {e}")
+                    continue
+                if not any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
+                    continue
+                cleaned_meta_count += 1
+                doc_id = str(doc.get('id', doc.get('idExternal', str(uuid.uuid4()))))
+                es_indexed += 1
+                yield {"_index": new_index, "_id": doc_id, "_source": doc}
+
+        success_count = 0
         try:
             from elasticsearch.helpers import streaming_bulk
-            
-            def actions_generator():
-                for doc in data:
-                    if not isinstance(doc, dict):
-                        continue
-                    
-                    doc_id = str(doc.get('id', doc.get('idExternal', str(uuid.uuid4()))))
-                    
-                    if not any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
-                        continue
-                    
-                    yield {
-                        "_index": new_index,
-                        "_id": doc_id,
-                        "_source": doc
-                    }
-            
-            success_count = 0
             for ok, response in streaming_bulk(
                 es,
-                actions_generator(),
-                chunk_size=200,
+                action_stream(),
+                chunk_size=500,
                 max_retries=3,
                 initial_backoff=2,
                 yield_ok=False,
@@ -815,31 +792,60 @@ def load_file_to_elstic(filename, path=None, task_id=None):
                     success_count += 1
                 else:
                     logger.warning(f"Ошибка индексации: {response}")
-                    
         except Exception as bulk_error:
             logger.error(f"Ошибка bulk индексации: {bulk_error}", exc_info=True)
-        
+
         es.indices.refresh(index=new_index)
         total_docs = es.count(index=new_index)['count']
-        
-        logger.info(f"✅ Elasticsearch индексация завершена:")
-        logger.info(f"   Успешно: {success_count}, Всего в индексе: {total_docs}")
-        
+
+        logger.info(f"✅ Elasticsearch индексация завершена: успешно {success_count}, всего в индексе {total_docs}")
+
         if total_docs == 0:
             return {"status": "failed", "error": "Индекс пуст после загрузки"}
-        
-        # Обработка для Qdrant
+
+        # Лимит эмбеддингов: ES-загрузка всегда; эмбеддинги/Qdrant только для файлов
+        # не больше лимита документов, либо если явно запрошено (build_embeddings=True).
+        if build_embeddings is None:
+            build_embeddings = total_docs <= EMBEDDING_MAX_DOCS
+
+        if not build_embeddings:
+            logger.info(f"Файл большой ({total_docs} док. > {EMBEDDING_MAX_DOCS}) - эмбеддинги пропущены (только ES).")
+            try:
+                safe_update_progress(
+                    task_id, 100, status="completed", stage="completed",
+                    stage_details=f"Загружено в Elasticsearch ({total_docs} док.); эмбеддинги пропущены - файл большой"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось обновить статус: {e}")
+            return {
+                "status": "completed",
+                "task_id": task_id,
+                "index_name": new_index,
+                "elasticsearch_docs": total_docs,
+                "embeddings_skipped": True,
+                "stage_details": f"Загружено в Elasticsearch ({total_docs} док.); эмбеддинги пропущены - файл большой",
+            }
+
         logger.info("🔄 Начало обработки для Qdrant")
-        processed_docs = batch_process_documents_with_embeddings_optimized(data, task_id)
-        
+        docs_for_embeddings = []
+        for doc in iter_json_docs(file_name):
+            if not isinstance(doc, dict):
+                continue
+            try:
+                doc = validate_document_numeric_fields(dict(doc))
+            except Exception:
+                continue
+            if any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
+                docs_for_embeddings.append(doc)
+                if len(docs_for_embeddings) >= EMBEDDING_MAX_DOCS:
+                    break
+
+        processed_docs = batch_process_documents_with_embeddings_optimized(docs_for_embeddings, task_id)
         if not processed_docs:
             return {"status": "failed", "error": "Нет документов для Qdrant"}
-        
-        logger.info(f"📊 Статистика обработки:")
-        logger.info(f"   Исходных документов: {len(data)}")
-        logger.info(f"   Обработано для Qdrant: {len(processed_docs)}")
-        logger.info(f"   Пропущено: {len(data) - len(processed_docs)}")
-        
+
+        logger.info(f"📊 Обработано для Qdrant: {len(processed_docs)}")
+
         redis_client.hset(
             f"task:{task_id}",
             mapping={
@@ -847,18 +853,17 @@ def load_file_to_elstic(filename, path=None, task_id=None):
                 "progress": "80",
                 "total": str(len(processed_docs)),
                 "start_time": datetime.now().isoformat(),
-                "total_docs": str(len(data))
+                "total_docs": str(total_docs)
             }
         )
-        
+
         try:
             load_to_qdrant_optimized(new_index, processed_docs, task_id)
         except Exception as e:
             logger.error(f"Ошибка Qdrant: {e}", exc_info=True)
             return {"status": "failed", "error": str(e)}
-        
+
         logger.info("🎉 Обработка файла полностью завершена")
-        
         return {
             "status": "completed",
             "task_id": task_id,
@@ -866,7 +871,7 @@ def load_file_to_elstic(filename, path=None, task_id=None):
             "processed_docs": len(processed_docs),
             "elasticsearch_docs": total_docs
         }
-        
+
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}", exc_info=True)
         return {"status": "failed", "error": str(e)}
