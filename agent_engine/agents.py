@@ -323,6 +323,8 @@ def start_agent_run(user_id: Any, agent: Dict[str, Any], user: Any, main_loop: A
     )
     run["agent_id"] = agent.get("id")
     run["agent_name"] = agent.get("name")
+    # Пользователь обязателен: инструменты проверяют по нему доступ к датасету
+    run["_user"] = user
     if main_loop is not None:
         future = asyncio.run_coroutine_threadsafe(agent_runs.execute_run(run["run_id"], main_loop), agent_runs.worker_loop())
         agent_runs._ACTIVE_TASKS[run["run_id"]] = future
