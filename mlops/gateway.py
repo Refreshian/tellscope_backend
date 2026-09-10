@@ -13,6 +13,7 @@ from mlops import usage as _usage_tracker
 
 _async_client: httpx.AsyncClient | None = None
 _async_loop_id: int | None = None
+_async_clients: dict[int, httpx.AsyncClient] = {}
 _ENV_LOADED = False
 _METRICS_CALLS: dict[str, int] = {}
 _METRICS_ERRORS: dict[str, int] = {}
@@ -150,25 +151,31 @@ def _timeout(timeout: float) -> httpx.Timeout:
 
 
 async def _get_async_client() -> httpx.AsyncClient:
+    """Клиент на каждый цикл событий.
+
+    Агентный режим работает в отдельном потоке со своим циклом, поэтому единый
+    глобальный клиент закрывался из чужого цикла и запросы падали. Держим по клиенту
+    на цикл и подчищаем только закрытые.
+    """
     global _async_client, _async_loop_id
     import asyncio
 
-    loop = asyncio.get_running_loop()
-    loop_id = id(loop)
-    if _async_client is not None and (not _async_client.is_closed) and _async_loop_id == loop_id:
-        return _async_client
-    if _async_client is not None:
-        try:
-            await _async_client.aclose()
-        except Exception:
-            pass
-        _async_client = None
-    _async_client = httpx.AsyncClient(
+    loop_id = id(asyncio.get_running_loop())
+    client = _async_clients.get(loop_id)
+    if client is not None and not client.is_closed:
+        _async_client = client
+        _async_loop_id = loop_id
+        return client
+    for key in [k for k, c in list(_async_clients.items()) if c.is_closed]:
+        _async_clients.pop(key, None)
+    client = httpx.AsyncClient(
         limits=httpx.Limits(max_connections=128, max_keepalive_connections=64),
         timeout=_timeout(180),
     )
+    _async_clients[loop_id] = client
+    _async_client = client
     _async_loop_id = loop_id
-    return _async_client
+    return client
 
 
 def chat(

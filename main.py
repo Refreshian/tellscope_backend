@@ -11657,6 +11657,7 @@ _LLM_USAGE_CASE_MAP = {
     "/graph-analysis/cluster-summary": "graph-analysis",
     "/llm-run/": "llm_run",
     "/llm-run-multiple/": "llm_run",
+    "/agent/run": "agent-mode",
 }
 
 
@@ -11686,3 +11687,258 @@ async def admin_llm_usage_days(user_id: int | None = None, case_id: str | None =
     from mlops import usage as _usage_api
     return {"rows": _usage_api.aggregate_days(user_id=user_id, case=case_id, provider=provider,
                                               model=model, days=days, date_from=date_from, date_to=date_to)}
+
+# ============================== Агентный режим ==============================
+# Реестр инструментов, tool-calling цикл и стрим шагов. Ядро — пакет agent_engine.
+from agent_engine import catalog as _agent_catalog
+from agent_engine import runs as _agent_runs
+from agent_engine.loop import DEFAULT_CHOICE as _AGENT_DEFAULT_CHOICE
+from agent_engine.loop import MODEL_CHOICES as _AGENT_MODELS
+from agent_engine.tools_connectors import load_connectors as _agent_connectors_load
+from agent_engine.tools_connectors import save_connectors as _agent_connectors_save
+
+_AGENT_MAX_ACTIVE_PER_USER = 1
+_AGENT_MAX_RUNS_PER_DAY = 60
+
+
+class AgentRunRequest(BaseModel):
+    user_query: str
+    index: Optional[int] = None
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    tools: Optional[List[str]] = None
+    model: Optional[str] = None
+    folder: Optional[str] = None
+
+
+class AgentConnectorBody(BaseModel):
+    name: str
+    type: Optional[str] = "http"
+    base_url: Optional[str] = None
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
+    allow_paths: Optional[List[str]] = None
+    token: Optional[str] = None
+    description: Optional[str] = None
+    enabled: Optional[bool] = True
+
+
+def _agent_ws_user_id(websocket) -> Optional[str]:
+    """Пользователь по JWT из cookie/query — WebSocket не умеет Authorization-заголовок."""
+    token = (websocket.cookies.get("token") or websocket.query_params.get("token") or "").strip()
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET, algorithms=["HS256"], audience="fastapi-users:auth")
+    except Exception:
+        return None
+    sub = payload.get("sub")
+    return str(sub) if sub is not None else None
+
+
+def _agent_dataset_name(index: Optional[int]) -> str:
+    if index is None:
+        return ""
+    try:
+        mapping = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+        return str(mapping.get(int(index)) or mapping.get(str(index)) or "")
+    except Exception:
+        return ""
+
+
+@app.get("/agent/tools", tags=["agent mode"])
+async def agent_tools_catalog(user: User = Depends(current_user)):
+    """Каталог инструментов агентного режима: группы, описания, JSON-схемы, доступные модели."""
+    data = _agent_catalog()
+    data["models"] = [{"id": key, "label": value.get("label")} for key, value in _AGENT_MODELS.items()]
+    data["default_model"] = _AGENT_DEFAULT_CHOICE
+    return data
+
+
+@app.get("/agent/runs", tags=["agent mode"])
+async def agent_runs_list(user: User = Depends(current_user)):
+    """История агентных запусков пользователя."""
+    return {"runs": _agent_runs.list_runs(user.id), "active": len(_agent_runs.active_runs_for_user(user.id)),
+            "runs_today": _agent_runs.runs_today_for_user(user.id), "limit_per_day": _AGENT_MAX_RUNS_PER_DAY}
+
+
+@app.post("/agent/run", tags=["agent mode"])
+async def agent_run_start(request: AgentRunRequest, user: User = Depends(current_user)):
+    """Запуск агента: он сам выбирает инструменты Tellscope и собирает аналитику или отчёт."""
+    query = (request.user_query or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Опишите задачу для агента")
+    if request.index is not None:
+        _guard_index_access(user, request.index)
+    if len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
+        raise HTTPException(status_code=409, detail="Уже есть активный агентный запуск — дождитесь его завершения")
+    if _agent_runs.active_runs_total() >= _agent_runs.MAX_ACTIVE_TOTAL:
+        raise HTTPException(status_code=409, detail="Агент занят другими запусками — попробуйте через минуту")
+    if _agent_runs.runs_today_for_user(user.id) >= _AGENT_MAX_RUNS_PER_DAY:
+        raise HTTPException(status_code=429, detail="Достигнут дневной лимит агентных запусков")
+    if (request.model or "") == "qwen":
+        try:
+            from mlops.runtime import GpuBusy, assert_can_start
+
+            assert_can_start("agent-mode")
+        except GpuBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    run = _agent_runs.create_run(
+        user=user,
+        user_id=str(user.id),
+        task=query,
+        dataset_index=request.index,
+        dataset_name=_agent_dataset_name(request.index),
+        dataset_label=_agent_dataset_name(request.index),
+        min_date=request.min_date,
+        max_date=request.max_date,
+        tools=request.tools,
+        model_choice=(request.model or _AGENT_DEFAULT_CHOICE),
+        folder=(request.folder or "Агент"),
+    )
+    _agent_runs.start_run(run, user)
+    return {
+        "run_id": run["run_id"],
+        "status": run["status"],
+        "tools": run["tools"],
+        "model": run.get("model_label"),
+        "dataset": run.get("dataset_name"),
+    }
+
+
+@app.get("/agent/run/{run_id}", tags=["agent mode"])
+async def agent_run_status(run_id: str, user: User = Depends(current_user)):
+    """Состояние запуска: статус, журнал шагов, ответ, артефакты."""
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    payload = {k: v for k, v in run.items() if k not in ("events", "_user")}
+    payload["events"] = _agent_runs.buffered_events(run_id)[-250:]
+    return payload
+
+
+@app.get("/agent/artifact/{run_id}/{file_name}", tags=["agent mode"])
+async def agent_artifact(run_id: str, file_name: str, user: User = Depends(current_user)):
+    """Скачивание артефакта запуска (графики, промежуточные файлы)."""
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    path = _agent_runs.artifact_path(run_id, file_name)
+    if not path:
+        raise HTTPException(status_code=404, detail="Артефакт не найден")
+    low = os.path.basename(path).lower()
+    media = 'application/pdf' if low.endswith('.pdf') else ('image/png' if low.endswith('.png') else 'application/octet-stream')
+    return FileResponse(path, media_type=media, filename=os.path.basename(path))
+
+
+@app.websocket("/ws/agent-run/{run_id}")
+async def agent_run_ws(websocket: WebSocket, run_id: str):
+    """Стрим шагов агентного запуска: сначала отдаём буфер событий, затем живые."""
+    user_id = _agent_ws_user_id(websocket)
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        await websocket.close(code=1008, reason="Запуск не найден")
+        return
+    if user_id is None or (str(run.get("user_id")) != str(user_id)):
+        await websocket.close(code=1008, reason="Нет доступа к запуску")
+        return
+    await websocket.accept()
+    queue = _agent_runs.subscribe(run_id)
+    try:
+        for event in _agent_runs.buffered_events(run_id):
+            await websocket.send_json(event)
+        if str(run.get("status") or "") in ("completed", "failed"):
+            await websocket.send_json({"type": "done", "status": run.get("status"), "error": run.get("error")})
+            return
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=20.0)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "keepalive"})
+                continue
+            if event.get("type") == "__close__":
+                break
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"agent-run websocket error for {run_id}: {exc}")
+    finally:
+        _agent_runs.unsubscribe(run_id, queue)
+        try:
+            await websocket.close(code=1000)
+        except Exception:
+            pass
+
+
+@app.get("/agent/connectors", tags=["agent mode"])
+async def agent_connectors_list(user: User = Depends(current_user)):
+    """Внешние инструменты пользователя (секреты не возвращаются)."""
+    items = _agent_connectors_load(user.id)
+    safe = []
+    for item in items:
+        safe.append({
+            "name": item.get("name"),
+            "type": item.get("type") or "http",
+            "base_url": item.get("base_url") or item.get("url"),
+            "description": item.get("description") or "",
+            "enabled": item.get("enabled", True),
+            "has_secret": bool(item.get("token") or item.get("headers")),
+            "allow_paths": item.get("allow_paths") or [],
+        })
+    return {"connectors": safe}
+
+
+@app.post("/agent/connectors", tags=["agent mode"])
+async def agent_connectors_upsert(body: AgentConnectorBody, user: User = Depends(current_user)):
+    """Добавляет или обновляет внешний инструмент (HTTP или MCP)."""
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Укажите имя коннектора")
+    kind = (body.type or "http").lower()
+    if kind not in ("http", "mcp"):
+        raise HTTPException(status_code=400, detail="Поддерживаются типы http и mcp")
+    if kind == "http" and not (body.base_url or "").strip():
+        raise HTTPException(status_code=400, detail="Для HTTP-коннектора нужен base_url")
+    if kind == "mcp" and not (body.url or "").strip():
+        raise HTTPException(status_code=400, detail="Для MCP-коннектора нужен url")
+    items = _agent_connectors_load(user.id)
+    existing = next((it for it in items if str(it.get("name")).lower() == name.lower()), None)
+    record = {
+        "name": name,
+        "type": kind,
+        "base_url": (body.base_url or "").strip() or None,
+        "url": (body.url or "").strip() or None,
+        "headers": body.headers or {},
+        "allow_paths": body.allow_paths or [],
+        "description": body.description or "",
+        "enabled": bool(body.enabled),
+    }
+    if body.token:
+        record["token"] = body.token
+    elif existing and existing.get("token"):
+        record["token"] = existing["token"]
+    if existing:
+        existing.update({k: v for k, v in record.items() if v is not None})
+    else:
+        items.append({k: v for k, v in record.items() if v is not None})
+    _agent_connectors_save(user.id, items)
+    return {"ok": True, "connectors": [it.get("name") for it in items]}
+
+
+@app.delete("/agent/connectors/{name}", tags=["agent mode"])
+async def agent_connectors_delete(name: str, user: User = Depends(current_user)):
+    items = _agent_connectors_load(user.id)
+    left = [it for it in items if str(it.get("name")).lower() != str(name or "").lower()]
+    if len(left) == len(items):
+        raise HTTPException(status_code=404, detail="Коннектор не найден")
+    _agent_connectors_save(user.id, left)
+    return {"ok": True, "removed": name}
