@@ -1631,7 +1631,7 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None, 
     indexes = load_dict_from_pickle(file_path)
 
     # 2. Запрашиваем из Elasticsearch
-    data = elastic_query(theme_index=indexes[index], query_str="all") 
+    data = elastic_query(theme_index=indexes[index], query_str="all", min_date=min_date, max_date=max_date) 
 
     print(777999)
     print(f'data: {data[:2]})')
