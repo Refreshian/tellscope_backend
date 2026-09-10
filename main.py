@@ -11975,6 +11975,130 @@ async def agent_connectors_delete(name: str, user: User = Depends(current_user))
     return {"ok": True, "removed": name}
 
 
+# ------------------------------ Конструктор агентов ------------------------------
+
+_agent_scheduler_started = False
+
+
+def _agent_ensure_scheduler() -> None:
+    """Планировщик расписаний поднимаем при первом обращении к разделу агентов."""
+    global _agent_scheduler_started
+    if _agent_scheduler_started:
+        return
+    try:
+        from agent_engine import agents as _agent_agents_store
+
+        _agent_agents_store.start_scheduler(asyncio.get_running_loop())
+        _agent_scheduler_started = True
+    except Exception as exc:
+        print(f"agent scheduler start error: {exc}")
+
+
+def _agent_public(agent: Dict[str, Any]) -> Dict[str, Any]:
+    from agent_engine import agents as _agent_agents_store
+
+    item = dict(agent)
+    item["schedule_text"] = _agent_agents_store.describe_schedule(agent.get("schedule") or {})
+    item["tools_count"] = len(agent.get("tools") or [])
+    return item
+
+
+class AgentConfigBody(BaseModel):
+    id: Optional[str] = None
+    preset: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    instruction: Optional[str] = None
+    tools: Optional[List[str]] = None
+    model: Optional[str] = None
+    token_budget: Optional[int] = None
+    dataset_index: Optional[int] = None
+    dataset_name: Optional[str] = None
+    folder: Optional[str] = None
+    schedule: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
+
+@app.get("/agent/agents", tags=["agent mode"])
+async def agent_agents_list(user: User = Depends(current_user)):
+    """Сохранённые агенты пользователя и готовые шаблоны."""
+    _agent_ensure_scheduler()
+    from agent_engine import agents as _agent_agents_store
+
+    items = [_agent_public(item) for item in _agent_agents_store.list_agents(user.id)]
+    return {
+        "agents": items,
+        "presets": _agent_agents_store.presets_public(),
+        "models": [
+            {"id": key, "label": value.get("label"), "tier": value.get("tier"), "price_in": value.get("price_in"), "price_out": value.get("price_out")}
+            for key, value in _AGENT_MODELS.items()
+        ],
+        "default_model": _AGENT_DEFAULT_CHOICE,
+        "default_token_budget": _agent_runs.DEFAULT_TOKEN_BUDGET,
+        "tokens_today": _agent_runs.tokens_today_for_user(user.id),
+        "tokens_per_day_limit": _agent_runs.MAX_TOKENS_PER_DAY,
+    }
+
+
+@app.post("/agent/agents", tags=["agent mode"])
+async def agent_agents_upsert(body: AgentConfigBody, user: User = Depends(current_user)):
+    """Создаёт или обновляет агента (в том числе из готового шаблона)."""
+    _agent_ensure_scheduler()
+    from agent_engine import agents as _agent_agents_store
+
+    payload = body.dict(exclude_none=True)
+    if body.dataset_index is not None:
+        _guard_index_access(user, body.dataset_index)
+        if not payload.get("dataset_name"):
+            payload["dataset_name"] = _agent_dataset_name(body.dataset_index)
+    if payload.get("tools"):
+        payload["tools"] = _agent_runs.resolve_tools(payload["tools"])
+    if not payload.get("preset") and not payload.get("id"):
+        preset = _agent_agents_store._PRESET_BY_ID.get(str(body.preset or ""))
+        if not preset and not payload.get("name"):
+            raise HTTPException(status_code=400, detail="Нужно имя агента или готовый шаблон")
+    if payload.get("instruction") is not None and len(str(payload["instruction"]).strip()) < 20:
+        raise HTTPException(status_code=400, detail="Инструкция агента слишком короткая")
+    agent = _agent_agents_store.upsert_agent(user.id, payload)
+    return {"ok": True, "agent": _agent_public(agent)}
+
+
+@app.delete("/agent/agents/{agent_id}", tags=["agent mode"])
+async def agent_agents_delete(agent_id: str, user: User = Depends(current_user)):
+    from agent_engine import agents as _agent_agents_store
+
+    if not _agent_agents_store.delete_agent(user.id, agent_id):
+        raise HTTPException(status_code=404, detail="Агент не найден")
+    return {"ok": True, "removed": agent_id}
+
+
+@app.post("/agent/agents/{agent_id}/run", tags=["agent mode"])
+async def agent_agents_run(agent_id: str, user: User = Depends(current_user)):
+    """Запускает сохранённого агента вручную."""
+    _agent_ensure_scheduler()
+    from agent_engine import agents as _agent_agents_store
+
+    agent = _agent_agents_store.get_agent(user.id, agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Агент не найден")
+    if not agent.get("instruction"):
+        raise HTTPException(status_code=400, detail="У агента нет инструкции")
+    if agent.get("dataset_index") is not None:
+        _guard_index_access(user, agent.get("dataset_index"))
+    if len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
+        raise HTTPException(status_code=409, detail="Уже есть активный агентный запуск — дождитесь завершения")
+    if _agent_runs.tokens_today_for_user(user.id) >= _agent_runs.MAX_TOKENS_PER_DAY:
+        raise HTTPException(status_code=429, detail="Достигнут дневной лимит расхода токенов агента")
+    run = _agent_agents_store.start_agent_run(user.id, agent, user)
+    return {
+        "run_id": run["run_id"],
+        "status": run["status"],
+        "agent_id": agent_id,
+        "model": run.get("model_label"),
+        "token_budget": run.get("token_budget"),
+    }
+
+
 # ============================ MCP-сервер Tellscope ============================
 # Тот же реестр инструментов, что и у встроенного агента, доступен внешним клиентам
 # (Claude Desktop, LangFlow, n8n, собственные агенты) по протоколу MCP через JSON-RPC.

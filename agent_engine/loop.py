@@ -299,7 +299,10 @@ def _compact_history(messages: List[dict]) -> None:
 
 
 def _budget_exceeded(ctx) -> bool:
-    return bool(ctx.token_budget) and ctx.tokens >= int(ctx.token_budget)
+    """Бюджет считаем с запасом на один шаг, чтобы не выходить за заявленный лимит."""
+    if not ctx.token_budget:
+        return False
+    return ctx.tokens >= max(1000, int(ctx.token_budget) - 8000)
 
 
 def _tool_payload(outcome: Dict[str, Any]) -> Dict[str, Any]:
