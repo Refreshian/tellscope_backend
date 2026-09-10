@@ -21,7 +21,10 @@ from mlops.prompts import render_prompt
 # ==========================================
 # КОНФИГУРАЦИЯ (модели из serving lock, ключи только из .env)
 # ==========================================
-EXTERNAL_MODEL = (external_cfg("smart_agent_planner").get("model") or "claude-sonnet-4.5")
+# Профиль внешней модели: по умолчанию дешёвый gpt-4.1-mini вместо claude-sonnet-4.5.
+# Переопределяется переменной окружения SMART_AGENT_PROFILE (см. mlops/lock.yaml -> external.profiles).
+SMART_AGENT_PROFILE = os.environ.get("SMART_AGENT_PROFILE", "dashboard_qa")
+EXTERNAL_MODEL = (external_cfg(SMART_AGENT_PROFILE).get("model") or "gpt-4.1-mini")
 LOCAL_MODEL_NAME = (generate_cfg().get("model") or "Qwen/Qwen3-32B-FP8")
 BATCH_SIZE = 32
 MAX_CONCURRENCY = 64
@@ -35,7 +38,7 @@ MAX_RETRIES = 2
 
 class ExternalLLMbrain:
     def __init__(self):
-        self.client = GatewayChatClient(provider="aitunnel", profile="smart_agent_planner")
+        self.client = GatewayChatClient(provider="aitunnel", profile=SMART_AGENT_PROFILE)
 
     def _is_english_requested(self, text: str) -> bool:
         lowered = text.lower()

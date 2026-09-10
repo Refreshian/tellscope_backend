@@ -39,7 +39,7 @@ def to_unix(value: Any) -> Optional[int]:
         return None
 
 
-def compact(value: Any, max_items: int = 30, max_str: int = 320, depth: int = 0, max_depth: int = 5) -> Any:
+def compact(value: Any, max_items: int = 15, max_str: int = 260, depth: int = 0, max_depth: int = 5) -> Any:
     """Сжимает структуру ответа до размера, пригодного для передачи в LLM."""
     if depth > max_depth:
         return "..."
@@ -92,6 +92,8 @@ class AgentContext:
     charts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     llm_calls: int = 0
     tokens: int = 0
+    cost_usd: float = 0.0
+    token_budget: int = 0
     notes: List[str] = field(default_factory=list)
 
     def time_left(self) -> float:

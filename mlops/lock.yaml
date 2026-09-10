@@ -47,3 +47,26 @@ prompts:
   smart_agent_plan: smart_agent_plan_v1
   smart_agent_intro: smart_agent_intro_v1
   smart_agent_narrative: smart_agent_narrative_v1
+
+# Цены за 1M токенов (USD) — источник правды для учёта расхода LLM.
+# Локальный vLLM работает на наших GPU: внешних платежей нет, поэтому цена 0.
+# Значения для aitunnel — ориентир по прайсу провайдеров; если aitunnel берёт наценку,
+# поправьте цифры здесь, они подхватятся при старте приложения.
+pricing:
+  vllm:
+    "*":
+      in: 0.0
+      out: 0.0
+  aitunnel:
+    "*":
+      in: 3.0
+      out: 15.0
+    claude-sonnet-4.5:
+      in: 3.0
+      out: 15.0
+    gpt-4.1-mini:
+      in: 0.4
+      out: 1.6
+    deepseek-chat-v3.1:
+      in: 0.27
+      out: 1.1

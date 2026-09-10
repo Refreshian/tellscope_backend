@@ -11709,6 +11709,7 @@ class AgentRunRequest(BaseModel):
     tools: Optional[List[str]] = None
     model: Optional[str] = None
     folder: Optional[str] = None
+    max_tokens: Optional[int] = None
 
 
 class AgentConnectorBody(BaseModel):
@@ -11748,18 +11749,37 @@ def _agent_dataset_name(index: Optional[int]) -> str:
 
 @app.get("/agent/tools", tags=["agent mode"])
 async def agent_tools_catalog(user: User = Depends(current_user)):
-    """Каталог инструментов агентного режима: группы, описания, JSON-схемы, доступные модели."""
+    """Каталог инструментов агентного режима: группы, описания, JSON-схемы, доступные модели и цены."""
     data = _agent_catalog()
-    data["models"] = [{"id": key, "label": value.get("label")} for key, value in _AGENT_MODELS.items()]
+    data["models"] = [
+        {
+            "id": key,
+            "label": value.get("label"),
+            "tier": value.get("tier"),
+            "provider": value.get("provider"),
+            "price_in": value.get("price_in"),
+            "price_out": value.get("price_out"),
+        }
+        for key, value in _AGENT_MODELS.items()
+    ]
     data["default_model"] = _AGENT_DEFAULT_CHOICE
+    data["default_token_budget"] = _agent_runs.DEFAULT_TOKEN_BUDGET
+    data["max_tokens_per_day"] = _agent_runs.MAX_TOKENS_PER_DAY
+    data["tokens_today"] = _agent_runs.tokens_today_for_user(user.id)
     return data
 
 
 @app.get("/agent/runs", tags=["agent mode"])
 async def agent_runs_list(user: User = Depends(current_user)):
-    """История агентных запусков пользователя."""
-    return {"runs": _agent_runs.list_runs(user.id), "active": len(_agent_runs.active_runs_for_user(user.id)),
-            "runs_today": _agent_runs.runs_today_for_user(user.id), "limit_per_day": _AGENT_MAX_RUNS_PER_DAY}
+    """История агентных запусков пользователя и расход токенов за сегодня."""
+    return {
+        "runs": _agent_runs.list_runs(user.id),
+        "active": len(_agent_runs.active_runs_for_user(user.id)),
+        "runs_today": _agent_runs.runs_today_for_user(user.id),
+        "limit_per_day": _AGENT_MAX_RUNS_PER_DAY,
+        "tokens_today": _agent_runs.tokens_today_for_user(user.id),
+        "tokens_per_day_limit": _agent_runs.MAX_TOKENS_PER_DAY,
+    }
 
 
 @app.post("/agent/run", tags=["agent mode"])
@@ -11776,6 +11796,15 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
         raise HTTPException(status_code=409, detail="Агент занят другими запусками — попробуйте через минуту")
     if _agent_runs.runs_today_for_user(user.id) >= _AGENT_MAX_RUNS_PER_DAY:
         raise HTTPException(status_code=429, detail="Достигнут дневной лимит агентных запусков")
+    spent_today = _agent_runs.tokens_today_for_user(user.id)
+    if spent_today >= _agent_runs.MAX_TOKENS_PER_DAY:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Достигнут дневной лимит расхода токенов агента "
+                f"({spent_today} из {_agent_runs.MAX_TOKENS_PER_DAY}). Лимит защищает бюджет на внешние модели."
+            ),
+        )
     if (request.model or "") == "qwen":
         try:
             from mlops.runtime import GpuBusy, assert_can_start
@@ -11799,6 +11828,7 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
         tools=request.tools,
         model_choice=(request.model or _AGENT_DEFAULT_CHOICE),
         folder=(request.folder or "Агент"),
+        token_budget=request.max_tokens,
     )
     _agent_runs.start_run(run, user)
     return {
@@ -11806,6 +11836,7 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
         "status": run["status"],
         "tools": run["tools"],
         "model": run.get("model_label"),
+        "token_budget": run.get("token_budget"),
         "dataset": run.get("dataset_name"),
     }
 

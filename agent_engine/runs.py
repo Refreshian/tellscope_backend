@@ -11,7 +11,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from .context import AGENT_RUNS_ROOT, AgentContext, to_unix
-from .loop import DEFAULT_CHOICE, MODEL_CHOICES, run_agent
+from .loop import DEFAULT_CHOICE, DEFAULT_TOKEN_BUDGET, MODEL_CHOICES, run_agent
 from .registry import resolve_tools
 
 MAX_EVENTS = 800
@@ -19,6 +19,9 @@ RUN_BUDGET_SEC = 1800
 MAX_ACTIVE_PER_USER = 1
 MAX_ACTIVE_TOTAL = 3
 MAX_RUNS_PER_DAY = 60
+MAX_TOKENS_PER_DAY = 1_500_000
+MIN_TOKEN_BUDGET = 20_000
+MAX_TOKEN_BUDGET = 2_000_000
 
 RUNS: Dict[str, Dict[str, Any]] = {}
 _SUBS: Dict[str, List[asyncio.Queue]] = {}
@@ -106,6 +109,21 @@ def runs_today_for_user(user_id: Any) -> int:
     return count
 
 
+def tokens_today_for_user(user_id: Any) -> int:
+    """Сколько токенов пользователь уже сжёг агентными запусками за сегодня (учёт расхода)."""
+    today = time.strftime("%Y-%m-%d")
+    total = 0
+    for run in RUNS.values():
+        if str(run.get("user_id")) == str(user_id) and str(run.get("created_at") or "").startswith(today):
+            total += int((run.get("stats") or {}).get("tokens") or 0)
+    for item in _load_persisted(str(user_id), limit=200):
+        if str(item.get("created_at") or "").startswith(today):
+            stats = item.get("stats") or {}
+            if stats:
+                total += int(stats.get("tokens") or 0)
+    return total
+
+
 def create_run(
     *,
     user: Any,
@@ -119,8 +137,14 @@ def create_run(
     tools: Optional[List[str]] = None,
     model_choice: str = DEFAULT_CHOICE,
     folder: str = "Агент",
+    token_budget: Optional[int] = None,
 ) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
+    try:
+        budget = int(token_budget) if token_budget else DEFAULT_TOKEN_BUDGET
+    except Exception:
+        budget = DEFAULT_TOKEN_BUDGET
+    budget = max(MIN_TOKEN_BUDGET, min(budget, MAX_TOKEN_BUDGET))
     run = {
         "run_id": run_id,
         "user_id": str(user_id),
@@ -131,6 +155,8 @@ def create_run(
         "finished_at": None,
         "model_choice": model_choice if model_choice in MODEL_CHOICES else DEFAULT_CHOICE,
         "model_label": (MODEL_CHOICES.get(model_choice) or MODEL_CHOICES[DEFAULT_CHOICE]).get("label"),
+        "token_budget": budget,
+        "cost_usd": 0.0,
         "tools": resolve_tools(tools),
         "dataset_index": dataset_index,
         "dataset_name": dataset_name,
@@ -282,6 +308,7 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         emit=emit,
         artifacts_dir=artifacts_dir(run_id),
         deadline=time.time() + RUN_BUDGET_SEC,
+        token_budget=int(run.get("token_budget") or DEFAULT_TOKEN_BUDGET),
     )
     try:
         result = await run_agent(ctx)
@@ -289,6 +316,7 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         run["stats"] = result.get("stats") or {}
         run["tool_calls"] = result.get("tool_calls") or []
         run["artifacts"] = result.get("artifacts") or []
+        run["cost_usd"] = float((result.get("stats") or {}).get("cost_usd") or 0.0)
         run["status"] = "completed" if run["answer"] else "failed"
         if not run["answer"]:
             run["error"] = "агент не сформировал ответ"

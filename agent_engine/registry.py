@@ -34,12 +34,35 @@ TOOL_GROUPS: Dict[str, Dict[str, str]] = {
     },
 }
 
-MAX_RESULT_CHARS = 7000
+MAX_RESULT_CHARS = 3500
 MAX_TOOL_TIMEOUT = 600.0
+
+# Ограничения длины описаний в схеме, которую отправляем модели каждый шаг.
+# Схемы 17 инструментов пересылаются в каждом запросе, поэтому их размер = прямые деньги.
+SCHEMA_DESC_LIMIT = 200
+SCHEMA_PARAM_DESC_LIMIT = 110
 
 
 class ToolError(RuntimeError):
     """Ошибка выполнения инструмента, безопасная для показа в журнале агента."""
+
+
+def slim_schema(parameters: Dict[str, Any], desc_limit: int = SCHEMA_PARAM_DESC_LIMIT) -> Dict[str, Any]:
+    """Урезает описания в JSON-схеме параметров, сохраняя структуру и типы."""
+    def walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if key == "description" and isinstance(value, str):
+                    out[key] = value if len(value) <= desc_limit else value[:desc_limit].rstrip() + "…"
+                else:
+                    out[key] = walk(value)
+            return out
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    return walk(parameters or {"type": "object", "properties": {}})
 
 
 @dataclass
@@ -55,13 +78,17 @@ class ToolSpec:
     timeout: float = 240.0
     cost: int = 1
 
-    def openai_schema(self) -> Dict[str, Any]:
+    def openai_schema(self, compact: bool = True) -> Dict[str, Any]:
+        description = self.description or ""
+        if compact and len(description) > SCHEMA_DESC_LIMIT:
+            description = description[:SCHEMA_DESC_LIMIT].rstrip() + "…"
+        parameters = slim_schema(self.parameters) if compact else (self.parameters or {"type": "object", "properties": {}})
         return {
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters or {"type": "object", "properties": {}},
+                "description": description,
+                "parameters": parameters,
             },
         }
 
@@ -156,12 +183,12 @@ def resolve_tools(requested: Optional[List[str]]) -> List[str]:
     return known
 
 
-def openai_tools(names: List[str]) -> List[Dict[str, Any]]:
+def openai_tools(names: List[str], compact: bool = True) -> List[Dict[str, Any]]:
     out = []
     for name in names:
         spec = _REGISTRY.get(name)
         if spec:
-            out.append(spec.openai_schema())
+            out.append(spec.openai_schema(compact=compact))
     return out
 
 

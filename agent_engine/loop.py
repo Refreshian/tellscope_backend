@@ -15,13 +15,49 @@ from .registry import execute, get_tool, json_text, openai_tools
 
 MAX_STEPS = 14
 MAX_TOOL_CALLS = 28
+DEFAULT_TOKEN_BUDGET = 120_000
 
-MODEL_CHOICES: Dict[str, Dict[str, str]] = {
-    "claude": {"provider": "aitunnel", "profile": "smart_agent_planner", "label": "Claude Sonnet 4.5"},
-    "gpt": {"provider": "aitunnel", "profile": "dashboard_qa", "label": "GPT-4.1 mini"},
-    "qwen": {"provider": "vllm", "profile": "agent", "label": "Qwen3-32B (локальная GPU)"},
+# Цены за 1M токенов (USD) — только для оценки расхода в интерфейсе.
+# Локальный Qwen считается бесплатным: это наши GPU, внешних платежей нет.
+MODEL_CHOICES: Dict[str, Dict[str, Any]] = {
+    "gpt": {
+        "provider": "aitunnel",
+        "profile": "dashboard_qa",
+        "label": "GPT-4.1 mini — дёшево",
+        "price_in": 0.4,
+        "price_out": 1.6,
+        "tier": "cheap",
+    },
+    "qwen": {
+        "provider": "vllm",
+        "profile": "agent",
+        "label": "Qwen3-32B — локально, без оплаты (экспериментально)",
+        "price_in": 0.0,
+        "price_out": 0.0,
+        "tier": "free",
+    },
+    "claude": {
+        "provider": "aitunnel",
+        "profile": "smart_agent_planner",
+        "label": "Claude Sonnet 4.5 — максимум качества, дорого",
+        "price_in": 3.0,
+        "price_out": 15.0,
+        "tier": "premium",
+    },
 }
-DEFAULT_CHOICE = "claude"
+DEFAULT_CHOICE = "gpt"
+# Куда переключаться, если выбранная модель не умеет вызывать инструменты.
+FALLBACK_CHOICE = "gpt"
+# Ставить ли в ответ предупреждение, если агент не получил данные инструментами.
+NO_DATA_WARNING = (
+    "⚠️ Данные не подтверждены инструментами: агент не смог получить факты из датасета, "
+    "поэтому цифрам ниже доверять нельзя. Запустите задачу ещё раз или выберите модель GPT-4.1 mini."
+)
+
+# Сколько символов результата инструмента остаётся в истории для старых шагов.
+# Без этого промпт растёт квадратично и каждый следующий шаг стоит дороже предыдущего.
+TOOL_RESULT_KEEP_CHARS = 2200
+TOOL_RESULT_RECENT_FULL = 3
 
 REPORT_KEYWORDS = ("отчёт", "отчет", "report", "презентац", "документ", "docx", "pdf", "выгрузк", "слайд")
 
@@ -177,6 +213,26 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
     except gateway.GatewayError as exc:
         status = getattr(exc, "status_code", 0)
         if tools and status in (400, 404, 422, 500, 501):
+            if choice.get("provider") != "aitunnel":
+                # Локальная модель без поддержки function calling: продолжаем на внешней дешёвой,
+                # чтобы агент не начал выдумывать данные вместо вызова инструментов.
+                fallback = MODEL_CHOICES[FALLBACK_CHOICE]
+                ctx.notes.append(
+                    f"{choice['label']} не поддерживает инструменты — прогон продолжен на {fallback['label']}"
+                )
+                ctx.model_choice = FALLBACK_CHOICE
+                await ctx.event({"type": "log", "level": "error", "message": f"Модель переключена на {fallback['label']}"})
+                result = await gateway.achat(
+                    provider=fallback["provider"],
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=max_tokens,
+                    timeout=300,
+                    extra=extra,
+                    profile=fallback["profile"],
+                    usage_ctx=usage_ctx,
+                )
+                return result, True
             ctx.notes.append(f"модель {choice['label']} не приняла tools (HTTP {status}), включён JSON-протокол")
             result = await gateway.achat(
                 provider=choice["provider"],
@@ -207,6 +263,43 @@ def _usage_tokens(result: Any) -> int:
         return int(usage.get("total_tokens") or 0)
     except Exception:
         return 0
+
+
+def _usage_parts(result: Any) -> Tuple[int, int, int]:
+    raw = getattr(result, "raw", None) or {}
+    usage = raw.get("usage") or {}
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        total = int(usage.get("total_tokens") or (prompt + completion))
+    except Exception:
+        return 0, 0, 0
+    return prompt, completion, total
+
+
+def _account(ctx, result: Any) -> None:
+    """Пишет расход токенов и денег в контекст прогона."""
+    prompt, completion, total = _usage_parts(result)
+    choice = MODEL_CHOICES.get(ctx.model_choice or DEFAULT_CHOICE) or MODEL_CHOICES[DEFAULT_CHOICE]
+    ctx.tokens += total
+    ctx.cost_usd += (prompt * float(choice.get("price_in") or 0) + completion * float(choice.get("price_out") or 0)) / 1_000_000.0
+
+
+def _compact_history(messages: List[dict]) -> None:
+    """Сжимает старые результаты инструментов: они уже использованы, но весят больше всего."""
+    indexes = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    # в резервном JSON-протоколе результаты лежат в user-сообщениях
+    indexes += [i for i, m in enumerate(messages) if m.get("role") == "user" and str(m.get("content") or "").startswith("Результат инструмента")]
+    for pos, idx in enumerate(indexes):
+        if pos >= len(indexes) - TOOL_RESULT_RECENT_FULL:
+            continue
+        content = str(messages[idx].get("content") or "")
+        if len(content) > TOOL_RESULT_KEEP_CHARS:
+            messages[idx]["content"] = content[:TOOL_RESULT_KEEP_CHARS] + " … [результат сжат для экономии токенов]"
+
+
+def _budget_exceeded(ctx) -> bool:
+    return bool(ctx.token_budget) and ctx.tokens >= int(ctx.token_budget)
 
 
 def _tool_payload(outcome: Dict[str, Any]) -> Dict[str, Any]:
@@ -262,7 +355,7 @@ async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) ->
             await ctx.log(f"Не удалось принудительно собрать отчёт: {exc}", level="error")
             continue
         ctx.llm_calls += 1
-        ctx.tokens += _usage_tokens(result)
+        _account(ctx, result)
         content, calls = _parse_message(result)
         if not calls:
             parsed = _extract_json(content or "")
@@ -294,10 +387,60 @@ async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) ->
     return any(call.get("name") == "build_report" for call in ctx.tool_calls)
 
 
+async def _ensure_data(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
+    """Не даёт агенту отвечать цифрами без данных: принудительно вызывает инструмент."""
+    if ctx.tool_calls:
+        return True
+    candidates = [name for name in ("dataset_overview", "search_messages", "list_datasets") if name in ctx.allowed_tools]
+    if not candidates or ctx.out_of_time() or not tools_schema:
+        return False
+    tool_name = candidates[0]
+    messages.append(
+        {
+            "role": "user",
+            "content": f"Ты ещё не обращался к данным. Вызови инструмент {tool_name} прямо сейчас и работай только с его результатами.",
+        }
+    )
+    try:
+        result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=1200, force_tool=tool_name)
+    except Exception as exc:
+        await ctx.log(f"Не удалось принудительно вызвать инструмент: {exc}", level="error")
+        return False
+    ctx.llm_calls += 1
+    _account(ctx, result)
+    content, calls = _parse_message(result)
+    if not calls:
+        parsed = _extract_json(content or "")
+        if parsed and parsed.get("tool"):
+            calls = [
+                {
+                    "id": "forced",
+                    "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)},
+                }
+            ]
+    if not calls:
+        return False
+    for call in calls:
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "")
+        if name not in ctx.allowed_tools:
+            continue
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except Exception:
+            args = {}
+        outcome = await _run_tool(ctx, name, args)
+        messages.append(
+            {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
+        )
+    return bool(ctx.tool_calls)
+
+
 async def run_agent(ctx) -> Dict[str, Any]:
     """Основной цикл агента. Возвращает итоговый ответ, шаги и артефакты."""
     allowed = sorted(ctx.allowed_tools)
-    tools_schema = openai_tools(allowed)
+    tools_schema = openai_tools(allowed, compact=True)
     use_tools = bool(tools_schema)
     messages: List[dict] = [
         {"role": "system", "content": system_prompt(ctx)},
@@ -310,7 +453,14 @@ async def run_agent(ctx) -> Dict[str, Any]:
         )
     tool_call_count = 0
     answer = ""
-    await ctx.event({"type": "start", "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"), "tools": allowed})
+    await ctx.event(
+        {
+            "type": "start",
+            "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"),
+            "tools": allowed,
+            "token_budget": ctx.token_budget,
+        }
+    )
 
     for step in range(1, MAX_STEPS + 1):
         if ctx.out_of_time():
@@ -319,6 +469,10 @@ async def run_agent(ctx) -> Dict[str, Any]:
         if tool_call_count >= MAX_TOOL_CALLS:
             ctx.notes.append("достигнут лимит вызовов инструментов")
             break
+        if _budget_exceeded(ctx):
+            ctx.notes.append(f"достигнут бюджет прогона: {ctx.tokens} токенов из {ctx.token_budget}")
+            break
+        _compact_history(messages)
         try:
             result, tools_ok = await _call_llm(ctx, messages, tools_schema if use_tools else None)
         except Exception as exc:
@@ -331,7 +485,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
         if use_tools and not tools_ok:
             use_tools = False
         ctx.llm_calls += 1
-        ctx.tokens += _usage_tokens(result)
+        _account(ctx, result)
         content, calls = _parse_message(result)
 
         if use_tools and calls:
@@ -391,8 +545,14 @@ async def run_agent(ctx) -> Dict[str, Any]:
             }
         )
 
+    # Агент не должен отвечать цифрами, не обратившись к данным
+    if not ctx.tool_calls:
+        await _ensure_data(ctx, messages, tools_schema)
+        if not ctx.tool_calls:
+            ctx.notes.append("агент не вызвал ни одного инструмента — ответ не подтверждён данными")
+
     # Если просили отчёт — добиваемся, чтобы файл действительно был собран
-    if wants_report(ctx.task):
+    if wants_report(ctx.task) and not _budget_exceeded(ctx):
         reported = await _ensure_report(ctx, messages, tools_schema)
         if reported:
             messages.append(
@@ -405,7 +565,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
                 brief_result, _ = await _call_llm(ctx, messages, None, max_tokens=900)
                 brief = (_parse_message(brief_result)[0] or "").strip()
                 ctx.llm_calls += 1
-                ctx.tokens += _usage_tokens(brief_result)
+                _account(ctx, brief_result)
                 if brief:
                     answer = brief
             except Exception:
@@ -420,9 +580,12 @@ async def run_agent(ctx) -> Dict[str, Any]:
             final_result, _ = await _call_llm(ctx, messages, None, max_tokens=2500)
             answer = (_parse_message(final_result)[0] or "").strip()
             ctx.llm_calls += 1
-            ctx.tokens += _usage_tokens(final_result)
+            _account(ctx, final_result)
         except Exception as exc:
             answer = "Не удалось получить итоговый ответ: " + str(exc)
+
+    if answer and not ctx.tool_calls:
+        answer = NO_DATA_WARNING + "\n\n" + answer
 
     if answer:
         await ctx.event({"type": "answer", "text": answer})
@@ -430,6 +593,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
         "llm_calls": ctx.llm_calls,
         "tool_calls": len(ctx.tool_calls),
         "tokens": ctx.tokens,
+        "cost_usd": round(ctx.cost_usd, 4),
+        "token_budget": ctx.token_budget,
+        "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"),
         "artifacts": len(ctx.artifacts),
         "tools_used": sorted({c["name"] for c in ctx.tool_calls}),
         "notes": ctx.notes,

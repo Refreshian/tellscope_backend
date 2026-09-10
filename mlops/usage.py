@@ -63,19 +63,42 @@ def _reload_prices(cur):
             print("llm usage prices reload err:", exc)
 
 
+def _pricing_seeds() -> list[tuple]:
+    """Цены берём из mlops/lock.yaml (секция pricing), иначе — разумные значения по умолчанию."""
+    default = [
+        ("vllm", "*", 0.0, 0.0),
+        ("aitunnel", "*", 3.0, 15.0),
+    ]
+    try:
+        from .lock import load_lock
+
+        pricing = (load_lock() or {}).get("pricing") or {}
+        rows = []
+        for provider, models in pricing.items():
+            if not isinstance(models, dict):
+                continue
+            for model, price in models.items():
+                if isinstance(price, dict):
+                    rows.append(
+                        (str(provider), str(model), float(price.get("in") or 0), float(price.get("out") or 0))
+                    )
+        return rows or default
+    except Exception:
+        return default
+
+
 def ensure():
     try:
         conn = _db()
         cur = conn.cursor()
         _ensure_tables(cur)
-        seeds = [
-            ("vllm", "*", 1.0, 1.0),
-            ("aitunnel", "*", 5.0, 15.0),
-        ]
+        seeds = _pricing_seeds()
         for provider, model, ip, op in seeds:
             cur.execute(
                 "INSERT INTO llm_pricing (provider, model, input_price_usd_per_1m, output_price_usd_per_1m) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (provider, model) DO NOTHING",
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (provider, model) DO UPDATE SET "
+                "input_price_usd_per_1m = EXCLUDED.input_price_usd_per_1m, "
+                "output_price_usd_per_1m = EXCLUDED.output_price_usd_per_1m",
                 (provider, model, ip, op))
         conn.commit()
         _reload_prices(cur)
@@ -112,17 +135,30 @@ def write(user_id=None, case=None, provider="", model="", status="ok",
         print("llm usage write err:", exc)
 
 
-def aggregate():
+def aggregate(date_from=None, date_to=None):
     out = []
     try:
         conn = _db()
         cur = conn.cursor()
         _ensure_tables(cur)
-        cur.execute(
+        sql = (
             "SELECT COALESCE(user_id, 0), COALESCE(case_id, ''), COALESCE(provider, ''), COALESCE(model, ''), "
             "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
             "COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) "
-            "FROM llm_usage GROUP BY 1,2,3,4 ORDER BY 5 DESC")
+            "FROM llm_usage "
+        )
+        conds = []
+        params = []
+        if date_from:
+            conds.append("(ts AT TIME ZONE 'UTC')::date >= %s::date")
+            params.append(date_from)
+        if date_to:
+            conds.append("(ts AT TIME ZONE 'UTC')::date <= %s::date")
+            params.append(date_to)
+        if conds:
+            sql += "WHERE " + " AND ".join(conds) + " "
+        sql += "GROUP BY 1,2,3,4 ORDER BY 5 DESC"
+        cur.execute(sql, params)
         for r in cur.fetchall():
             out.append({
                 "user_id": r[0], "case_id": r[1], "provider": r[2], "model": r[3],
@@ -151,7 +187,7 @@ def reset_ctx(token):
 
 def current():
     return _CTX.get() or {}
-def aggregate_days(user_id=None, case=None, provider=None, model=None, days=30):
+def aggregate_days(user_id=None, case=None, provider=None, model=None, days=30, date_from=None, date_to=None):
     out = []
     try:
         conn = _db()
@@ -161,19 +197,32 @@ def aggregate_days(user_id=None, case=None, provider=None, model=None, days=30):
                "COALESCE(user_id, 0), COALESCE(case_id, ''), COALESCE(provider, ''), COALESCE(model, ''), "
                "COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
                "COALESCE(SUM(total_tokens),0), COALESCE(SUM(cost_usd),0) "
-               "FROM llm_usage WHERE ts >= now() - (%s || ' days')::interval ")
+               "FROM llm_usage WHERE ")
         conds = []
-        params = [int(days or 30)]
+        params = []
+        if date_from or date_to:
+            if date_from:
+                conds.append("(ts AT TIME ZONE 'UTC')::date >= %s::date")
+                params.append(date_from)
+            if date_to:
+                conds.append("(ts AT TIME ZONE 'UTC')::date <= %s::date")
+                params.append(date_to)
+        else:
+            conds.append("ts >= now() - (%s || ' days')::interval ")
+            params.append(int(days or 30))
         if user_id is not None:
-            conds.append("user_id = %s"); params.append(int(user_id))
+            conds.append("user_id = %s")
+            params.append(int(user_id))
         if case:
-            conds.append("case_id = %s"); params.append(case)
+            conds.append("case_id = %s")
+            params.append(case)
         if provider:
-            conds.append("provider = %s"); params.append(provider)
+            conds.append("provider = %s")
+            params.append(provider)
         if model:
-            conds.append("model = %s"); params.append(model)
-        if conds:
-            sql += " AND " + " AND ".join(conds)
+            conds.append("model = %s")
+            params.append(model)
+        sql += " AND ".join(conds)
         sql += " GROUP BY 1,2,3,4,5 ORDER BY 1"
         cur.execute(sql, params)
         for r in cur.fetchall():
