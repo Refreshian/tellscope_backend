@@ -43,25 +43,34 @@ def _full_period(ctx, idx: int, lo, hi):
     "popular_hooks",
     title="Популярные инфоповоды",
     description=(
-        "Список инфоповодов датасета (фразы с наибольшим числом сообщений) с количеством упоминаний. "
-        "Используй, чтобы выбрать темы для детального анализа и цепочек распространения."
+        "Инфоповоды датасета: самые частые фразы, извлечённые из сообщений именно этого датасета, "
+        "с точным числом упоминаний. Темы не переносятся из других проектов — используй то, что вернул инструмент."
     ),
     parameters={
         "type": "object",
         "properties": {
             "index": {"type": "integer"},
             "limit": {"type": "integer", "description": "сколько поводов вернуть (по умолчанию 15, максимум 40)"},
+            "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD или unix-секунды"},
+            "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD или unix-секунды"},
         },
     },
     group="graph",
+    timeout=300.0,
 )
-async def popular_hooks(ctx, index: Optional[int] = None, limit: int = 15):
+async def popular_hooks(ctx, index: Optional[int] = None, limit: int = 15, min_date: Any = None, max_date: Any = None):
     m = _m()
-    idx, _ = guard(ctx, index)
+    idx, index_name = guard(ctx, index)
     limit = max(1, min(int(limit or 15), 40))
-    data = await _guard_call(m.popular_hooks, user=ctx.user, index=idx, limit=limit)
+    lo, hi = dates(ctx, min_date, max_date)
+    data = await _guard_call(m.popular_hooks, user=ctx.user, index=idx, limit=limit, min_date=lo, max_date=hi)
     payload = jsonable_encoder(data)
-    return {"index": idx, "hooks": compact(payload.get("values") or payload, max_items=limit, max_str=120)}
+    return {
+        "index": idx,
+        "index_name": index_name,
+        "hooks": compact(payload.get("values") or [], max_items=limit, max_str=120),
+        "note": payload.get("note") or "фразы извлечены из сообщений датасета",
+    }
 
 
 @tool(

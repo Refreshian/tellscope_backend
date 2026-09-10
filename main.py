@@ -1938,24 +1938,252 @@ HOOK_CANDIDATES = [
 ]
 
 
+
+
+
+
+
+
+
+
+# ===================== Инфоповоды датасета (данные, не список) =====================
+# Раньше здесь был захардкоженный список KFC-фраз: на других датасетах он выдавал чужие
+# темы («Комбо», «просрочка») как инфоповоды проекта. Теперь темы извлекаются из самих
+# сообщений датасета: фразы (1–3 слова) схлопываются по нормальной форме слова через
+# pymorphy3, а точные счётчики подтверждаются запросами в Elasticsearch.
+
+_RU_STOPWORDS = {
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она", "так",
+    "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее", "мне", "было",
+    "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь", "когда", "даже", "ну", "вдруг",
+    "ли", "если", "уже", "или", "ни", "быть", "был", "него", "до", "вас", "нибудь", "опять", "уж",
+    "вам", "ведь", "там", "потом", "себя", "ничего", "ей", "может", "они", "тут", "где", "есть",
+    "надо", "ней", "для", "мы", "тебя", "их", "чем", "была", "сам", "чтоб", "без", "будто", "чего",
+    "раз", "тоже", "себе", "под", "будет", "ж", "тогда", "кто", "этот", "того", "потому", "этого",
+    "какой", "совсем", "ним", "здесь", "этом", "один", "почти", "мой", "тем", "чтобы", "нее",
+    "сейчас", "были", "куда", "зачем", "всех", "никогда", "можно", "при", "наконец", "два", "об",
+    "другой", "хоть", "после", "над", "больше", "тот", "через", "эти", "нас", "про", "всего",
+    "них", "какая", "много", "разве", "три", "эту", "моя", "впрочем", "хорошо", "свою", "этой",
+    "перед", "иногда", "лучше", "чуть", "том", "нельзя", "такой", "им", "более", "всегда", "конец",
+    "всю", "между", "эта", "которые", "который", "которая", "которого", "привет", "спасибо", "пожалуйста",
+}
+
+# Служебные и рекламные обороты: как тема проекта они бессмысленны
+_BOILERPLATE = {
+    "изображение", "изображении", "изображения", "иллюстративный", "иллюстрация", "характер",
+    "другими", "словами", "материал", "материалы", "источник", "фото", "фотография", "реклама",
+    "подробнее", "ссылке", "ссылкам", "перейти", "подписаться", "подписывайтесь", "канал",
+    "комментарии", "комментарий", "лайк", "репост", "поделиться", "далее", "также", "однако",
+    "поэтому", "кстати", "впрочем", "например", "короче", "вообще", "конечно", "правда", "итоге",
+    "текст", "тексте", "тексты", "картинка", "картинке", "видео", "ролик", "запись", "пост",
+    "год", "года", "году", "годы", "годах", "годом", "одно", "один", "одна", "одной", "номер",
+}
+
+_RU_SUFFIXES = (
+    "иями", "иях", "ией", "ями", "ами", "ию", "ия", "ии", "ей", "ой", "ый", "ий", "ая", "яя",
+    "ое", "ее", "ые", "ие", "ов", "ев", "ам", "ям", "ах", "ях", "ом", "ем", "ую", "юю", "ею",
+    "ого", "его", "ому", "ему", "ыми", "ими", "а", "я", "о", "е", "у", "ю", "ы", "и", "ь", "й",
+)
+
+_MORPH = None
+_MORPH_TRIED = False
+
+
+def _morph():
+    """Морфологический анализатор для схлопывания словоформ (если доступен)."""
+    global _MORPH, _MORPH_TRIED
+    if _MORPH_TRIED:
+        return _MORPH
+    _MORPH_TRIED = True
+    for module_name in ("pymorphy3", "pymorphy2"):
+        try:
+            module = __import__(module_name)
+            _MORPH = module.MorphAnalyzer()
+            break
+        except Exception:
+            continue
+    return _MORPH
+
+
+def _lemma_key(phrase: str) -> str:
+    """«дороги», «дорожного», «дорожной» → «дорога»; «года», «году» → «год»."""
+    morph = _morph()
+    words = []
+    for word in str(phrase or "").split():
+        if morph is not None:
+            try:
+                words.append(morph.parse(word)[0].normal_form)
+                continue
+            except Exception:
+                pass
+        stem = word
+        for suffix in _RU_SUFFIXES:
+            if len(stem) - len(suffix) >= 3 and stem.endswith(suffix):
+                stem = stem[: -len(suffix)]
+                break
+        words.append(stem)
+    return " ".join(words)
+
+
+def _text_for_mining(raw: str) -> str:
+    import re as _re
+
+    text = (raw or "").lower()
+    text = _re.sub(r"https?://\S+|www\.\S+", " ", text)
+    text = _re.sub(r"[@#][\w\-]+", " ", text)
+    text = _re.sub(r"[^а-яёa-z\s\-]", " ", text)
+    text = _re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _is_noise(phrase: str) -> bool:
+    words = phrase.split()
+    if any(word in _BOILERPLATE for word in words):
+        return True
+    if all(len(word) < 4 for word in words):
+        return True
+    return False
+
+
+def mine_popular_hooks(index_name, min_date=None, max_date=None, limit=12, sample_size=6000):
+    """Темы датасета: фразы и слова из сообщений, схлопнутые по нормальной форме.
+
+    Возвращает [{'phrase', 'count', 'words'}]: count — сумма подтверждённых Elasticsearch
+    упоминаний всех словоформ темы.
+    """
+    from sklearn.feature_extraction.text import CountVectorizer
+
+    filters = []
+    if min_date or max_date:
+        rng = {}
+        if min_date:
+            rng["gte"] = int(min_date)
+        if max_date:
+            rng["lte"] = int(max_date)
+        filters.append({"range": {"timeCreate": rng}})
+    base_query = {"bool": {"filter": filters}} if filters else {"match_all": {}}
+
+    body = {
+        "size": int(sample_size),
+        "_source": ["text"],
+        "query": {"function_score": {"query": base_query, "random_score": {"seed": 42, "field": "_seq_no"}}},
+    }
+    try:
+        res = es.search(index=index_name, body=body)
+    except Exception as exc:
+        print(f"[popular-hooks] не удалось получить выборку: {exc}")
+        return []
+
+    cleaned = [t for t in (_text_for_mining((h.get("_source") or {}).get("text") or "") for h in res["hits"]["hits"]) if len(t) >= 20]
+    if len(cleaned) < 150:
+        return []
+
+    vectorizer = CountVectorizer(
+        ngram_range=(1, 3),
+        min_df=3,
+        max_features=6000,
+        binary=True,
+        token_pattern=r"(?u)\b[а-яёa-z][а-яёa-z\-]{2,}\b",
+        stop_words=list(_RU_STOPWORDS),
+    )
+    try:
+        matrix = vectorizer.fit_transform(cleaned)
+    except ValueError:
+        return []
+    terms = list(vectorizer.get_feature_names_out())
+    doc_freq = matrix.sum(axis=0).A1
+    order = doc_freq.argsort()[::-1]
+
+    multiword, single = [], []
+    for idx in order:
+        phrase = str(terms[idx]).strip()
+        if _is_noise(phrase):
+            continue
+        (multiword if len(phrase.split()) > 1 else single).append(phrase)
+        if len(multiword) >= 70 and len(single) >= 60:
+            break
+
+    cache = {}
+
+    def count_phrase(phrase: str) -> int:
+        if phrase in cache:
+            return cache[phrase]
+        q = {"bool": {"must": [{"match_phrase": {"text": phrase}}], "filter": filters}}
+        try:
+            total = int(es.count(index=index_name, body={"query": q}).get("count") or 0)
+        except Exception:
+            total = 0
+        cache[phrase] = total
+        return total
+
+    def collect(phrases):
+        counted = []
+        for phrase in phrases:
+            total = count_phrase(phrase)
+            if total >= 5:
+                counted.append({"phrase": phrase, "count": total, "words": len(phrase.split()), "key": _lemma_key(phrase)})
+        grouped = {}
+        for item in counted:
+            bucket = grouped.setdefault(item["key"], {"total": 0, "best": item})
+            bucket["total"] += item["count"]
+            if item["count"] > bucket["best"]["count"]:
+                bucket["best"] = item
+        rows = []
+        for bucket in grouped.values():
+            best = dict(bucket["best"])
+            best["count"] = bucket["total"]
+            rows.append(best)
+        rows.sort(key=lambda item: -item["count"])
+        return rows
+
+    phrases = collect(multiword)
+    words = collect(single)
+
+    def merge_into(result, item):
+        """Добавляет тему, схлопывая перекрывающиеся формулировки одной и той же темы."""
+        for pos, keep in enumerate(result):
+            related = item["phrase"] in keep["phrase"] or keep["phrase"] in item["phrase"]
+            if not related:
+                continue
+            if item["words"] > keep["words"] and item["count"] >= keep["count"] * 0.7:
+                result[pos] = item  # более полная формулировка при сопоставимой частоте
+            return
+        result.append(item)
+
+    result = []
+    multi_quota = max(3, int(limit * 0.6))
+    for item in phrases:
+        if len([row for row in result if row["words"] > 1]) >= multi_quota:
+            break
+        merge_into(result, {"phrase": item["phrase"], "count": item["count"], "words": item["words"]})
+    for item in words:
+        if len(result) >= int(limit):
+            break
+        merge_into(result, {"phrase": item["phrase"], "count": item["count"], "words": item["words"]})
+    for item in phrases:
+        if len(result) >= int(limit):
+            break
+        merge_into(result, {"phrase": item["phrase"], "count": item["count"], "words": item["words"]})
+    return result[: int(limit)]
+
+
 @app.get('/popular-hooks', tags=['reports'])
-async def popular_hooks(user: User = Depends(current_user), index: int = None, limit: int = 12):
-    """Популярные инфоповоды датасета: фразы с наибольшим числом сообщений."""
+async def popular_hooks(user: User = Depends(current_user), index: int = None, limit: int = 12,
+                        min_date: int = None, max_date: int = None):
+    """Популярные инфоповоды датасета: частые фразы, извлечённые из самих сообщений датасета."""
     indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
     index_name = indexes.get(index) or indexes.get(str(index))
     if not index_name:
         raise HTTPException(status_code=404, detail='Индекс не найден')
-    out = []
-    for phrase in HOOK_CANDIDATES:
-        try:
-            res = es.count(index=index_name, body={'query': {'match_phrase': {'text': phrase}}})
-            n = int(res.get('count') or 0)
-        except Exception:
-            n = 0
-        if n > 0:
-            out.append({'phrase': phrase, 'count': n})
-    out.sort(key=lambda x: -x['count'])
-    return {'values': out[:max(1, min(limit, 40))]}
+    _guard_index_access(user, index)
+    limit = max(1, min(int(limit or 12), 40))
+    values = mine_popular_hooks(index_name, min_date=min_date, max_date=max_date, limit=limit)
+    return {
+        'values': values,
+        'source': 'data',
+        'method': 'частые фразы (1-3 слова) из сообщений датасета, счётчики подтверждены Elasticsearch',
+        'note': 'Фразы извлечены из самих данных: список не задаётся вручную и не переносится из других проектов.',
+    }
 
 
 @app.get('/chain-graph', tags=['reports'])
