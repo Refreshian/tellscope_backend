@@ -1930,6 +1930,114 @@ async def download_report(user_id: str, folder_name: str, file_name: str, user: 
     return FileResponse(path, media_type=media, filename=safe_name)
 
 
+@app.get('/chain-graph', tags=['reports'])
+async def chain_graph(
+    user: User = Depends(current_user),
+    index: int = None,
+    phrase: str = None,
+    min_date: int = None,
+    max_date: int = None,
+):
+    """Цепочка распространения инфоповода: первый пост -> распространители.
+
+    Группирует сообщения по точному тексту (дедупликация), определяет первоисточник
+    в каждой группе (самое раннее сообщение) и строит граф автор -> распространители.
+    """
+    from collections import defaultdict, Counter
+    if not phrase or not phrase.strip():
+        raise HTTPException(status_code=400, detail='Укажите тему (фразу) для построения цепочки')
+    indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+    index_name = indexes.get(index) or indexes.get(str(index))
+    if not index_name:
+        raise HTTPException(status_code=404, detail='Индекс не найден')
+    body = {
+        'size': 3000,
+        '_source': ['text', 'title', 'timeCreate', 'hub', 'hubtype', 'authorObject', 'url', 'likesCount', 'commentsCount', 'duplicateCount', 'toneMark'],
+        'query': {'bool': {'must': [{'match_phrase': {'text': phrase}}]}},
+        'sort': [{'timeCreate': {'order': 'asc'}}],
+    }
+    if min_date or max_date:
+        rng = {}
+        if min_date: rng['gte'] = min_date
+        if max_date: rng['lte'] = max_date
+        body['query']['bool'].setdefault('filter', []).append({'range': {'timeCreate': rng}})
+    try:
+        res = es.search(index=index_name, body=body)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Ошибка поиска: {exc}')
+    hits = res.get('hits', {}).get('hits', [])
+    docs = []
+    for h in hits:
+        s = h.get('_source') or {}
+        au = (s.get('authorObject') or {})
+        docs.append({
+            'text': (s.get('text') or s.get('title') or '').strip(),
+            't': int(float(s.get('timeCreate') or 0)),
+            'hub': s.get('hub') or 'unknown',
+            'hubtype': s.get('hubtype') or '',
+            'author': au.get('fullname') or (s.get('hub') or 'unknown'),
+            'author_url': au.get('url') or '',
+            'author_type': au.get('author_type') or '',
+            'url': s.get('url') or '',
+            'likes': int(s.get('likesCount') or 0),
+            'comments': int(s.get('commentsCount') or 0),
+            'dup': int(s.get('duplicateCount') or 0),
+            'tone': str(s.get('toneMark')),
+        })
+    groups = defaultdict(list)
+    for d in docs:
+        key = ' '.join((d['text'] or '')[:220].split()).lower()
+        groups[key].append(d)
+    nodes = {}
+    links = Counter()
+    clusters = []
+    for gid, items in groups.items():
+        items.sort(key=lambda x: x['t'])
+        origin = items[0]
+        clusters.append({'id': f'c{len(clusters)}', 'name': (origin['text'] or '')[:80], 'size': len(items), 'url': origin['url'], 'hub': origin['hub']})
+        oid = origin['author']
+        if oid not in nodes:
+            nodes[oid] = {'id': oid, 'label': oid, 'type': origin['author_type'] or origin['hubtype'] or 'автор',
+                          'hub': origin['hub'], 'posts_count': 0, 'audience': 0, 'url': origin['author_url'] or origin['url'],
+                          'topics': [{'text': (origin['text'] or '')[:160], 'url': origin['url']}]}
+        nodes[oid]['posts_count'] += 1
+        for d in items[1:]:
+            aid = d['author']
+            if aid not in nodes:
+                nodes[aid] = {'id': aid, 'label': aid, 'type': d['author_type'] or d['hubtype'] or 'автор',
+                              'hub': d['hub'], 'posts_count': 0, 'audience': 0, 'url': d['author_url'] or d['url'],
+                              'topics': [{'text': (d['text'] or '')[:160], 'url': d['url']}]}
+            nodes[aid]['posts_count'] += 1
+            links[(oid, aid)] += 1
+    links_list = [{'source': s, 'target': t, 'value': v} for (s, t), v in links.most_common(4000)]
+    timeline_buckets = Counter()
+    if docs:
+        t0 = docs[0]['t']
+        for d in docs:
+            timeline_buckets[(d['t'] - t0) // 3600] += 1
+        hs = sorted(timeline_buckets)
+        cum, run = [], 0
+        for h in hs:
+            run += timeline_buckets[h]
+            cum.append({'hour': h, 'count': timeline_buckets[h], 'cumulative': run})
+    else:
+        cum = []
+    hub_counts = Counter(d['hub'] for d in docs)
+    top_authors = sorted(nodes.values(), key=lambda n: -n['posts_count'])[:15]
+    return {
+        'graph': {'nodes': list(nodes.values()), 'links': links_list, 'clusters': clusters},
+        'timeline': cum,
+        'stats': {
+            'found': len(docs),
+            'unique_texts': len(groups),
+            'hubs': hub_counts.most_common(10),
+            'top_authors': [{'author': a['id'], 'posts': a['posts_count'], 'hub': a['hub'], 'url': a['url']} for a in top_authors],
+            'first': {'author': docs[0]['author'], 'hub': docs[0]['hub'], 'url': docs[0]['url'], 'date': docs[0]['t']} if docs else None,
+            'phrase': phrase,
+        },
+    }
+
+
 @app.get('/ai-analytics', tags=['ai analytics'])
 async def ai_analytics_get(
     user: User = Depends(current_user),
