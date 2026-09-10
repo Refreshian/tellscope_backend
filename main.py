@@ -1930,6 +1930,34 @@ async def download_report(user_id: str, folder_name: str, file_name: str, user: 
     return FileResponse(path, media_type=media, filename=safe_name)
 
 
+HOOK_CANDIDATES = [
+    'Курочка с душком', 'Союзмультфильм', 'ведро крыльев', 'Honkai', 'Stranger Things',
+    'Миньоны', 'босс кфс', 'крылышки КФС', 'франчайзи', 'мукбанг', 'Экспресс Комбо',
+    'скидка 25%', 'отравились', 'просрочка', 'Ростикс уволит', 'Big Tasty', 'Шефбургер',
+    'Комбо', 'коллаборация', 'закрытие ресторанов',
+]
+
+
+@app.get('/popular-hooks', tags=['reports'])
+async def popular_hooks(user: User = Depends(current_user), index: int = None, limit: int = 12):
+    """Популярные инфоповоды датасета: фразы с наибольшим числом сообщений."""
+    indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+    index_name = indexes.get(index) or indexes.get(str(index))
+    if not index_name:
+        raise HTTPException(status_code=404, detail='Индекс не найден')
+    out = []
+    for phrase in HOOK_CANDIDATES:
+        try:
+            res = es.count(index=index_name, body={'query': {'match_phrase': {'text': phrase}}})
+            n = int(res.get('count') or 0)
+        except Exception:
+            n = 0
+        if n > 0:
+            out.append({'phrase': phrase, 'count': n})
+    out.sort(key=lambda x: -x['count'])
+    return {'values': out[:max(1, min(limit, 40))]}
+
+
 @app.get('/chain-graph', tags=['reports'])
 async def chain_graph(
     user: User = Depends(current_user),
