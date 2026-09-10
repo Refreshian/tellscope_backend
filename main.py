@@ -1869,6 +1869,67 @@ def media_rating(index: int = None, min_date: int = None, max_date: int = None, 
     )
 
 
+REPORTS_DIR_NAME = 'reports_directory'
+
+
+def _reports_base_dir(user_id: str) -> str:
+    return f'/home/dev/tellscope_app/tellscope_backend/data/{user_id}/{REPORTS_DIR_NAME}'
+
+
+@app.get('/reports/{user_id}', tags=['reports'])
+async def list_reports(user_id: str, user: User = Depends(current_user)):
+    """Список готовых отчётов пользователя, сгруппированных по папкам-датасетам."""
+    if str(getattr(user, 'id', '')) != str(user_id):
+        raise HTTPException(status_code=403, detail='Нет доступа')
+    root = _reports_base_dir(user_id)
+    values = []
+    if os.path.isdir(root):
+        for folder in sorted(os.listdir(root)):
+            fdir = os.path.join(root, folder)
+            if not os.path.isdir(fdir):
+                continue
+            files = []
+            for name in sorted(os.listdir(fdir)):
+                fp = os.path.join(fdir, name)
+                if not os.path.isfile(fp):
+                    continue
+                st = os.stat(fp)
+                files.append({
+                    'name': name,
+                    'size': st.st_size,
+                    'modified': datetime.fromtimestamp(st.st_mtime).isoformat(),
+                })
+            if files:
+                values.append({'folder': folder, 'files': files})
+    return {'values': values}
+
+
+@app.get('/reports/download/{user_id}/{folder_name}/{file_name}', tags=['reports'])
+async def download_report(user_id: str, folder_name: str, file_name: str, user: User = Depends(current_user)):
+    """Скачивание файла отчёта."""
+    if str(getattr(user, 'id', '')) != str(user_id):
+        raise HTTPException(status_code=403, detail='Нет доступа')
+    safe_folder = os.path.basename(folder_name)
+    safe_name = os.path.basename(file_name)
+    path = os.path.join(_reports_base_dir(user_id), safe_folder, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail='Файл не найден')
+    from fastapi.responses import FileResponse
+    low = safe_name.lower()
+    media = 'application/octet-stream'
+    if low.endswith('.pdf'):
+        media = 'application/pdf'
+    elif low.endswith('.docx'):
+        media = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    elif low.endswith('.png'):
+        media = 'image/png'
+    elif low.endswith('.html'):
+        media = 'text/html; charset=utf-8'
+    elif low.endswith('.md'):
+        media = 'text/markdown; charset=utf-8'
+    return FileResponse(path, media_type=media, filename=safe_name)
+
+
 @app.get('/ai-analytics', tags=['ai analytics'])
 async def ai_analytics_get(
     user: User = Depends(current_user),
