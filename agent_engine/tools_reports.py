@@ -2,6 +2,7 @@
 """Инструменты отчётов: графики, сборка DOCX/PDF, сохранение во вкладке «Отчёты»."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import textwrap
@@ -405,16 +406,46 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
 )
 async def build_report(
     ctx,
-    title: str,
-    sections: List[Dict[str, Any]],
+    title: str = "",
+    sections: Any = None,
     subtitle: str = "",
     folder: Optional[str] = None,
     author: str = "агент Tellscope",
 ):
+    if isinstance(sections, str):
+        try:
+            sections = json.loads(sections)
+        except Exception as exc:
+            raise ToolError(f"sections передан строкой, но это не JSON: {exc}") from exc
+    if isinstance(sections, dict):
+        sections = [sections]
     if not sections:
-        raise ToolError("Нужен хотя бы один раздел отчёта")
+        raise ToolError(
+            "Нужны заголовок и разделы: вызовите build_report с аргументами "
+            '{"title": "название отчёта", "sections": [{"heading": "раздел", "text": "текст", '
+            '"bullets": ["вывод"], "chart_ids": ["chart1"], "citations": ["https://..."]}]}'
+        )
     if not title or not str(title).strip():
-        raise ToolError("Укажите заголовок отчёта")
+        raise ToolError('Укажите title — название отчёта, например "Аналитический отчёт по бренду"')
+    sections = [s for s in sections if isinstance(s, dict) and (s.get("heading") or s.get("text"))]
+    if not sections:
+        raise ToolError("Ни один раздел не содержит heading или text — проверьте структуру sections")
+    for section in sections:
+        citations = section.get("citations")
+        if isinstance(citations, str):
+            section["citations"] = [{"title": citations, "url": citations}]
+        elif isinstance(citations, list):
+            normalized = []
+            for item in citations:
+                if isinstance(item, str):
+                    normalized.append({"title": item, "url": item})
+                elif isinstance(item, dict):
+                    normalized.append(item)
+            section["citations"] = normalized
+        if isinstance(section.get("bullets"), str):
+            section["bullets"] = [section["bullets"]]
+        if isinstance(section.get("chart_ids"), str):
+            section["chart_ids"] = [section["chart_ids"]]
     folder_name = _safe_name(folder or ctx.folder or "Агент", 40)
     out_dir = _reports_dir(ctx.user_id, folder_name)
     stamp = datetime.now().strftime("%Y%m%d_%H%M")

@@ -425,7 +425,8 @@ def _guard_call(method, *args, **kwargs):
     title="Тональность и авторы",
     description=(
         "Тональный ландшафт датасета: распределение тональности по площадкам, авторы-источники "
-        "негатива и позитива. Используй для оценки репутационного фона и поиска драйверов негатива."
+        "негатива и позитива. Считается агрегациями по Elasticsearch, работает быстро на больших датасетах. "
+        "Используй для оценки репутационного фона и поиска драйверов негатива."
     ),
     parameters={
         "type": "object",
@@ -439,30 +440,63 @@ def _guard_call(method, *args, **kwargs):
     timeout=300.0,
 )
 async def tonality_summary(ctx, index: Optional[int] = None, min_date: Any = None, max_date: Any = None):
-    m = _m()
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
     lo, hi = _require_period(index_name, lo, hi)
-    data = await _guard_call(m.tonality_landscape, user=ctx.user, index=idx, min_date=lo, max_date=hi)
-    payload = jsonable_encoder(data)
-    values = payload.get("tonality_values") or {}
-    hubs = payload.get("tonality_hubs_values") or {}
+    base = _query(None, lo, hi, None)
+    hubs = _terms(index_name, "hub", 12, base)
+    by_hub = []
+    for item in hubs[:8]:
+        hub_query = {
+            "bool": {
+                "must": [{"term": {"hub": item.get("key")}}],
+                "filter": [{"range": {"timeCreate": {"gte": int(lo), "lte": int(hi)}}}],
+            }
+        }
+        by_hub.append({"hub": item.get("key"), "count": item.get("count"), "tonality": _tone_rows(_terms(index_name, "toneMark", 5, hub_query))})
+
+    def top_authors(tone: str, limit: int = 10) -> List[Dict[str, Any]]:
+        query = _query(None, lo, hi, tone)
+        body = {
+            "size": 1000,
+            "_source": ["authorObject", "hub"],
+            "query": query,
+            "sort": [{"likesCount": {"order": "desc"}}],
+        }
+        try:
+            res = _es().search(index=index_name, body=body)
+        except Exception:
+            return []
+        counter: Dict[str, int] = {}
+        for hit in (res.get("hits") or {}).get("hits") or []:
+            src = hit.get("_source") or {}
+            author = (src.get("authorObject") or {}).get("fullname") or src.get("hub") or ""
+            if author:
+                counter[author] = counter.get(author, 0) + 1
+        top = sorted(counter.items(), key=lambda kv: -kv[1])[:limit]
+        return [{"author": name, "posts_in_top1000": count} for name, count in top]
+
     return {
         "index": idx,
+        "index_name": index_name,
         "period": {"from": _iso(lo), "to": _iso(hi)},
-        "tonality_values": compact(values, max_items=40, max_str=120),
-        "tonality_by_hub": compact(hubs, max_items=20, max_str=120),
-        "top_negative_authors": compact(payload.get("negative_authors_values"), max_items=12, max_str=160),
-        "top_positive_authors": compact(payload.get("positive_authors_values"), max_items=12, max_str=160),
+        "tonality_total": _tone_rows(_terms(index_name, "toneMark", 5, base)),
+        "tonality_by_hub": by_hub,
+        "top_negative_authors": top_authors("negative"),
+        "top_positive_authors": top_authors("positive"),
+        "note": "Авторы считаются по 1000 самым вовлекающим сообщениям соответствующей тональности.",
     }
+
+
+SMI_FILTER = {"match_phrase": {"hubtype": "Онлайн-СМИ"}}
 
 
 @tool(
     "media_rating",
     title="Рейтинг СМИ",
     description=(
-        "Рейтинг СМИ по датасету: какие издания дают больше всего негатива и позитива, "
-        "а также лента публикаций СМИ по времени. Помогает отделить медийные волны от пользовательских."
+        "Рейтинг онлайн-СМИ (hubtype = «Онлайн-СМИ») по датасету: сколько негативных и позитивных публикаций "
+        "у каждого издания, плюс свежая лента публикаций СМИ со ссылками. Считается агрегациями Elasticsearch — быстро."
     ),
     parameters={
         "type": "object",
@@ -470,27 +504,71 @@ async def tonality_summary(ctx, index: Optional[int] = None, min_date: Any = Non
             "index": {"type": "integer"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
+            "limit": {"type": "integer", "description": "сколько изданий вернуть в каждом рейтинге (по умолчанию 12)"},
         },
     },
     group="analytics",
-    timeout=300.0,
+    timeout=240.0,
 )
-async def media_rating(ctx, index: Optional[int] = None, min_date: Any = None, max_date: Any = None):
-    m = _m()
+async def media_rating(ctx, index: Optional[int] = None, min_date: Any = None, max_date: Any = None, limit: int = 12):
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
     lo, hi = _require_period(index_name, lo, hi)
-    data = _guard_call(m.media_rating, index=idx, min_date=lo, max_date=hi, user=ctx.user)
-    payload = jsonable_encoder(data)
-    first = payload.get("first_graph") or {}
-    second = payload.get("second_graph") or []
+    limit = max(3, min(int(limit or 12), 30))
+    query = {
+        "bool": {
+            "must": [SMI_FILTER],
+            "filter": [{"range": {"timeCreate": {"gte": int(lo), "lte": int(hi)}}}],
+        }
+    }
+    body = {
+        "size": 0,
+        "query": query,
+        "aggs": {
+            "hubs": {
+                "terms": {"field": "hub", "size": 80},
+                "aggs": {"tone": {"terms": {"field": "toneMark", "size": 5}}},
+            }
+        },
+    }
+    try:
+        res = _es().search(index=index_name, body=body)
+    except Exception as exc:
+        raise ToolError(f"Ошибка агрегации по СМИ: {exc}") from exc
+    buckets = ((res.get("aggregations") or {}).get("hubs") or {}).get("buckets") or []
+    rows = []
+    for bucket in buckets:
+        tones = {b.get("key"): b.get("doc_count") for b in ((bucket.get("tone") or {}).get("buckets") or [])}
+        rows.append(
+            {
+                "media": bucket.get("key"),
+                "messages": bucket.get("doc_count"),
+                "negative": int(tones.get(-1) or 0),
+                "positive": int(tones.get(1) or 0),
+                "neutral": int(tones.get(0) or 0),
+            }
+        )
+    feed_body = {
+        "size": 20,
+        "_source": ["text", "title", "timeCreate", "hub", "toneMark", "url", "likesCount", "commentsCount", "authorObject"],
+        "query": query,
+        "sort": [{"timeCreate": {"order": "desc"}}],
+    }
+    feed = []
+    try:
+        feed_res = _es().search(index=index_name, body=feed_body)
+        feed = [_sample(h) for h in (feed_res.get("hits") or {}).get("hits") or []]
+    except Exception:
+        feed = []
     return {
         "index": idx,
+        "index_name": index_name,
         "period": {"from": _iso(lo), "to": _iso(hi)},
-        "negative_smi": compact(first.get("negative_smi"), max_items=15, max_str=120),
-        "positive_smi": compact(first.get("positive_smi"), max_items=15, max_str=120),
-        "media_feed": compact(second, max_items=20, max_str=200),
-        "media_feed_total": len(second),
+        "smi_messages_total": _exact_count(index_name, query),
+        "negative_smi": sorted(rows, key=lambda r: -r["negative"])[:limit],
+        "positive_smi": sorted(rows, key=lambda r: -r["positive"])[:limit],
+        "media_feed": feed,
+        "note": "СМИ определяется по hubtype «Онлайн-СМИ»; рейтинг — по числу публикаций соответствующей тональности.",
     }
 
 

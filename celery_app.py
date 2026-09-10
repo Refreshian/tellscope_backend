@@ -7,6 +7,7 @@ import psutil
 import signal
 import subprocess
 import logging
+import sys
 import time
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,36 @@ load_dotenv()
 # КРИТИЧЕСКИ ВАЖНО для CUDA
 multiprocessing.set_start_method('spawn', force=True)
 
+# --- Защита от самоубийства процесса API -------------------------------------
+# Модуль импортируется из main.py (строка "from celery_app import celery_app"), а очистка
+# ниже убивала процессы GPU и все python-процессы с "tellscope" в командной строке — то есть
+# сам uvicorn. Разрешаем очистку только реальному celery-воркеру (или явному флагу окружения)
+# и никогда не трогаем процесс API и supervisor.
+def _running_as_celery_worker() -> bool:
+    argv = " ".join(sys.argv).lower()
+    return "celery" in argv and "worker" in argv
+
+
+TELSCOPE_ALLOW_GPU_CLEANUP = os.environ.get("TELSCOPE_GPU_CLEANUP") == "1" or _running_as_celery_worker()
+
+_PROTECTED_MARKERS = ("uvicorn", "main:app", "supervisord", "gunicorn")
+
+
+def _protected_pids() -> set:
+    protected = {os.getpid(), os.getppid()}
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                cmd = " ".join(proc.info.get("cmdline") or []).lower()
+            except Exception:
+                continue
+            if any(marker in cmd for marker in _PROTECTED_MARKERS):
+                protected.add(proc.info["pid"])
+    except Exception:
+        pass
+    return protected
+
+
 def kill_gpu_processes():
     """Убиваем все процессы, использующие GPU 0"""
     try:
@@ -32,10 +63,14 @@ def kill_gpu_processes():
         if result.returncode == 0 and result.stdout.strip():
             pids = result.stdout.strip().split('\n')
             
+            protected = _protected_pids()
             for pid in pids:
                 pid = pid.strip()
                 if pid:
                     try:
+                        if int(pid) in protected:
+                            logger.info(f"⏭️ Процесс GPU {pid} защищён (API/supervisor) — пропускаем")
+                            continue
                         subprocess.run(f"kill -9 {pid}", shell=True)
                         logger.info(f"✅ Убит процесс GPU: {pid}")
                     except:
@@ -54,8 +89,11 @@ def cleanup_orphan_processes():
         kill_gpu_processes()
         
         current_pid = os.getpid()
+        protected = _protected_pids()
         for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
+                if proc.info['pid'] in protected:
+                    continue
                 if 'python' in proc.info['name'].lower() and proc.info['pid'] != current_pid:
                     cmdline = proc.info['cmdline'] or []
                     if any('tellscope' in str(cmd).lower() for cmd in cmdline):
@@ -69,15 +107,18 @@ def cleanup_orphan_processes():
     except Exception as e:
         logger.error(f"❌ Ошибка при очистке процессов: {e}")
 
-atexit.register(cleanup_orphan_processes)
+if TELSCOPE_ALLOW_GPU_CLEANUP:
+    atexit.register(cleanup_orphan_processes)
 
-def signal_handler(signum, frame):
-    logger.info(f"📡 Получен сигнал {signum}, очищаем ресурсы...")
-    cleanup_orphan_processes()
-    os._exit(0)
+    def signal_handler(signum, frame):
+        logger.info(f"📡 Получен сигнал {signum}, очищаем ресурсы...")
+        cleanup_orphan_processes()
+        os._exit(0)
 
-signal.signal(signal.SIGTERM, signal_handler)
-signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+else:
+    logger.info("Очистка GPU/процессов отключена: процесс не является celery-воркером")
 
 # Создаем приложение Celery
 celery_app = Celery('tellscope_backend')

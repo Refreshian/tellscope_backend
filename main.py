@@ -11942,3 +11942,118 @@ async def agent_connectors_delete(name: str, user: User = Depends(current_user))
         raise HTTPException(status_code=404, detail="Коннектор не найден")
     _agent_connectors_save(user.id, left)
     return {"ok": True, "removed": name}
+
+
+# ============================ MCP-сервер Tellscope ============================
+# Тот же реестр инструментов, что и у встроенного агента, доступен внешним клиентам
+# (Claude Desktop, LangFlow, n8n, собственные агенты) по протоколу MCP через JSON-RPC.
+
+class MCPCallRequest(BaseModel):
+    name: str
+    arguments: Optional[Dict[str, Any]] = None
+
+
+def _mcp_tools_payload() -> List[Dict[str, Any]]:
+    payload = []
+    for spec in _agent_catalog().get("groups", []):
+        for item in spec.get("tools", []):
+            payload.append(
+                {
+                    "name": item["name"],
+                    "title": item.get("title") or item["name"],
+                    "description": item["description"],
+                    "inputSchema": item.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+    return payload
+
+
+def _mcp_context(user, arguments: Dict[str, Any]):
+    """Контекст выполнения инструмента для внешнего MCP-клиента (без стрима в UI)."""
+    from agent_engine.context import AgentContext
+    from agent_engine.runs import artifacts_dir
+    import uuid as _uuid
+
+    run_id = "mcp-" + str(_uuid.uuid4())
+    index = arguments.get("index")
+    dataset_name = _agent_dataset_name(index) if index is not None else ""
+    return AgentContext(
+        run_id=run_id,
+        user=user,
+        user_id=str(getattr(user, "id", "")),
+        task="mcp",
+        dataset_index=index,
+        dataset_name=dataset_name,
+        dataset_label=dataset_name,
+        allowed_tools=set(_agent_catalog().get("default_enabled") or []),
+        artifacts_dir=artifacts_dir(run_id),
+        deadline=time.time() + 600,
+    )
+
+
+@app.post("/mcp", tags=["agent mode"])
+async def mcp_endpoint(request: Request, user: User = Depends(current_user)):
+    """MCP над HTTP: initialize / tools/list / tools/call (JSON-RPC 2.0)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "invalid JSON"}})
+    method = str(body.get("method") or "")
+    request_id = body.get("id")
+    params = body.get("params") or {}
+
+    if method in ("initialize",):
+        result: Dict[str, Any] = {
+            "protocolVersion": params.get("protocolVersion") or "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "tellscope-agent", "version": "1.0.0"},
+        }
+    elif method in ("tools/list", "notifications/initialized", "ping"):
+        result = {"tools": _mcp_tools_payload()} if method == "tools/list" else {}
+    elif method == "tools/call":
+        name = str(params.get("name") or "")
+        arguments = params.get("arguments") or {}
+        spec = _agent_catalog  # noqa: F841  (для читаемости ветки)
+        from agent_engine.registry import execute as _agent_execute
+        from agent_engine.registry import get_tool as _agent_get_tool
+
+        tool_spec = _agent_get_tool(name)
+        if tool_spec is None:
+            return JSONResponse(
+                {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"инструмент {name} не найден"}}
+            )
+        ctx = _mcp_context(user, arguments)
+        ctx.allowed_tools = {name}
+        outcome = await _agent_execute(tool_spec, ctx, arguments)
+        if not outcome.get("ok"):
+            text = f"Ошибка инструмента {name}: {outcome.get('error')}"
+            is_error = True
+        else:
+            text = json.dumps(outcome.get("result"), ensure_ascii=False, default=str)
+            is_error = False
+        result = {"content": [{"type": "text", "text": text[:60000]}], "isError": is_error}
+    elif method.startswith("notifications/"):
+        return JSONResponse({}, status_code=202)
+    else:
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"метод {method} не поддержан"}}
+        )
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+@app.get("/mcp", tags=["agent mode"])
+async def mcp_descriptor(user: User = Depends(current_user)):
+    """Краткая информация о MCP-сервере Tellscope: как подключить внешний агент."""
+    return {
+        "name": "tellscope-agent",
+        "transport": "http-jsonrpc",
+        "endpoint": "/api/mcp",
+        "auth": "Authorization: Bearer <JWT Tellscope>",
+        "tools": len(_mcp_tools_payload()),
+        "example": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "dataset_overview", "arguments": {"index": 1102, "top_n": 5}},
+        },
+    }

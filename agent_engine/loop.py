@@ -23,6 +23,14 @@ MODEL_CHOICES: Dict[str, Dict[str, str]] = {
 }
 DEFAULT_CHOICE = "claude"
 
+REPORT_KEYWORDS = ("отчёт", "отчет", "report", "презентац", "документ", "docx", "pdf", "выгрузк", "слайд")
+
+
+def wants_report(task: str) -> bool:
+    """Просит ли пользователь именно файл отчёта, а не просто текстовый ответ."""
+    low = str(task or "").lower()
+    return any(keyword in low for keyword in REPORT_KEYWORDS)
+
 
 def _gateway():
     from mlops import gateway
@@ -93,6 +101,12 @@ def user_prompt(ctx) -> str:
         "Работай по шагам: сначала пойми, какие данные нужны, затем вызывай инструменты и используй их результаты. "
         "Все цифры в ответе должны опираться на данные инструментов."
     )
+    if wants_report(ctx.task) and "build_report" in ctx.allowed_tools:
+        lines.append(
+            "Пользователь просит отчёт. Обязательный порядок: собрать данные инструментами, построить 2–4 графика "
+            "через make_chart (динамика, тональность, площадки, сравнение периодов), затем вызвать build_report "
+            "со всеми разделами, выводами и ссылками на источники. Ответ в чате — короткое резюме, сам отчёт только файлом."
+        )
     return "\n".join(lines)
 
 
@@ -138,13 +152,15 @@ def _summarize(name: str, result: Any) -> str:
         return "готово"
 
 
-async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int = 3000) -> Tuple[Any, bool]:
-    """Возвращает (ChatResult, tools_supported)."""
+async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int = 3000, force_tool: Optional[str] = None) -> Tuple[Any, bool]:
+    """Возвращает (ChatResult, tools_supported). force_tool принудительно выбирает инструмент."""
     gateway = _gateway()
     choice = MODEL_CHOICES.get(ctx.model_choice or DEFAULT_CHOICE) or MODEL_CHOICES[DEFAULT_CHOICE]
     extra: Dict[str, Any] = {}
     if tools:
         extra = {"tools": tools, "tool_choice": "auto", "parallel_tool_calls": False}
+        if force_tool:
+            extra["tool_choice"] = {"type": "function", "function": {"name": force_tool}}
     usage_ctx = {"user_id": ctx.user_id, "case": "agent-mode"}
     try:
         result = await gateway.achat(
@@ -198,6 +214,84 @@ def _tool_payload(outcome: Dict[str, Any]) -> Dict[str, Any]:
     if outcome.get("ok"):
         return {"ok": True, "result": outcome.get("result")}
     return {"ok": False, "error": outcome.get("error")}
+
+
+async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Выполняет один инструмент, стримит шаги в журнал и запоминает вызов."""
+    spec = get_tool(name)
+    if spec is None or name not in ctx.allowed_tools:
+        return {"ok": False, "error": f"инструмент {name} недоступен"}
+    await ctx.event({"type": "tool_start", "name": name, "title": spec.title, "args": args})
+    outcome = await execute(spec, ctx, args)
+    summary = _summarize(name, outcome.get("result")) if outcome.get("ok") else str(outcome.get("error"))[:200]
+    ctx.tool_calls.append({"name": name, "args": args, "ok": outcome.get("ok"), "ms": outcome.get("ms"), "summary": summary})
+    await ctx.event(
+        {
+            "type": "tool_end",
+            "name": name,
+            "title": spec.title,
+            "ok": bool(outcome.get("ok")),
+            "ms": outcome.get("ms"),
+            "summary": summary,
+            "error": None if outcome.get("ok") else outcome.get("error"),
+        }
+    )
+    return outcome
+
+
+async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
+    """Гарантирует, что при запросе отчёта файл действительно собран."""
+    if "build_report" not in ctx.allowed_tools:
+        return False
+    if any(call.get("name") == "build_report" for call in ctx.tool_calls):
+        return True
+    if ctx.out_of_time():
+        return False
+    instruction = (
+        "Собери итоговый отчёт прямо сейчас: вызови инструмент build_report с заголовком, разделами "
+        "(динамика, тональность, площадки, инфоповоды, выводы), графиками по их chart_id и ссылками на источники. "
+        "Если графиков ещё нет, сначала вызови make_chart 2–4 раза, затем build_report."
+    )
+    messages.append({"role": "user", "content": instruction})
+    for force in ("build_report", None):
+        if ctx.out_of_time():
+            break
+        try:
+            result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=3000, force_tool=force)
+        except Exception as exc:
+            await ctx.log(f"Не удалось принудительно собрать отчёт: {exc}", level="error")
+            continue
+        ctx.llm_calls += 1
+        ctx.tokens += _usage_tokens(result)
+        content, calls = _parse_message(result)
+        if not calls:
+            parsed = _extract_json(content or "")
+            if parsed and parsed.get("tool"):
+                calls = [{"id": "forced", "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)}}]
+        if not calls:
+            continue
+        for call in calls:
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or "")
+            if name not in ("build_report", "make_chart"):
+                continue
+            raw_args = fn.get("arguments") or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception:
+                args = {}
+            outcome = await _run_tool(ctx, name, args)
+            if name == "build_report" and outcome.get("ok"):
+                return True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome)),
+                }
+            )
+        if any(call.get("name") == "build_report" for call in ctx.tool_calls):
+            return True
+    return any(call.get("name") == "build_report" for call in ctx.tool_calls)
 
 
 async def run_agent(ctx) -> Dict[str, Any]:
@@ -258,27 +352,13 @@ async def run_agent(ctx) -> Dict[str, Any]:
                     await ctx.event({"type": "tool_end", "name": name, "ok": False, "summary": "инструмент недоступен"})
                     continue
                 tool_call_count += 1
-                await ctx.event({"type": "tool_start", "name": name, "title": spec.title, "args": args})
-                outcome = await execute(spec, ctx, args)
-                summary = _summarize(name, outcome.get("result")) if outcome.get("ok") else str(outcome.get("error"))[:200]
-                ctx.tool_calls.append({"name": name, "args": args, "ok": outcome.get("ok"), "ms": outcome.get("ms"), "summary": summary})
+                outcome = await _run_tool(ctx, name, args)
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.get("id"),
                         "name": name,
                         "content": json_text(_tool_payload(outcome)),
-                    }
-                )
-                await ctx.event(
-                    {
-                        "type": "tool_end",
-                        "name": name,
-                        "title": spec.title,
-                        "ok": bool(outcome.get("ok")),
-                        "ms": outcome.get("ms"),
-                        "summary": summary,
-                        "error": None if outcome.get("ok") else outcome.get("error"),
                     }
                 )
             continue
@@ -303,27 +383,33 @@ async def run_agent(ctx) -> Dict[str, Any]:
             messages.append({"role": "user", "content": f"Инструмент {name} недоступен. Доступны: {', '.join(allowed)}"})
             continue
         tool_call_count += 1
-        await ctx.event({"type": "tool_start", "name": name, "title": spec.title, "args": args})
-        outcome = await execute(spec, ctx, args)
-        summary = _summarize(name, outcome.get("result")) if outcome.get("ok") else str(outcome.get("error"))[:200]
-        ctx.tool_calls.append({"name": name, "args": args, "ok": outcome.get("ok"), "ms": outcome.get("ms"), "summary": summary})
+        outcome = await _run_tool(ctx, name, args)
         messages.append(
             {
                 "role": "user",
                 "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome)),
             }
         )
-        await ctx.event(
-            {
-                "type": "tool_end",
-                "name": name,
-                "title": spec.title,
-                "ok": bool(outcome.get("ok")),
-                "ms": outcome.get("ms"),
-                "summary": summary,
-                "error": None if outcome.get("ok") else outcome.get("error"),
-            }
-        )
+
+    # Если просили отчёт — добиваемся, чтобы файл действительно был собран
+    if wants_report(ctx.task):
+        reported = await _ensure_report(ctx, messages, tools_schema)
+        if reported:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Отчёт собран. Дай короткое резюме для чата: 5–8 строк с ключевыми цифрами и перечнем того, что вошло в отчёт.",
+                }
+            )
+            try:
+                brief_result, _ = await _call_llm(ctx, messages, None, max_tokens=900)
+                brief = (_parse_message(brief_result)[0] or "").strip()
+                ctx.llm_calls += 1
+                ctx.tokens += _usage_tokens(brief_result)
+                if brief:
+                    answer = brief
+            except Exception:
+                pass
 
     if not answer:
         if ctx.out_of_time():
