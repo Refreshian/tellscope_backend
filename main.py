@@ -12468,6 +12468,160 @@ async def mcp_descriptor(user: User = Depends(current_user)):
             "params": {"name": "dataset_overview", "arguments": {"index": 1102, "top_n": 5}},
         },
     }
+# ==================== Сервисный доступ к инструментам (Dify / OpenAPI / n8n) ====================
+# Визуальный конструктор Dify и любой другой внешний оркестратор вызывают инструменты Tellscope
+# как обычные HTTP-эндпоинты: POST /api/agent/tool/<имя> с сервисным токеном. Полное описание
+# инструментов отдаётся по /api/agent/openapi.json и импортируется в Dify как «Custom Tool» (API Key).
+# Токены хранятся в data/agent_service_tokens.json, поэтому выдаются и отзываются без рестарта API.
+
+class ServiceTokenBody(BaseModel):
+    name: str = "dify"
+    user_id: Optional[int] = None
+
+
+def _request_service_token(request: Request) -> str:
+    """Достаёт сервисный токен из заголовка X-Service-Token или Authorization: Bearer."""
+    token = (request.headers.get("x-service-token") or "").strip()
+    if not token:
+        auth = (request.headers.get("authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+    return token
+
+
+async def _user_by_service_token(token: str, user_manager):
+    """Пользователь-владелец сервисного токена (для проверки прав и лимитов)."""
+    from agent_engine.service_api import match_service_token
+
+    info = match_service_token(token)
+    if not info:
+        return None
+    try:
+        return await user_manager.get(int(info["user_id"]))
+    except Exception as exc:
+        print(f"[agent-tool] не удалось загрузить владельца токена {info.get('id')}: {exc}")
+        return None
+
+
+def _agent_public_base_url(request: Request) -> str:
+    """Публичный адрес API Tellscope (для OpenAPI-описания инструментов)."""
+    env_url = (os.getenv("TELLSCOPE_PUBLIC_URL") or "").strip()
+    if env_url:
+        return env_url.rstrip("/")
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
+    if host and "127.0.0.1" not in host and "localhost" not in host:
+        proto = (request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip() or "https"
+        return f"{proto}://{host}"
+    return "https://tellscope40.headsmade.com"
+
+
+@app.get("/agent/openapi.json", tags=["agent mode"])
+async def agent_openapi_spec(request: Request):
+    """OpenAPI-описание инструментов Tellscope: импортируется в Dify как Custom Tool."""
+    from agent_engine.service_api import openapi_spec
+
+    return JSONResponse(openapi_spec(_agent_public_base_url(request)))
+
+
+@app.get("/agent/dify", tags=["agent mode"])
+async def agent_dify_info(request: Request, user: User = Depends(current_user)):
+    """Что нужно, чтобы подключить Tellscope к визуальному конструктору Dify."""
+    from agent_engine.service_api import list_tokens, public_tool_names
+
+    base = _agent_public_base_url(request)
+    return {
+        "dify_url": (os.getenv("DIFY_PUBLIC_URL") or "https://tellscope40.headsmade.com:8443").strip(),
+        "openapi_url": base + "/api/agent/openapi.json",
+        "tool_endpoint": base + "/api/agent/tool/{tool_name}",
+        "auth_header": "X-Service-Token",
+        "tokens": list_tokens(),
+        "tools": public_tool_names(),
+    }
+
+
+@app.get("/agent/service-tokens", tags=["agent mode"])
+async def agent_service_tokens_list(user: User = Depends(current_user)):
+    """Список выданных сервисных токенов (значения маскируются)."""
+    from agent_engine.service_api import list_tokens
+
+    if not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Доступно только администратору")
+    return {"tokens": list_tokens()}
+
+
+@app.post("/agent/service-tokens", tags=["agent mode"])
+async def agent_service_token_create(body: ServiceTokenBody, user: User = Depends(current_user)):
+    """Выдаёт сервисный токен для внешнего конструктора (Dify, n8n, свои скрипты)."""
+    from agent_engine.service_api import create_service_token
+
+    if not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Доступно только администратору")
+    owner_id = int(body.user_id or user.id)
+    created = create_service_token(body.name or "dify", owner_id)
+    return created
+
+
+@app.delete("/agent/service-tokens/{token_id}", tags=["agent mode"])
+async def agent_service_token_revoke(token_id: str, user: User = Depends(current_user)):
+    """Отзывает сервисный токен."""
+    from agent_engine.service_api import revoke_service_token
+
+    if not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Доступно только администратору")
+    if not revoke_service_token(token_id):
+        raise HTTPException(status_code=404, detail="Токен не найден")
+    return {"ok": True, "revoked": token_id}
+
+
+@app.post("/agent/tool/{tool_name}", tags=["agent mode"])
+async def agent_tool_call(tool_name: str, request: Request, user_manager: UserManager = Depends(get_user_manager)):
+    """Прямой вызов инструмента Tellscope по HTTP (Dify, n8n, собственные скрипты)."""
+    from agent_engine.registry import execute as _agent_tool_execute
+    from agent_engine.registry import get_tool as _agent_tool_get
+    from agent_engine.service_api import dump_limited, SKIP_GROUPS
+
+    token = _request_service_token(request)
+    user = await _user_by_service_token(token, user_manager) if token else None
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Нужен сервисный токен Tellscope в заголовке X-Service-Token",
+        )
+
+    spec = _agent_tool_get(tool_name)
+    if spec is None or spec.group in SKIP_GROUPS:
+        raise HTTPException(status_code=404, detail=f"инструмент {tool_name} не найден")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    arguments = {key: value for key, value in payload.items() if value is not None and value != ""}
+
+    if arguments.get("index") is not None:
+        _guard_index_access(user, arguments.get("index"))
+
+    ctx = _mcp_context(user, arguments)
+    ctx.allowed_tools = {tool_name}
+    started = time.time()
+    outcome = await _agent_tool_execute(spec, ctx, arguments)
+    if not outcome.get("ok"):
+        print(f"[agent-tool] {tool_name} ошибка: {outcome.get('error')}")
+        return JSONResponse(
+            {
+                "ok": False,
+                "tool": tool_name,
+                "error": outcome.get("error"),
+                "ms": outcome.get("ms"),
+            }
+        )
+    body = dump_limited({"ok": True, "tool": tool_name, "ms": outcome.get("ms"), "result": outcome.get("result")})
+    print(f"[agent-tool] {tool_name} ok за {int((time.time() - started) * 1000)} мс (user {getattr(user, 'id', '?')})")
+    return JSONResponse(body)
+
+
 # ==================== Авторизация: вход с refresh-токеном ====================
 # Стандартный /auth/jwt/login отдаёт только access-токен (его обслуживает роутер FastAPI-Users),
 # поэтому фронтенд сохранял в cookie строку «undefined», обновление сессии не работало и после
