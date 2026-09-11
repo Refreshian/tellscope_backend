@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .context import compact
 from .registry import ToolError, tool
+from . import semantic
 
 BATCH_SIZE = 16
 MAX_BATCHES = 10
@@ -119,29 +120,87 @@ def _message_line(msg_id: str, doc: Dict[str, Any]) -> str:
     return f"[{msg_id}] ({doc.get('hub') or 'источник'}, {date}, лайков {doc.get('likes') or 0}) {text}"
 
 
-def _fetch_messages(ctx, index_name: str, phrase: str, lo, hi, tone: str, limit: int) -> List[Dict[str, Any]]:
+async def _fetch_messages(ctx, index_name: str, phrase: str, lo, hi, tone: str, limit: int) -> Dict[str, Any]:
+    """Семантическая выборка сообщений: формулировки + морфология + синонимы + векторный поиск.
+
+    Возвращает {'docs', 'terms', 'per_term_counts', 'vector_used', 'vector_count', 'expanded'}.
+    """
+    from . import semantic
     from .tools_data import _es, _iso, _query, _sample
 
-    query = _query(phrase, lo, hi, tone)
+    filters: List[dict] = []
+    if lo or hi:
+        rng: Dict[str, Any] = {}
+        if lo:
+            rng["gte"] = int(lo)
+        if hi:
+            rng["lte"] = int(hi)
+        filters.append({"range": {"timeCreate": rng}})
+    filters.extend(_query("", None, None, tone).get("bool", {}).get("filter") or [])
+
+    expanded = await semantic.expand_terms(ctx, phrase)
+    variants = expanded.get("variants") or [phrase]
+    if expanded.get("sources"):
+        await ctx.log(
+            f"Формулировки поиска ({', '.join(expanded['sources'])}): " + ", ".join(variants[:12])
+        )
+
     body = {
         "size": int(limit),
         "_source": [
             "text", "timeCreate", "hub", "url", "likesCount", "commentsCount", "toneMark", "city", "authorObject",
         ],
-        "query": query,
-        "sort": [{"likesCount": {"order": "desc"}}, {"timeCreate": {"order": "desc"}}],
+        "query": semantic.build_query(variants, filters),
+        "sort": ["_score", {"likesCount": {"order": "desc"}}, {"timeCreate": {"order": "desc"}}],
     }
     try:
         res = _es().search(index=index_name, body=body)
     except Exception as exc:
         raise ToolError(f"Ошибка выборки сообщений: {exc}") from exc
-    docs = []
+
+    docs: List[Dict[str, Any]] = []
     for hit in (res.get("hits") or {}).get("hits") or []:
         sample = _sample(hit)
         sample["time"] = _iso((hit.get("_source") or {}).get("timeCreate"))
         sample["city"] = (hit.get("_source") or {}).get("city") or ""
+        sample["origin"] = "lexical"
         docs.append(sample)
-    return docs
+
+    per_term_counts = semantic.count_terms(index_name, variants, filters)
+
+    vector_used = False
+    vector_count = 0
+    vector_note = ""
+    vector_added = 0
+    try:
+        ids, vector_count, vector_note = semantic.vector_search_ids(index_name, phrase, limit=max(80, int(limit)))
+        if ids:
+            vector_docs, fetch_note = semantic.fetch_docs_by_ids(index_name, ids, limit=int(limit))
+            if fetch_note:
+                vector_note = fetch_note
+            seen = {str(doc.get("es_id") or doc.get("url")) for doc in docs}
+            for doc in vector_docs:
+                key = str(doc.get("es_id") or doc.get("url"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                docs.append(doc)
+                vector_added += 1
+            vector_used = bool(vector_docs)
+    except Exception as exc:
+        vector_note = f"ошибка векторного поиска: {exc}"
+        await ctx.log(f"Векторный поиск недоступен: {exc}", level="error")
+
+    return {
+        "docs": docs,
+        "terms": variants,
+        "per_term_counts": per_term_counts,
+        "vector_used": vector_used,
+        "vector_count": vector_count,
+        "vector_added": vector_added,
+        "vector_note": vector_note,
+        "expanded": expanded,
+    }
 
 
 def _merge_results(parsed_batches: List[dict], docs_by_id: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -213,8 +272,10 @@ def _merge_results(parsed_batches: List[dict], docs_by_id: Dict[str, Dict[str, A
     description=(
         "Подробный разбор сообщений по теме локальной моделью Qwen (бесплатно, наши GPU): смысловые блоки, "
         "конкретные претензии и похвалы с цитатами и ссылками, детали (продукты, места, суммы, организации), "
-        "тональность внутри темы и итоговый аналитический текст. Работает 1–3 минуты, поэтому вызывай его, "
-        "когда нужен именно глубокий разбор темы, а не общие счётчики."
+        "тональность внутри темы и итоговый аналитический текст. Поиск по теме смысловой: учитываются формы слов, "
+        "синонимы и разговорные варианты («отравление» найдёт «траванулся» и «отравился»), а для датасетов с "
+        "эмбеддингами — ещё и векторный поиск. Работает 1–3 минуты, поэтому вызывай его, когда нужен именно "
+        "подробный разбор темы, а не общие счётчики."
     ),
     parameters={
         "type": "object",
@@ -250,13 +311,15 @@ async def deep_text_analysis(
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
     limit = max(16, min(int(max_messages or 120), BATCH_SIZE * MAX_BATCHES))
-    docs = _fetch_messages(ctx, index_name, topic, lo, hi, tone, limit)
+    found = await _fetch_messages(ctx, index_name, topic, lo, hi, tone, limit)
+    docs = found["docs"]
     if not docs:
         return {
             "index": idx,
             "index_name": index_name,
             "topic": topic,
             "messages_analyzed": 0,
+            "search_terms": found.get("terms") or [],
             "note": "По этой теме сообщений не найдено — анализировать нечего.",
         }
 
@@ -269,8 +332,13 @@ async def deep_text_analysis(
 
     batches = [lines[i : i + BATCH_SIZE] for i in range(0, len(lines), BATCH_SIZE)][:MAX_BATCHES]
     focus_text = f" Особое внимание: {focus}." if focus else ""
+    per_term = found.get("per_term_counts") or {}
+    scope = semantic.scope_note(
+        per_term, bool(found.get("vector_used")), int(found.get("vector_count") or 0), str(found.get("vector_note") or "")
+    )
     await ctx.log(
-        f"Подробный разбор темы «{topic}»: {len(docs)} сообщений, {len(batches)} пачек, локальная модель Qwen"
+        f"Подробный разбор темы «{topic}»: {len(docs)} сообщений, {len(batches)} пачек, локальная модель Qwen. "
+        f"Формулировок поиска: {len(found.get('terms') or [])}, векторный поиск: {'да' if found.get('vector_used') else 'нет'}"
     )
 
     semaphore = asyncio.Semaphore(PARALLEL_BATCHES)
@@ -345,6 +413,7 @@ async def deep_text_analysis(
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(f"# Подробный разбор темы «{topic}»\n\n")
             fh.write(f"Датасет: {index_name} · сообщений разобрано: {len(docs)} · модель: Qwen3-32B (локально)\n\n")
+            fh.write(scope + "\n\n")
             fh.write(summary or "Итоговый текст модель не сформировала.")
             fh.write("\n\n## Смысловые блоки\n")
             for item in merged["subtopics"]:
@@ -357,6 +426,19 @@ async def deep_text_analysis(
     except Exception as exc:
         await ctx.log(f"Не удалось сохранить файл разбора: {exc}", level="error")
 
+    section = {
+        "heading": f"Подробный разбор темы «{topic}»",
+        "text": (scope + "\n\n" + (summary or "")).strip(),
+        "bullets": [f"{item['name']} — {item['mentions']} упоминаний" for item in merged["subtopics"][:8]],
+        "citations": [
+            {"title": f"{item.get('platform') or 'источник'} · {item.get('date') or ''}".strip(), "url": item.get("url")}
+            for item in merged["key_claims"]
+            if item.get("url")
+        ][:10],
+    }
+    # Запоминаем раздел: build_report добавит его в документ, даже если модель про него забудет
+    ctx.deep_analysis = section
+
     return {
         "index": idx,
         "index_name": index_name,
@@ -365,12 +447,23 @@ async def deep_text_analysis(
         "messages_analyzed": len(docs),
         "batches": len(batches),
         "batches_failed": failed,
+        "search_terms": found.get("terms") or [],
+        "per_term_counts": compact(per_term, max_items=20, max_str=80),
+        "semantic_vectors": bool(found.get("vector_used")),
+        "vector_hits": int(found.get("vector_count") or 0),
+        "vector_added": int(found.get("vector_added") or 0),
+        "scope_note": scope,
         "subtopics": compact(merged["subtopics"], max_items=12, max_str=120),
         "key_claims": compact(merged["key_claims"], max_items=12, max_str=260),
         "details": compact(merged["details"], max_items=12, max_str=120),
         "sentiment": merged["sentiment"],
         "summary": summary,
+        "report_section": section,
         "artifact": {"name": os.path.basename(artifact["path"])} if artifact else None,
         "usage": {"local_model_tokens": tokens_used, "cost_usd": 0.0},
-        "note": "Разбор выполнен локальной моделью Qwen3-32B на сервере Tellscope: внешние API не оплачиваются.",
+        "note": (
+            "Разбор выполнен локальной моделью Qwen3-32B на сервере Tellscope: внешние API не оплачиваются. "
+            "Обязательно передай report_section в build_report отдельным разделом и укажи, по каким формулировкам "
+            "шёл поиск (scope_note), чтобы было понятно, что именно проанализировано."
+        ),
     }

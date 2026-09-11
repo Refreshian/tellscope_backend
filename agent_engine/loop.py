@@ -59,12 +59,22 @@ NO_DATA_WARNING = (
 TOOL_RESULT_KEEP_CHARS = 2200
 TOOL_RESULT_RECENT_FULL = 3
 
-REPORT_KEYWORDS = ("отчёт", "отчет", "report", "презентац", "документ", "docx", "pdf", "выгрузк", "слайд")
+REPORT_KEYWORDS = (
+    "отчёт", "отчет", "report", "презентац", "документ", "docx", "pdf", "выгрузк", "слайд",
+    "разбор", "анализ", "аналитик", "исследован", "обзор", "доклад", "записк", "справк",
+)
+# Если пользователь явно просит короткий ответ, отчёт не навязываем
+REPORT_SKIP_PHRASES = (
+    "без отчёта", "без отчета", "не нужен отчёт", "не нужен отчет", "не надо отчёт", "не надо отчет",
+    "только текстом", "только текст", "в чат", "одной строкой", "кратко", "коротко", "не собирай отчёт",
+)
 
 
 def wants_report(task: str) -> bool:
-    """Просит ли пользователь именно файл отчёта, а не просто текстовый ответ."""
+    """Нужен ли пользователю файл отчёта, а не только текст в чате."""
     low = str(task or "").lower()
+    if any(phrase in low for phrase in REPORT_SKIP_PHRASES):
+        return False
     return any(keyword in low for keyword in REPORT_KEYWORDS)
 
 
@@ -152,7 +162,18 @@ def _summarize(name: str, result: Any) -> str:
         if not isinstance(result, dict):
             return "готово"
         if name == "search_messages":
-            return f"найдено {result.get('messages_found')} сообщений" + (f" по «{result.get('phrase')}»" if result.get("phrase") else "")
+            base = f"найдено {result.get('messages_found')} сообщений" + (f" по «{result.get('phrase')}»" if result.get("phrase") else "")
+            terms = result.get("search_terms") or []
+            if len(terms) > 1:
+                base += f" (смысловой поиск, формулировок: {len(terms)})"
+            return base
+        if name == "deep_text_analysis":
+            terms = result.get("search_terms") or []
+            vector = " + векторный" if result.get("semantic_vectors") else ""
+            return (
+                f"разобрано {result.get('messages_analyzed')} сообщений, формулировок поиска: {len(terms)}{vector}, "
+                f"претензий: {len(result.get('key_claims') or [])}"
+            )
         if name == "dataset_overview":
             period = result.get("period") or {}
             return f"{result.get('messages_total')} сообщений, период {period.get('from', '')} — {period.get('to', '')}"
@@ -346,7 +367,9 @@ async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) ->
     instruction = (
         "Собери итоговый отчёт прямо сейчас: вызови инструмент build_report с заголовком, разделами "
         "(динамика, тональность, площадки, инфоповоды, выводы), графиками по их chart_id и ссылками на источники. "
-        "Если графиков ещё нет, сначала вызови make_chart 2–4 раза, затем build_report."
+        "Если графиков ещё нет, сначала вызови make_chart 2–4 раза, затем build_report. "
+        "Если ранее делал подробный разбор темы (deep_text_analysis) — включи его итоговый текст отдельным разделом "
+        "с цитатами и ссылками, а не пересказывай своими словами."
     )
     messages.append({"role": "user", "content": instruction})
     for force in ("build_report", None):
@@ -554,8 +577,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
         if not ctx.tool_calls:
             ctx.notes.append("агент не вызвал ни одного инструмента — ответ не подтверждён данными")
 
-    # Если просили отчёт — добиваемся, чтобы файл действительно был собран
-    if wants_report(ctx.task) and not _budget_exceeded(ctx):
+    # Если просили отчёт (или делали подробный разбор текстов) — файл должен быть собран
+    deep_analysis_done = any(call.get("name") == "deep_text_analysis" for call in ctx.tool_calls)
+    if (wants_report(ctx.task) or deep_analysis_done) and not _budget_exceeded(ctx):
         reported = await _ensure_report(ctx, messages, tools_schema)
         if reported:
             messages.append(

@@ -430,6 +430,12 @@ async def build_report(
     sections = [s for s in sections if isinstance(s, dict) and (s.get("heading") or s.get("text"))]
     if not sections:
         raise ToolError("Ни один раздел не содержит heading или text — проверьте структуру sections")
+    # Подробный разбор темы (deep_text_analysis) обязан попасть в документ — добавляем, если модель забыла
+    deep = getattr(ctx, "deep_analysis", None)
+    if deep and deep.get("text"):
+        already = any("подробный разбор" in str(section.get("heading") or "").lower() for section in sections)
+        if not already:
+            sections.append(dict(deep))
     for section in sections:
         citations = section.get("citations")
         if isinstance(citations, str):

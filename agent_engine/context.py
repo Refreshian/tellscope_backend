@@ -90,6 +90,8 @@ class AgentContext:
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     charts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Раздел подробного разбора (deep_text_analysis) — обязан попасть в итоговый отчёт
+    deep_analysis: Optional[Dict[str, Any]] = None
     llm_calls: int = 0
     tokens: int = 0
     cost_usd: float = 0.0

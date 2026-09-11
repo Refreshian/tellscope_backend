@@ -337,20 +337,23 @@ async def dataset_overview(ctx, index: Optional[int] = None, top_n: int = 10):
     "search_messages",
     title="Поиск сообщений",
     description=(
-        "Поиск сообщений по фразе (точное вхождение) с фильтрами по датам и тональности. "
-        "Возвращает точное число совпадений, распределение по площадкам и тональности, динамику по месяцам "
-        "и примеры сообщений со ссылками. Основной инструмент доказательной базы отчёта."
+        "Поиск сообщений по теме с фильтрами по датам и тональности. Поиск смысловой: учитываются формы слов и "
+        "синонимы («отравление» находит «траванулся», «отравился», «пищевое отравление»), поэтому в ответе есть "
+        "search_terms и per_term_counts — по каким формулировкам и сколько найдено. Возвращает точное число "
+        "совпадений, распределение по площадкам и тональности, динамику по месяцам и примеры сообщений со ссылками. "
+        "Основной инструмент доказательной базы отчёта."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "phrase": {"type": "string", "description": "фраза для поиска; пусто — все сообщения периода"},
+            "phrase": {"type": "string", "description": "тема поиска; пусто — все сообщения периода"},
             "index": {"type": "integer", "description": "index датасета"},
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD или unix-секунды"},
             "tone": {"type": "string", "enum": ["any", "negative", "positive", "neutral"], "description": "фильтр тональности"},
             "limit": {"type": "integer", "description": "сколько примеров вернуть (по умолчанию 10, максимум 30)"},
             "sort": {"type": "string", "enum": ["date_desc", "date_asc", "relevance"], "description": "порядок примеров"},
+            "expand": {"type": "boolean", "description": "расширять запрос формами слов и синонимами (по умолчанию да)"},
         },
         "required": ["phrase"],
     },
@@ -365,11 +368,37 @@ async def search_messages(
     tone: str = "any",
     limit: int = 10,
     sort: str = "date_desc",
+    expand: bool = True,
 ):
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
     limit = max(1, min(int(limit or 10), 30))
-    query = _query(phrase, lo, hi, tone)
+
+    variants: List[str] = []
+    per_term: Dict[str, int] = {}
+    expanded_info: Dict[str, Any] = {}
+    if expand and phrase and str(phrase).strip():
+        from . import semantic
+
+        expanded_info = await semantic.expand_terms(ctx, phrase, use_llm=False)
+        variants = expanded_info.get("variants") or []
+
+    query = semantic.build_query(variants, []) if variants else _query(phrase, lo, hi, tone)
+    if variants:
+        # период и тональность добавляем фильтрами, чтобы не терять расширенные формулировки
+        filters: List[dict] = []
+        if lo or hi:
+            rng: Dict[str, Any] = {}
+            if lo:
+                rng["gte"] = int(lo)
+            if hi:
+                rng["lte"] = int(hi)
+            filters.append({"range": {"timeCreate": rng}})
+        filters.extend(_query("", None, None, tone).get("bool", {}).get("filter") or [])
+        if filters:
+            query.setdefault("bool", {})["filter"] = filters
+        per_term = semantic.count_terms(index_name, variants, filters)
+
     sort_spec = [{"timeCreate": {"order": "desc"}}]
     if sort == "date_asc":
         sort_spec = [{"timeCreate": {"order": "asc"}}]
@@ -391,7 +420,10 @@ async def search_messages(
     if not (lo or hi):
         if not _period(index_name)[0]:
             notes.append(NO_TIME_NOTE)
-    return {
+    if variants:
+        notes.append("Поиск расширен формами слов и синонимами: см. search_terms и per_term_counts — только эти формулировки дают данное число сообщений.")
+
+    result = {
         "index": idx,
         "index_name": index_name,
         "phrase": phrase,
@@ -404,6 +436,12 @@ async def search_messages(
         "examples": [_sample(h) for h in hits],
         "notes": notes,
     }
+    if variants:
+        result["search_terms"] = variants
+        result["search_sources"] = expanded_info.get("sources") or []
+        result["per_term_counts"] = compact(per_term, max_items=20, max_str=80)
+        result["exact_phrase_messages"] = _exact_count(index_name, _query(phrase, lo, hi, tone))
+    return result
 
 
 def _guard_call(method, *args, **kwargs):
