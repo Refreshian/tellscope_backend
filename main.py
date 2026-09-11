@@ -12269,6 +12269,7 @@ class AgentConfigBody(BaseModel):
     folder: Optional[str] = None
     schedule: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = None
+    steps: Optional[List[Dict[str, Any]]] = None
 
 
 @app.get("/agent/agents", tags=["agent mode"])
@@ -12287,6 +12288,7 @@ async def agent_agents_list(user: User = Depends(current_user)):
         ],
         "default_model": _AGENT_DEFAULT_CHOICE,
         "default_token_budget": _agent_runs.DEFAULT_TOKEN_BUDGET,
+        "step_kinds": _agent_agents_store.step_kinds_public(),
         "tokens_today": _agent_runs.tokens_today_for_user(user.id),
         "tokens_per_day_limit": _agent_runs.MAX_TOKENS_PER_DAY,
     }
@@ -12305,6 +12307,8 @@ async def agent_agents_upsert(body: AgentConfigBody, user: User = Depends(curren
             payload["dataset_name"] = _agent_dataset_name(body.dataset_index)
     if payload.get("tools"):
         payload["tools"] = _agent_runs.resolve_tools(payload["tools"])
+    if payload.get("steps") is not None:
+        payload["steps"] = _agent_agents_store.normalize_steps(payload["steps"])
     if not payload.get("preset") and not payload.get("id"):
         preset = _agent_agents_store._PRESET_BY_ID.get(str(body.preset or ""))
         if not preset and not payload.get("name"):

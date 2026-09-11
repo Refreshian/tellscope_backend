@@ -80,6 +80,29 @@ PRESETS: List[Dict[str, Any]] = [
             "build_report",
         ],
         "folder": "Отчёт по бренду",
+        "steps": [
+            {"kind": "tool", "title": "Обзор датасета", "tool": "dataset_overview",
+             "args": {"top_n": 10}, "save_as": "overview"},
+            {"kind": "tool", "title": "Тональность и площадки", "tool": "tonality_summary",
+             "save_as": "tonality"},
+            {"kind": "tool", "title": "Ключевые инфоповоды", "tool": "popular_hooks",
+             "args": {"limit": 12}, "save_as": "hooks"},
+            {"kind": "chart", "title": "Динамика упоминаний по месяцам", "from": "{{overview.monthly_dynamics}}",
+             "label_field": "month", "value_field": "count", "chart_type": "line",
+             "series_name": "Сообщений", "save_as": "chart_dynamics"},
+            {"kind": "chart", "title": "Тональность: доли", "from": "{{overview.tonality}}",
+             "label_field": "tone", "value_field": "count", "chart_type": "pie",
+             "series_name": "Сообщений", "save_as": "chart_tone"},
+            {"kind": "chart", "title": "Топ площадок", "from": "{{overview.hubs}}",
+             "label_field": "key", "value_field": "count", "chart_type": "hbar",
+             "series_name": "Сообщений", "save_as": "chart_hubs"},
+            {"kind": "llm", "title": "Выводы аналитика", "save_as": "synthesis", "max_tokens": 1600,
+             "prompt": "Данные по бренду за период.\n\nОбъём и период: {{overview.messages_total}} сообщений, {{overview.period}}.\n\nДинамика по месяцам: {{overview.monthly_dynamics}}\n\nТональность: {{overview.tonality}}\n\nПлощадки: {{overview.hubs}}\n\nИнфоповоды: {{hooks.hooks}}\n\nНапиши аналитический разбор: 1) динамика упоминаний и что изменилось; 2) тональность; 3) площадки; 4) ключевые инфоповоды; 5) выводы и рекомендации. Только по этим данным, без вводных фраз."},
+            {"kind": "report", "title": "Сборка отчёта", "report_title": "Сводный отчёт по бренду",
+             "subtitle": "Динамика, тональность, площадки, инфоповоды", "save_as": "report",
+             "sections": [{"heading": "Аналитика и выводы", "text": "{{synthesis.text}}",
+                           "chart_ids": ["chart1", "chart2", "chart3"]}]},
+        ],
         "token_budget": 150000,
         "schedule": {"enabled": True, "mode": "weekly", "hour": 9, "minute": 0, "weekdays": [1]},
     },
@@ -132,9 +155,101 @@ PRESETS: List[Dict[str, Any]] = [
         "token_budget": 120000,
         "schedule": {"enabled": True, "mode": "daily", "hour": 12, "minute": 0, "weekdays": [1, 2, 3, 4, 5, 6, 7]},
     },
+    {
+        "id": "topic_pipeline",
+        "name": "Отчёт по теме (цепочка шагов)",
+        "description": "Готовая цепочка: поиск по теме → подробный разбор текстов → график → выводы ИИ → отчёт DOCX/PDF. Тему укажите в первых двух шагах.",
+        "instruction": (
+            "Сделай подробный анализ указанной темы: о чём пишут, на что жалуются, какие детали, примеры со ссылками, "
+            "и собери отчёт."
+        ),
+        "tools": [
+            "search_messages",
+            "deep_text_analysis",
+            "popular_hooks",
+            "make_chart",
+            "build_report",
+        ],
+        "folder": "Отчёт по теме",
+        "token_budget": 120000,
+        "schedule": {"enabled": False, "mode": "manual", "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5]},
+        "steps": [
+            {"kind": "tool", "title": "Поиск сообщений по теме", "tool": "search_messages",
+             "args": {"phrase": "отравление", "limit": 30, "sort": "relevance"}, "save_as": "search"},
+            {"kind": "tool", "title": "Подробный разбор текстов", "tool": "deep_text_analysis",
+             "args": {"phrase": "отравление", "focus": "претензии, детали, продукты", "max_messages": 64},
+             "save_as": "deep"},
+            {"kind": "chart", "title": "Динамика упоминаний по месяцам", "from": "{{search.monthly_dynamics}}",
+             "label_field": "month", "value_field": "count", "chart_type": "line",
+             "series_name": "Сообщений", "save_as": "chart_dynamics"},
+            {"kind": "llm", "title": "Выводы по теме", "save_as": "synthesis", "max_tokens": 1600,
+             "prompt": "Тема разбора.\n\nНайдено сообщений: {{search.messages_found}}, формулировки поиска: {{search.search_terms}}, динамика: {{search.monthly_dynamics}}\n\nПодробный разбор текстов: {{deep.summary}}\n\nСмысловые блоки: {{deep.subtopics}}\n\nПретензии с цитатами: {{deep.key_claims}}\n\nНапиши разбор темы: о чём пишут, на что жалуются, ключевые детали и факты, 2–3 примера со ссылками, выводы. Только по этим данным."},
+            {"kind": "report", "title": "Сборка отчёта", "report_title": "Отчёт по теме",
+             "subtitle": "Подробный разбор сообщений по теме", "save_as": "report",
+             "sections": [{"heading": "Разбор темы", "text": "{{synthesis.text}}", "chart_ids": ["chart1"]}]},
+        ],
+    },
 ]
 
 _PRESET_BY_ID = {preset["id"]: preset for preset in PRESETS}
+
+
+def normalize_steps(raw: Any) -> List[Dict[str, Any]]:
+    """Приводит цепочку шагов к безопасному виду (шаги конструктора)."""
+    from .pipeline import STEP_KINDS
+
+    out: List[Dict[str, Any]] = []
+    for number, step in enumerate(raw or [], start=1):
+        if not isinstance(step, dict):
+            continue
+        kind = str(step.get("kind") or "tool")
+        if kind not in STEP_KINDS:
+            continue
+        item = {
+            "id": str(step.get("id") or f"step{number}"),
+            "kind": kind,
+            "title": str(step.get("title") or STEP_KINDS.get(kind, kind))[:200],
+            "save_as": str(step.get("save_as") or f"step{number}")[:60],
+        }
+        for key in (
+            "tool",
+            "prompt",
+            "system",
+            "report_title",
+            "subtitle",
+            "folder",
+            "from",
+            "label_field",
+            "value_field",
+            "chart_type",
+            "series_name",
+            "x_label",
+            "y_label",
+        ):
+            if step.get(key) not in (None, ""):
+                item[key] = step[key]
+        for key in ("args", "sections", "series_fields"):
+            if isinstance(step.get(key), (dict, list)):
+                item[key] = step[key]
+        if step.get("limit") is not None:
+            try:
+                item["limit"] = int(step["limit"])
+            except Exception:
+                pass
+        if step.get("max_tokens") is not None:
+            try:
+                item["max_tokens"] = int(step["max_tokens"])
+            except Exception:
+                pass
+        out.append(item)
+    return out[:14]
+
+
+def step_kinds_public() -> List[Dict[str, str]]:
+    """Виды шагов для интерфейса конструктора."""
+    from .pipeline import STEP_KINDS
+
+    return [{"id": key, "title": value} for key, value in STEP_KINDS.items()]
 
 
 def store_path(user_id: Any) -> str:
@@ -227,6 +342,7 @@ def upsert_agent(user_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
             "folder": payload.get("folder") or base.get("folder") or "Агент",
             "schedule": normalize_schedule(payload.get("schedule") if payload.get("schedule") is not None else base.get("schedule")),
             "enabled": bool(payload.get("enabled", True)),
+            "steps": normalize_steps(payload.get("steps") if payload.get("steps") is not None else base.get("steps")),
         }
         items.append(record)
     else:
@@ -236,6 +352,8 @@ def upsert_agent(user_id: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
                 record[key] = payload[key]
         if payload.get("tools") is not None:
             record["tools"] = payload["tools"]
+        if payload.get("steps") is not None:
+            record["steps"] = normalize_steps(payload["steps"])
         if payload.get("token_budget") is not None:
             try:
                 record["token_budget"] = int(payload["token_budget"])
@@ -326,6 +444,7 @@ def start_agent_run(user_id: Any, agent: Dict[str, Any], user: Any, main_loop: A
         model_choice=str(agent.get("model") or "gpt"),
         folder=str(agent.get("folder") or "Агент"),
         token_budget=agent.get("token_budget"),
+        steps=agent.get("steps"),
     )
     run["agent_id"] = agent.get("id")
     run["agent_name"] = agent.get("name")

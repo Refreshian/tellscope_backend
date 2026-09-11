@@ -138,6 +138,7 @@ def create_run(
     model_choice: str = DEFAULT_CHOICE,
     folder: str = "Агент",
     token_budget: Optional[int] = None,
+    steps: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
     try:
@@ -158,6 +159,7 @@ def create_run(
         "token_budget": budget,
         "cost_usd": 0.0,
         "tools": resolve_tools(tools),
+        "steps": list(steps or []),
         "dataset_index": dataset_index,
         "dataset_name": dataset_name,
         "dataset_label": dataset_label,
@@ -311,7 +313,14 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         token_budget=int(run.get("token_budget") or DEFAULT_TOKEN_BUDGET),
     )
     try:
-        result = await run_agent(ctx)
+        steps = run.get("steps") or []
+        if steps:
+            # конструктор шагов: детерминированная цепочка
+            from .pipeline import run_pipeline
+
+            result = await run_pipeline(ctx, steps)
+        else:
+            result = await run_agent(ctx)
         run["answer"] = result.get("answer") or ""
         run["stats"] = result.get("stats") or {}
         run["tool_calls"] = result.get("tool_calls") or []
