@@ -6737,20 +6737,37 @@ import jwt
 
 @app.post("/auth/refresh")
 async def refresh_token(
-    refresh_token: str,
+    request: Request,
+    refresh_token: Optional[str] = None,
     user_manager: UserManager = Depends(get_user_manager),
 ):
+    # токен принимаем и в query, и в JSON-теле: фронтенд отправляет телом
+    if not refresh_token:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                refresh_token = body.get("refresh_token")
+        except Exception:
+            refresh_token = None
+    if not refresh_token or refresh_token in ("undefined", "null"):
+        raise HTTPException(status_code=400, detail="refresh_token is required")
     try:
-        payload = jwt.decode(refresh_token, SECRET, algorithms=["HS256"])
+        # аудиторию в refresh-токене не проверяем: он выписан нашим SECRET, а не FastAPI-Users
+        payload = jwt.decode(refresh_token, SECRET, algorithms=["HS256"], options={"verify_aud": False})
         user_id = payload.get("sub")
         
-        # Проверяем, что refresh-токен сохранён в Redis
+        # Проверяем, что refresh-токен сохранён в Redis (значение может прийти как bytes)
         stored_token = await redis_db.get(f"refresh:{user_id}")
+        if isinstance(stored_token, (bytes, bytearray)):
+            stored_token = stored_token.decode("utf-8", "replace")
         if not stored_token or stored_token != refresh_token:
             raise HTTPException(status_code=401, detail="Invalid refresh token") 
 
-        # Получаем пользователя
-        user = await user_manager.get(user_id)
+        # Получаем пользователя: id в БД целочисленный, а в токене sub — строка
+        try:
+            user = await user_manager.get(int(user_id))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
         
         # Генерируем новый access-токен через JWTStrategy
         new_access_token = await auth_backend.get_strategy().write_token(user)
@@ -6759,6 +6776,13 @@ async def refresh_token(
     
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Refresh token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"refresh token error: {exc}")
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 # # Эндпоинт для выхода пользователя (удаление refresh-токена)
 # @app.post("/logout")
@@ -12440,3 +12464,38 @@ async def mcp_descriptor(user: User = Depends(current_user)):
             "params": {"name": "dataset_overview", "arguments": {"index": 1102, "top_n": 5}},
         },
     }
+# ==================== Авторизация: вход с refresh-токеном ====================
+# Стандартный /auth/jwt/login отдаёт только access-токен (его обслуживает роутер FastAPI-Users),
+# поэтому фронтенд сохранял в cookie строку «undefined», обновление сессии не работало и после
+# истечения access-токена пользователя выбрасывало на несуществующий маршрут /login (страница «404»).
+# Здесь вход выдаёт оба токена, а /auth/refresh принимает токен и в query, и в теле запроса.
+
+class RefreshRequestBody(BaseModel):
+    refresh_token: Optional[str] = None
+
+
+@app.post("/auth/login", tags=["auth"])
+async def login_with_refresh(
+    credentials: OAuth2PasswordRequestForm = Depends(),
+    user_manager: UserManager = Depends(get_user_manager),
+):
+    """Вход с выдачей access- и refresh-токена (30 дней)."""
+    user = await user_manager.authenticate(credentials)
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+
+    # access-токен выдаём стратегией FastAPI-Users: иначе current_user его не принимает (нужна audience)
+    access_token = await auth_backend.get_strategy().write_token(user)
+    refresh_token = create_refresh_token({"sub": str(user.id)})
+    try:
+        await redis_db.setex(f"refresh:{user.id}", 2592000, refresh_token)
+    except Exception as exc:
+        print(f"refresh token store error: {exc}")
+
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+
+@app.get("/auth/session", tags=["auth"])
+async def auth_session(user: User = Depends(current_user)):
+    """Проверка, что сессия ещё жива (используется фронтендом при загрузке)."""
+    return {"ok": True, "user_id": str(user.id), "email": getattr(user, "email", "")}
