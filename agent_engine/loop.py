@@ -232,63 +232,193 @@ def _summarize(name: str, result: Any) -> str:
         return "готово"
 
 
-async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int = 3000, force_tool: Optional[str] = None) -> Tuple[Any, bool]:
-    """Возвращает (ChatResult, tools_supported). force_tool принудительно выбирает инструмент."""
-    gateway = _gateway()
-    choice = MODEL_CHOICES.get(ctx.model_choice or DEFAULT_CHOICE) or MODEL_CHOICES[DEFAULT_CHOICE]
+def _choice(key: Optional[str]) -> Dict[str, Any]:
+    return MODEL_CHOICES.get(key or "") or MODEL_CHOICES[DEFAULT_CHOICE]
+
+
+JSON_PROTOCOL_HINT = (
+    "\n\nФормат ответа (инструменты недоступны как функции): отвечай ТОЛЬКО JSON без пояснений: "
+    '{"tool": "<имя инструмента>", "arguments": {...}} для вызова инструмента или {"final": "<итоговый ответ>"} для завершения.'
+)
+
+
+def orchestrator_chain(ctx) -> List[str]:
+    """Порядок моделей-оркестраторов: активная, затем настроенные отказы.
+
+    Цепочку кладёт в контекст запуск (agent_engine.runs) по настройке mlops.lock.agent_cfg,
+    поэтому смена orchestrator/orchestrator_fallbacks действует на следующий запуск без правки кода.
+    """
+    chain = [key for key in (getattr(ctx, "orchestrator_chain", None) or []) if key in MODEL_CHOICES]
+    current = getattr(ctx, "orchestrator_choice", None)
+    if current in MODEL_CHOICES:
+        chain = [current] + [key for key in chain if key != current]
+    if not chain:
+        chain = [ctx.model_choice if ctx.model_choice in MODEL_CHOICES else DEFAULT_CHOICE]
+    return chain
+
+
+async def _switch_orchestrator(ctx, key: str, reason: str) -> None:
+    """Фиксирует смену оркестратора: в контексте, в метаданных запуска, в журнале и в заметках."""
+    previous = getattr(ctx, "orchestrator_choice", None)
+    if previous == key:
+        return
+    ctx.orchestrator_choice = key
+    info = getattr(ctx, "orchestrator_info", None)
+    if isinstance(info, dict):
+        info["orchestrator"] = key
+        info["orchestrator_label"] = _choice(key).get("label")
+        info["orchestrator_fallback_used"] = True
+        if reason:
+            info["orchestrator_reason"] = (
+                f"{info.get('orchestrator_reason')}; " if info.get("orchestrator_reason") else ""
+            ) + f"{previous or 'основной профиль'}: {reason}"
+    note = f"оркестратор переключён на {_choice(key).get('label')}"
+    if previous:
+        note += f" (было {_choice(previous).get('label')})"
+    if reason:
+        note += f": {reason}"
+    ctx.notes.append(note)
+    await ctx.event({"type": "log", "level": "error", "message": note})
+
+
+def _tools_problem(exc: BaseException) -> bool:
+    """Ошибка похожа на «профиль не умеет function calling», а не на отказ авторизации/оплаты."""
+    try:
+        status = int(getattr(exc, "status_code", 0) or 0)
+    except Exception:
+        status = 0
+    return status in (400, 404, 422, 501)
+
+
+def _request_extra(tools: Optional[List[dict]], force_tool: Optional[str],
+                   choice: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     extra: Dict[str, Any] = {}
     if tools:
         extra = {"tools": tools, "tool_choice": "auto", "parallel_tool_calls": False}
         if force_tool:
             extra["tool_choice"] = {"type": "function", "function": {"name": force_tool}}
+    if choice.get("provider") == "vllm":
+        # Локальному Qwen3 этот флаг отключает длинные рассуждения: без него модель
+        # уходит в <think> и не возвращает корректный вызов инструмента.
+        extra["chat_template_kwargs"] = {"enable_thinking": False}
+    return extra or None
+
+
+async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int = 3000,
+                    force_tool: Optional[str] = None, role: str = "orchestrator") -> Tuple[Any, bool]:
+    """Возвращает (ChatResult, tools_supported). force_tool принудительно выбирает инструмент.
+
+    role="orchestrator" — планирование шагов и вызов инструментов. Модель берётся из единой
+        настройки (agent.orchestrator в mlops/lock.yaml или TELLSCOPE_ORCHESTRATOR), при
+        недоступности профиля идём по списку orchestrator_fallbacks и пишем причину в метаданные.
+    role="analysis" — текст итогового ответа: остаётся моделью, которую выбрал пользователь.
+    """
+    from mlops.orchestrator import failure_reason
+
+    gateway = _gateway()
     usage_ctx = {"user_id": ctx.user_id, "case": "agent-mode"}
-    try:
-        result = await gateway.achat(
-            provider=choice["provider"],
-            messages=messages,
-            temperature=0.2,
-            max_tokens=max_tokens,
-            timeout=300,
-            extra=extra or None,
-            profile=choice["profile"],
-            usage_ctx=usage_ctx,
-        )
-        return result, True
-    except gateway.GatewayError as exc:
-        status = getattr(exc, "status_code", 0)
-        if tools and status in (400, 404, 422, 500, 501):
-            if choice.get("provider") != "aitunnel":
-                # Локальная модель без поддержки function calling: продолжаем на внешней дешёвой,
-                # чтобы агент не начал выдумывать данные вместо вызова инструментов.
-                fallback = MODEL_CHOICES[FALLBACK_CHOICE]
-                ctx.notes.append(
-                    f"{choice['label']} не поддерживает инструменты — прогон продолжен на {fallback['label']}"
-                )
-                ctx.model_choice = FALLBACK_CHOICE
-                await ctx.event({"type": "log", "level": "error", "message": f"Модель переключена на {fallback['label']}"})
-                result = await gateway.achat(
-                    provider=fallback["provider"],
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=max_tokens,
-                    timeout=300,
-                    extra=extra,
-                    profile=fallback["profile"],
-                    usage_ctx=usage_ctx,
-                )
-                return result, True
-            ctx.notes.append(f"модель {choice['label']} не приняла tools (HTTP {status}), включён JSON-протокол")
+
+    if role == "analysis":
+        key = ctx.model_choice if ctx.model_choice in MODEL_CHOICES else DEFAULT_CHOICE
+        choice = _choice(key)
+        ctx.last_choice_key = key
+        try:
             result = await gateway.achat(
                 provider=choice["provider"],
                 messages=messages,
                 temperature=0.2,
                 max_tokens=max_tokens,
                 timeout=300,
+                extra=_request_extra(tools, force_tool, choice),
                 profile=choice["profile"],
                 usage_ctx=usage_ctx,
             )
-            return result, False
-        raise
+            return result, True
+        except gateway.GatewayError as exc:
+            # Модель анализа недоступна (например у локального профиля нет шаблона под
+            # историю с tool_calls) — запуск не теряем, текст дописываем оркестратором.
+            fallback_key = getattr(ctx, "orchestrator_choice", None) or DEFAULT_CHOICE
+            if fallback_key not in MODEL_CHOICES or fallback_key == ctx.model_choice:
+                raise
+            fallback = _choice(fallback_key)
+            ctx.notes.append(
+                f"модель анализа {choice['label']} недоступна ({failure_reason(exc) or exc}) — "
+                f"текст собран на {fallback['label']}"
+            )
+            await ctx.log("Модель анализа недоступна — текст собран оркестратором", level="error")
+            ctx.last_choice_key = fallback_key
+            return await gateway.achat(
+                provider=fallback["provider"],
+                messages=messages,
+                temperature=0.2,
+                max_tokens=max_tokens,
+                timeout=300,
+                extra=_request_extra(tools, force_tool, fallback),
+                profile=fallback["profile"],
+                usage_ctx=usage_ctx,
+            ), True
+
+    chain = orchestrator_chain(ctx)
+    last_error: Optional[BaseException] = None
+
+    async def _json_protocol(choice: Dict[str, Any], reason: str) -> Tuple[Any, bool]:
+        """Профиль не принял tools: остаёмся на нём и переходим на резервный JSON-протокол.
+
+        Так запуск не теряется, а агент продолжает опираться на данные инструментов.
+        """
+        ctx.notes.append(f"модель {choice['label']} не приняла tools ({reason}), включён JSON-протокол")
+        await ctx.log(f"{choice['label']}: JSON-протокол вместо вызова инструментов", level="error")
+        if JSON_PROTOCOL_HINT not in str(messages[0].get("content") or ""):
+            messages[0]["content"] = str(messages[0].get("content") or "") + JSON_PROTOCOL_HINT
+        result = await gateway.achat(
+            provider=choice["provider"],
+            messages=messages,
+            temperature=0.2,
+            max_tokens=max_tokens,
+            timeout=300,
+            extra=_request_extra(None, None, choice),
+            profile=choice["profile"],
+            usage_ctx=usage_ctx,
+        )
+        return result, False
+
+    for position, key in enumerate(chain):
+        choice = _choice(key)
+        ctx.last_choice_key = key
+        try:
+            result = await gateway.achat(
+                provider=choice["provider"],
+                messages=messages,
+                temperature=0.2,
+                max_tokens=max_tokens,
+                timeout=300,
+                extra=_request_extra(tools, force_tool, choice),
+                profile=choice["profile"],
+                usage_ctx=usage_ctx,
+            )
+            if position:
+                await _switch_orchestrator(ctx, key, "предыдущий профиль недоступен")
+            return result, True
+        except gateway.GatewayError as exc:
+            reason = failure_reason(exc)
+            if reason is None:
+                raise
+            last_error = exc
+            tools_problem = bool(tools) and _tools_problem(exc)
+            # Режим reachability: профиль отвечает, но native tool-calling не поддерживает.
+            # Тогда остаёмся на нём — цепочка отказов тут не нужна, работает JSON-протокол.
+            if tools_problem and str(getattr(ctx, "orchestrator_probe_mode", "tools")) == "reachability":
+                return await _json_protocol(choice, reason)
+            if position + 1 < len(chain):
+                await _switch_orchestrator(ctx, chain[position + 1], f"{choice['label']}: {reason}")
+                continue
+            if tools_problem:
+                # Цепочка кончилась: JSON-протокол как последний шанс сохранить запуск.
+                return await _json_protocol(choice, reason)
+            raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("нет доступной модели-оркестратора")
 
 
 def _parse_message(result: Any) -> Tuple[str, List[dict]]:
@@ -322,11 +452,23 @@ def _usage_parts(result: Any) -> Tuple[int, int, int]:
 
 
 def _account(ctx, result: Any) -> None:
-    """Пишет расход токенов и денег в контекст прогона."""
+    """Пишет расход токенов и денег в контекст прогона.
+
+    Считаем по той модели, которая реально ответила: оркестратор и модель анализа
+    могут не совпадать, поэтому у каждой свой прайс.
+    """
     prompt, completion, total = _usage_parts(result)
-    choice = MODEL_CHOICES.get(ctx.model_choice or DEFAULT_CHOICE) or MODEL_CHOICES[DEFAULT_CHOICE]
+    key = getattr(ctx, "last_choice_key", None)
+    if key not in MODEL_CHOICES:
+        key = ctx.model_choice if ctx.model_choice in MODEL_CHOICES else DEFAULT_CHOICE
+    choice = MODEL_CHOICES[key]
     ctx.tokens += total
     ctx.cost_usd += (prompt * float(choice.get("price_in") or 0) + completion * float(choice.get("price_out") or 0)) / 1_000_000.0
+    used = getattr(ctx, "models_used", None)
+    if isinstance(used, dict):
+        item = used.setdefault(key, {"label": choice.get("label"), "calls": 0, "tokens": 0})
+        item["calls"] += 1
+        item["tokens"] += total
 
 
 def _compact_history(messages: List[dict]) -> None:
@@ -552,7 +694,11 @@ async def _ensure_data(ctx, messages: List[dict], tools_schema: List[dict]) -> b
 
 
 async def run_agent(ctx) -> Dict[str, Any]:
-    """Основной цикл агента. Возвращает итоговый ответ, шаги и артефакты."""
+    """Основной цикл агента. Возвращает итоговый ответ, шаги и артефакты.
+
+    Планирование и вызовы инструментов идут на модели-оркестраторе (единая настройка),
+    текст итогового ответа — на модели анализа, которую выбрал пользователь.
+    """
     allowed = sorted(ctx.allowed_tools)
     tools_schema = openai_tools(allowed, compact=True)
     use_tools = bool(tools_schema)
@@ -561,16 +707,19 @@ async def run_agent(ctx) -> Dict[str, Any]:
         {"role": "user", "content": user_prompt(ctx)},
     ]
     if not use_tools:
-        messages[0]["content"] += (
-            "\n\nФормат ответа (инструменты недоступны как функции): отвечай ТОЛЬКО JSON без пояснений: "
-            '{"tool": "<имя инструмента>", "arguments": {...}} для вызова инструмента или {"final": "<итоговый ответ>"} для завершения.'
-        )
+        messages[0]["content"] += JSON_PROTOCOL_HINT
     tool_call_count = 0
     answer = ""
+    orchestrator_key = getattr(ctx, "orchestrator_choice", None) or ctx.model_choice
     await ctx.event(
         {
             "type": "start",
-            "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"),
+            "model": (_choice(ctx.model_choice)).get("label"),
+            "orchestrator": _choice(orchestrator_key).get("label"),
+            "orchestrator_key": orchestrator_key,
+            "orchestrator_chain": orchestrator_chain(ctx),
+            "orchestrator_reason": str((getattr(ctx, "orchestrator_info", None) or {}).get("orchestrator_reason") or ""),
+            "analysis_model": _choice(ctx.model_choice).get("label"),
             "tools": allowed,
             "token_budget": ctx.token_budget,
         }
@@ -667,6 +816,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
 
     # Если просили отчёт (или делали подробный разбор текстов) — файл должен быть собран
     deep_analysis_done = any(call.get("name") == "deep_text_analysis" for call in ctx.tool_calls)
+    answer_from_analysis = False
     if (wants_report(ctx.task) or deep_analysis_done) and not _budget_exceeded(ctx):
         reported = await _ensure_report(ctx, messages, tools_schema)
         if reported:
@@ -677,14 +827,36 @@ async def run_agent(ctx) -> Dict[str, Any]:
                 }
             )
             try:
-                brief_result, _ = await _call_llm(ctx, messages, None, max_tokens=900)
+                brief_result, _ = await _call_llm(ctx, messages, None, max_tokens=900, role="analysis")
                 brief = (_parse_message(brief_result)[0] or "").strip()
                 ctx.llm_calls += 1
                 _account(ctx, brief_result)
                 if brief:
                     answer = brief
+                    answer_from_analysis = True
             except Exception:
                 pass
+
+    # Селектор модели в интерфейсе остаётся выбором модели анализа: если текст в цикле
+    # написала модель-оркестратор, переписываем итог на выбранной пользователем модели.
+    used_key = getattr(ctx, "orchestrator_choice", None) or ctx.model_choice
+    if answer and not answer_from_analysis and ctx.model_choice != used_key and ctx.model_choice in MODEL_CHOICES:
+        messages.append(
+            {
+                "role": "user",
+                "content": "Сформулируй итоговый ответ для чата по уже собранным данным, без новых вызовов инструментов.",
+            }
+        )
+        try:
+            analysis_result, _ = await _call_llm(ctx, messages, None, max_tokens=2500, role="analysis")
+            analysis_text = (_parse_message(analysis_result)[0] or "").strip()
+            ctx.llm_calls += 1
+            _account(ctx, analysis_result)
+            if analysis_text:
+                answer = analysis_text
+                answer_from_analysis = True
+        except Exception as exc:  # noqa: BLE001
+            ctx.notes.append(f"итоговый текст оставлен моделью-оркестратором: {exc}")
 
     if not answer:
         if ctx.out_of_time():
@@ -692,10 +864,11 @@ async def run_agent(ctx) -> Dict[str, Any]:
         else:
             messages.append({"role": "user", "content": "Заверши работу: сформулируй итоговый ответ по собранным данным, без новых вызовов инструментов."})
         try:
-            final_result, _ = await _call_llm(ctx, messages, None, max_tokens=2500)
+            final_result, _ = await _call_llm(ctx, messages, None, max_tokens=2500, role="analysis")
             answer = (_parse_message(final_result)[0] or "").strip()
             ctx.llm_calls += 1
             _account(ctx, final_result)
+            answer_from_analysis = True
         except Exception as exc:
             answer = "Не удалось получить итоговый ответ: " + str(exc)
 
@@ -704,13 +877,28 @@ async def run_agent(ctx) -> Dict[str, Any]:
 
     if answer:
         await ctx.event({"type": "answer", "text": answer})
+    orchestrator_meta = dict(getattr(ctx, "orchestrator_info", None) or {})
+    orchestrator_meta.setdefault("orchestrator", used_key)
+    orchestrator_meta.setdefault("orchestrator_label", _choice(used_key).get("label"))
+    orchestrator_meta["orchestrator_final"] = used_key
+    orchestrator_meta["orchestrator_final_label"] = _choice(used_key).get("label")
+    orchestrator_meta["analysis_model"] = ctx.model_choice
+    orchestrator_meta["analysis_model_label"] = _choice(ctx.model_choice).get("label")
+    orchestrator_meta["answer_from_analysis"] = bool(answer_from_analysis)
     stats = {
         "llm_calls": ctx.llm_calls,
         "tool_calls": len(ctx.tool_calls),
         "tokens": ctx.tokens,
         "cost_usd": round(ctx.cost_usd, 4),
         "token_budget": ctx.token_budget,
-        "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"),
+        "model": _choice(ctx.model_choice).get("label"),
+        "analysis_model": _choice(ctx.model_choice).get("label"),
+        "orchestrator": orchestrator_meta.get("orchestrator"),
+        "orchestrator_label": orchestrator_meta.get("orchestrator_final_label"),
+        "orchestrator_reason": orchestrator_meta.get("orchestrator_reason") or "",
+        "orchestrator_chain": list(orchestrator_meta.get("orchestrator_chain") or orchestrator_chain(ctx)),
+        "answer_from_analysis": bool(answer_from_analysis),
+        "models_used": getattr(ctx, "models_used", {}) or {},
         "artifacts": len(ctx.artifacts),
         "tools_used": sorted({c["name"] for c in ctx.tool_calls}),
         "notes": ctx.notes,
@@ -721,6 +909,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
         "stats": stats,
         "tool_calls": ctx.tool_calls,
         "artifacts": ctx.artifacts,
+        "orchestrator": orchestrator_meta,
         "no_data": bool(getattr(ctx, "no_data", False)),
         "text_gap": str(getattr(ctx, "text_gap", "") or ""),
     }

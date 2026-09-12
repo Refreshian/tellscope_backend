@@ -12108,6 +12108,118 @@ async def admin_llm_usage_days(user_id: int | None = None, case_id: str | None =
     return {"rows": _usage_api.aggregate_days(user_id=user_id, case=case_id, provider=provider,
                                               model=model, days=days, date_from=date_from, date_to=date_to)}
 
+
+# ==================== Оркестратор (только суперпользователь) ====================
+# Модель-оркестратор планирует шаги и вызывает инструменты Tellscope. Настройка живёт в
+# mlops/lock.yaml (секция agent) и переопределяется TELLSCOPE_ORCHESTRATOR*; читается на каждый
+# запуск, поэтому переключение действует без правки кода и рестарта. Здесь — админский тумблер.
+
+class OrchestratorBody(BaseModel):
+    orchestrator: Optional[str] = None
+    fallbacks: Optional[List[str]] = None
+    probe: Optional[str] = None
+    persist: bool = True
+    check: bool = True
+
+
+def _orchestrator_describe() -> Dict[str, Any]:
+    """Настройка оркестратора и последний выбор — без сетевых проб (для /harness/info)."""
+    try:
+        from mlops.orchestrator import describe as _describe
+
+        return _describe()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _orchestrator_active_payload(state: Any) -> Dict[str, Any]:
+    return {
+        "key": state.choice,
+        "label": state.label,
+        "requested": state.requested,
+        "chain": list(state.chain),
+        "fallback_used": state.fallback_used,
+        "reason": state.reason_text(),
+        "checked": state.checked,
+        "probe_mode": state.probe_mode,
+        "source": state.source,
+        "available": state.available,
+    }
+
+
+def _validate_model_keys(keys: List[str]) -> None:
+    from agent_engine.loop import MODEL_CHOICES
+
+    bad = [key for key in keys if key not in MODEL_CHOICES]
+    if bad:
+        raise HTTPException(status_code=400, detail=f"неизвестные ключи моделей: {', '.join(bad)}; доступны: {', '.join(MODEL_CHOICES)}")
+
+
+@app.get("/admin/orchestrator", tags=["admin"])
+async def admin_orchestrator_get(admin: User = Depends(current_superuser)):
+    """Текущая модель-оркестратор, цепочка отказов и активная модель. Только суперпользователь."""
+    from mlops import orchestrator as _orch
+
+    info = _orchestrator_describe()
+    active = await _orch.resolve_orchestrator()
+    return {
+        **info,
+        "active": _orchestrator_active_payload(active),
+        "run_metadata_fields": [
+            "orchestrator", "orchestrator_label", "orchestrator_chain",
+            "orchestrator_reason", "orchestrator_fallback_used", "models_used",
+        ],
+        "switch_hint": (
+            "POST /admin/orchestrator {\"orchestrator\": \"deepseek\", \"fallbacks\": [\"qwen\", \"gpt\"]} — "
+            "пишет значение в mlops/lock.yaml; без записи в файл: TELLSCOPE_ORCHESTRATOR=deepseek "
+            "(TELLSCOPE_ORCHESTRATOR_FALLBACKS=qwen,gpt) в .env — подхватится без рестарта"
+        ),
+    }
+
+
+@app.post("/admin/orchestrator", tags=["admin"])
+async def admin_orchestrator_set(body: OrchestratorBody, admin: User = Depends(current_superuser)):
+    """Переключает модель-оркестратор на ходу: пишет agent.orchestrator в mlops/lock.yaml.
+
+    Доступно только суперпользователю. Ответ содержит текущий оркестратор, цепочку отказов
+    и активную модель (с проверкой доступности, поэтому сразу видно, ушёл ли откат дальше).
+    """
+    from mlops import lock as _lock
+    from mlops import orchestrator as _orch
+
+    current = _lock.agent_cfg()
+    primary = (body.orchestrator or current.get("orchestrator") or "gpt").strip().lower()
+    fallbacks = body.fallbacks if body.fallbacks is not None else list(current.get("orchestrator_fallbacks") or [])
+    fallbacks = [str(key).strip().lower() for key in fallbacks if str(key).strip()]
+    probe = (body.probe or current.get("orchestrator_probe") or "tools").strip().lower()
+    _validate_model_keys([primary, *fallbacks])
+    if probe not in ("tools", "reachability"):
+        raise HTTPException(status_code=400, detail="probe должен быть tools или reachability")
+    if not body.persist:
+        raise HTTPException(
+            status_code=400,
+            detail="запись в конфиг отключена: переключите переменной окружения TELLSCOPE_ORCHESTRATOR в .env",
+        )
+    try:
+        saved = _lock.save_agent_cfg(primary, fallbacks, probe)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _orch.reset_cache()
+    active = await _orch.resolve_orchestrator(force=bool(body.check))
+    return {
+        "saved": {
+            "orchestrator": saved.get("orchestrator"),
+            "orchestrator_fallbacks": saved.get("orchestrator_fallbacks"),
+            "orchestrator_probe": saved.get("orchestrator_probe"),
+            "source": saved.get("source"),
+            "lock_path": saved.get("lock_path"),
+        },
+        "active": _orchestrator_active_payload(active),
+        "config": _orchestrator_describe().get("config"),
+        "backup": (str(saved.get("lock_path")) + ".bak_orch") if saved.get("lock_path") else None,
+    }
+
+
 # ============================== Агентный режим ==============================
 # Реестр инструментов, tool-calling цикл и стрим шагов. Ядро — пакет agent_engine.
 from agent_engine import catalog as _agent_catalog
@@ -12186,6 +12298,8 @@ async def agent_tools_catalog(user: User = Depends(current_user)):
     data["default_token_budget"] = _agent_runs.DEFAULT_TOKEN_BUDGET
     data["max_tokens_per_day"] = _agent_runs.MAX_TOKENS_PER_DAY
     data["tokens_today"] = _agent_runs.tokens_today_for_user(user.id)
+    # Кто планирует шаги и вызывает инструменты: настройка общая для агентного режима и центра задач.
+    data["orchestrator"] = _orchestrator_describe().get("config")
     return data
 
 
@@ -12830,10 +12944,15 @@ def _harness_dataset_name(index: Optional[int]) -> str:
 
 @app.get("/harness/info", tags=["harness"])
 async def harness_info(user: User = Depends(current_user)):
-    """Что умеет DeepSeek Harness: режимы, модели, инструменты, ссылка на Dify."""
+    """Что умеет DeepSeek Harness: режимы, модели, инструменты, ссылка на Dify.
+
+    Дополнительно отдаём модель-оркестратор: кто планирует шаги и вызывает инструменты,
+    цепочку отказов и причину последнего переключения.
+    """
     from agent_engine import harness as _harness
 
     catalog = _agent_catalog()
+    orchestrator = _orchestrator_describe()
     return {
         "modes": _harness.MODES,
         "models": [
@@ -12841,6 +12960,13 @@ async def harness_info(user: User = Depends(current_user)):
             for key, value in _AGENT_MODELS.items()
         ],
         "default_model": _harness.DEFAULT_MODEL,
+        # Модель анализа по умолчанию (генерация текста); оркестратор задаётся отдельно.
+        "analysis_default_model": _harness.DEFAULT_MODEL,
+        "orchestrator": orchestrator.get("config"),
+        "orchestrator_chain": orchestrator.get("chain"),
+        "orchestrator_last": orchestrator.get("last_resolution"),
+        "orchestrator_probe_cache": orchestrator.get("probe_cache"),
+        "orchestrator_error": orchestrator.get("error"),
         "tools_total": catalog.get("total"),
         "dify_url": _harness.DIFY_PUBLIC_URL,
         "tasks_total": len(_harness.list_tasks(user.id, limit=200)),
@@ -12902,6 +13028,10 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
                 "run_id": run["run_id"],
                 "stream": f"/api/ws/agent-run/{run['run_id']}",
                 "model": run.get("model_label"),
+                "analysis_model": run.get("model_label"),
+                # Фактическую модель-оркестратор (с учётом откатов) отдаёт /harness/task/{id}
+                # и /agent/run/{run_id}: она выбирается уже в момент старта прогона.
+                "orchestrator_config": _orchestrator_describe().get("config"),
             }
 
         if mode == "explain":
@@ -12982,7 +13112,12 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
         _agent_runs.start_run(run, user)
         run_id = run["run_id"]
     task = _harness.update_task(str(user.id), task_id, {"status": "running", "run_id": run_id})
-    return {"task": task, "run_id": run_id, "stream": f"/api/ws/agent-run/{run_id}"}
+    return {
+        "task": task,
+        "run_id": run_id,
+        "stream": f"/api/ws/agent-run/{run_id}",
+        "orchestrator_config": _orchestrator_describe().get("config"),
+    }
 
 
 @app.delete("/harness/task/{task_id}", tags=["harness"])

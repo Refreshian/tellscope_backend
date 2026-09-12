@@ -122,7 +122,7 @@ def create_task(user_id: Any, text: str, mode: str, index: Optional[int], datase
 # ------------------------------------------------------------------- модель
 
 def _model_choice(name: Optional[str]) -> str:
-    """Выбор модели: deepseek по умолчанию, с откатом на gpt, если профиль недоступен."""
+    """Модель анализа (генерация текста): выбор пользователя, иначе deepseek, иначе gpt."""
     from .loop import MODEL_CHOICES
 
     if name and name in MODEL_CHOICES:
@@ -130,48 +130,84 @@ def _model_choice(name: Optional[str]) -> str:
     return DEFAULT_MODEL if DEFAULT_MODEL in MODEL_CHOICES else "gpt"
 
 
-async def _llm(user: Any, messages: List[Dict[str, str]], *, model_choice: Optional[str] = None,
-               temperature: float = 0.2, max_tokens: int = 1400, timeout: float = 300.0) -> Tuple[str, Dict[str, Any]]:
-    """Один вызов модели через общий шлюз Tellscope. Возвращает (текст, учёт)."""
-    from mlops import gateway
+async def _planner_model() -> Tuple[str, Dict[str, Any]]:
+    """Модель-оркестратор для планирования задачи.
+
+    Берётся из единой настройки (agent.orchestrator в mlops/lock.yaml или TELLSCOPE_ORCHESTRATOR)
+    с цепочкой отказов, поэтому селектор модели в интерфейсе её больше не переключает.
+    """
+    from mlops.orchestrator import resolve_orchestrator
+
+    state = await resolve_orchestrator()
+    return state.choice, state.as_dict()
+
+
+def _candidate_keys(model_choice: Optional[str], role: str,
+                    orchestrator_meta: Optional[Dict[str, Any]]) -> List[str]:
+    """Порядок моделей для одного вызова: основная, затем отказы."""
     from .loop import MODEL_CHOICES, DEFAULT_CHOICE
 
-    choice_key = _model_choice(model_choice)
-    choice = MODEL_CHOICES.get(choice_key) or MODEL_CHOICES[DEFAULT_CHOICE]
-    extra = {"chat_template_kwargs": {"enable_thinking": False}} if choice.get("provider") == "vllm" else None
-    try:
-        result = await gateway.achat(
-            provider=choice["provider"],
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-            extra=extra,
-            profile=choice["profile"],
-            usage_ctx={"user_id": str(getattr(user, "id", "")), "case": "harness"},
-        )
-    except Exception as exc:  # noqa: BLE001
-        # DeepSeek может быть недоступен в профиле — падаем на дефолтную модель, чтобы задача не терялась
-        if choice_key != DEFAULT_CHOICE:
-            fallback = MODEL_CHOICES[DEFAULT_CHOICE]
+    if role == "orchestrator":
+        primary = str((orchestrator_meta or {}).get("orchestrator") or "") or _model_choice(model_choice)
+        tail = list((orchestrator_meta or {}).get("orchestrator_chain") or [])
+    else:
+        primary = _model_choice(model_choice)
+        tail = [DEFAULT_CHOICE]
+    keys = [primary] + [key for key in tail if key != primary]
+    keys = [key for key in keys if key in MODEL_CHOICES]
+    return keys or [DEFAULT_CHOICE]
+
+
+async def _llm(user: Any, messages: List[Dict[str, str]], *, model_choice: Optional[str] = None,
+               role: str = "orchestrator", temperature: float = 0.2, max_tokens: int = 1400,
+               timeout: float = 300.0) -> Tuple[str, Dict[str, Any]]:
+    """Один вызов модели через общий шлюз Tellscope. Возвращает (текст, учёт).
+
+    role="orchestrator" — планирование шагов и выбор инструментов: модель из единой настройки,
+        при недоступности профиля идём по списку orchestrator_fallbacks и пишем причину отката.
+    role="analysis" — генерация текста: остаётся моделью, которую выбрал пользователь.
+    """
+    from mlops import gateway
+    from mlops.orchestrator import failure_reason
+    from .loop import MODEL_CHOICES, DEFAULT_CHOICE
+
+    orchestrator_meta: Optional[Dict[str, Any]] = None
+    if role == "orchestrator":
+        _key, orchestrator_meta = await _planner_model()
+    keys = _candidate_keys(model_choice, role, orchestrator_meta)
+    usage_ctx = {"user_id": str(getattr(user, "id", "")), "case": "harness"}
+    fallback_reasons: List[str] = []
+    result: Any = None
+    choice = MODEL_CHOICES[keys[0]]
+    for position, key in enumerate(keys):
+        choice = MODEL_CHOICES.get(key) or MODEL_CHOICES[DEFAULT_CHOICE]
+        extra = {"chat_template_kwargs": {"enable_thinking": False}} if choice.get("provider") == "vllm" else None
+        try:
             result = await gateway.achat(
-                provider=fallback["provider"],
+                provider=choice["provider"],
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
-                extra=None,
-                profile=fallback["profile"],
-                usage_ctx={"user_id": str(getattr(user, "id", "")), "case": "harness"},
+                extra=extra,
+                profile=choice["profile"],
+                usage_ctx=usage_ctx,
             )
-            choice = fallback
-        else:
-            raise
+            break
+        except Exception as exc:  # noqa: BLE001
+            reason = failure_reason(exc) or f"{type(exc).__name__}: {exc}"
+            fallback_reasons.append(f"{choice.get('label')}: {reason}")
+            # Профиль недоступен (нет ключа, 401/403/429, недостаточно средств, ошибка пробы) —
+            # берём следующего из цепочки, чтобы задача пользователя не потерялась.
+            if position + 1 >= len(keys):
+                raise
     usage = (getattr(result, "raw", None) or {}).get("usage") or {}
     text = re.sub(r"<think>.*?</think>", "", getattr(result, "content", "") or "", flags=re.S | re.I).strip()
     account = {
         "model": choice.get("label"),
         "provider": choice.get("provider"),
+        "key": next((key for key in keys if MODEL_CHOICES.get(key) is choice), ""),
+        "role": role,
         "tokens": int(usage.get("total_tokens") or 0),
         "cost_usd": round(
             (
@@ -182,6 +218,19 @@ async def _llm(user: Any, messages: List[Dict[str, str]], *, model_choice: Optio
             4,
         ),
     }
+    if fallback_reasons:
+        account["fallback_reason"] = "; ".join(fallback_reasons)
+        account["fallback_used"] = True
+    if orchestrator_meta is not None:
+        account["orchestrator"] = {
+            **orchestrator_meta,
+            "orchestrator": account["key"],
+            "orchestrator_label": choice.get("label"),
+            "orchestrator_fallback_used": bool(orchestrator_meta.get("orchestrator_fallback_used") or fallback_reasons),
+            "orchestrator_reason": "; ".join(
+                [part for part in [str(orchestrator_meta.get("orchestrator_reason") or ""), *fallback_reasons] if part]
+            ),
+        }
     return text, account
 
 
@@ -310,7 +359,7 @@ def _flow_prompt(text: str, index: Optional[int], dataset_name: str) -> str:
 
 async def explain(user: Any, text: str, index: Optional[int] = None, dataset_name: str = "",
                   model_choice: Optional[str] = None) -> Dict[str, Any]:
-    """План решения задачи без выполнения."""
+    """План решения задачи без выполнения. Планирует модель-оркестратор из единой настройки."""
     raw, account = await _llm(
         user,
         [
@@ -318,6 +367,7 @@ async def explain(user: Any, text: str, index: Optional[int] = None, dataset_nam
             {"role": "user", "content": _plan_prompt(text, index, dataset_name)},
         ],
         model_choice=model_choice,
+        role="orchestrator",
         temperature=0.2,
         max_tokens=1400,
     )
@@ -347,6 +397,7 @@ async def explain(user: Any, text: str, index: Optional[int] = None, dataset_nam
         "can_run_now": bool(data.get("can_run_now", True)),
         "mode_hint": str(data.get("mode_hint") or "run")[:20],
         "model": account,
+        "orchestrator": account.get("orchestrator"),
     }
 
 
@@ -354,7 +405,7 @@ async def explain(user: Any, text: str, index: Optional[int] = None, dataset_nam
 
 async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_name: str = "",
                      model_choice: Optional[str] = None) -> Dict[str, Any]:
-    """Собирает цепочку шагов и сохраняет её как агента пользователя."""
+    """Собирает цепочку шагов и сохраняет её как агента пользователя. Планирует модель-оркестратор."""
     raw, account = await _llm(
         user,
         [
@@ -362,6 +413,7 @@ async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_
             {"role": "user", "content": _chain_prompt(text, index, dataset_name)},
         ],
         model_choice=model_choice,
+        role="orchestrator",
         temperature=0.15,
         max_tokens=2400,
     )
@@ -381,13 +433,14 @@ async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_
             "folder": str(data.get("folder") or "Центр задач")[:80],
             "dataset_index": index,
             "dataset_name": dataset_name,
+            # модель анализа для будущих запусков агента: планирование идёт на оркестраторе
             "model": _model_choice(model_choice),
             "steps": steps,
             "tools": sorted({str(step.get("tool")) for step in steps if step.get("tool")}),
             "schedule": {"enabled": False, "mode": "manual", "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5]},
         },
     )
-    return {"agent": agent, "steps": steps, "model": account}
+    return {"agent": agent, "steps": steps, "model": account, "orchestrator": account.get("orchestrator")}
 
 
 # ---------------------------------------------------------------- режим flow
@@ -677,7 +730,7 @@ def flow_path(user_id: Any, task_id: str, name: str = "") -> str:
 
 async def make_flow(user: Any, text: str, index: Optional[int] = None, dataset_name: str = "",
                     model_choice: Optional[str] = None) -> Dict[str, Any]:
-    """Генерирует DSL-файл workflow для Dify."""
+    """Генерирует DSL-файл workflow для Dify. Планирует модель-оркестратор."""
     raw, account = await _llm(
         user,
         [
@@ -685,6 +738,7 @@ async def make_flow(user: Any, text: str, index: Optional[int] = None, dataset_n
             {"role": "user", "content": _flow_prompt(text, index, dataset_name)},
         ],
         model_choice=model_choice,
+        role="orchestrator",
         temperature=0.2,
         max_tokens=2000,
     )
@@ -703,4 +757,5 @@ async def make_flow(user: Any, text: str, index: Optional[int] = None, dataset_n
             "либо вкладка «Импорт DSL» в студии. После импорта задайте поля формы (index, подтема, период) и запустите."
         ),
         "model": account,
+        "orchestrator": account.get("orchestrator"),
     }

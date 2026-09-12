@@ -31,6 +31,23 @@ external:
     smart_agent_planner: claude-sonnet-4.5
     harness: deepseek-chat
 
+# Модель-оркестратор: та, что планирует шаги и вызывает инструменты Tellscope
+# (агентный режим и планировщик центра задач). Значения — ключи MODEL_CHOICES
+# из agent_engine/loop.py: gpt | deepseek | qwen | claude.
+# Настройка читается на каждый запуск, поэтому меняется без правки кода и без рестарта;
+# переопределения окружением (приоритет выше файла):
+#   TELLSCOPE_ORCHESTRATOR=gpt|deepseek|qwen|claude
+#   TELLSCOPE_ORCHESTRATOR_FALLBACKS=deepseek,qwen
+#   TELLSCOPE_ORCHESTRATOR_PROBE=tools|reachability
+# tools — от кандидата требуется поддержка вызова инструментов; при недоступности
+# (нет ключа, 401/403/429, недостаточно средств, проба не прошла) берётся следующий
+# из orchestrator_fallbacks. reachability — достаточно, чтобы модель отвечала
+# (тогда работает резервный JSON-протокол вызова инструментов).
+agent:
+  orchestrator: gpt
+  orchestrator_fallbacks: [deepseek, qwen]
+  orchestrator_probe: tools
+
 prompts:
   mosinform_classify: classify_v1
   mosinform_insights: insights_v1

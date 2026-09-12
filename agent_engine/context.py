@@ -143,6 +143,18 @@ class AgentContext:
     max_date: Optional[int] = None
     allowed_tools: Set[str] = field(default_factory=set)
     model_choice: str = "claude"
+    # Модель-оркестратор (планирование шагов и вызовы инструментов) берётся из единой настройки
+    # mlops.lock.agent_cfg: orchestrator + orchestrator_fallbacks. Может смениться на ходу,
+    # поэтому храним и активный ключ, и цепочку отказов, и причину переключения.
+    orchestrator_choice: str = ""
+    orchestrator_chain: List[str] = field(default_factory=list)
+    orchestrator_info: Dict[str, Any] = field(default_factory=dict)
+    orchestrator_probe_mode: str = "tools"
+    # Ключ модели, ответившей последней: нужен для честного учёта цены прогона
+    # (оркестратор и модель анализа могут быть разными).
+    last_choice_key: str = ""
+    # Сколько вызовов и токенов ушло на каждую модель в этом запуске.
+    models_used: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     folder: str = "Агент"
     emit: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
     artifacts_dir: str = ""

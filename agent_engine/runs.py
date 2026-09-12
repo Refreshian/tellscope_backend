@@ -283,6 +283,78 @@ def _bridge_emit(run_id: str, main_loop: asyncio.AbstractEventLoop):
     return emit
 
 
+async def _resolve_orchestrator_meta(run: Dict[str, Any], emit: Any) -> Dict[str, Any]:
+    """Выбирает модель-оркестратор на этот запуск и кладёт решение в метаданные запуска.
+
+    Настройка (agent.orchestrator + orchestrator_fallbacks) читается заново на каждый запуск,
+    поэтому смена lock.yaml или переменной окружения действует без перезапуска приложения.
+    """
+    run["orchestrator_used"] = False
+    try:
+        from mlops.orchestrator import resolve_orchestrator
+
+        state = await resolve_orchestrator()
+    except Exception as exc:  # noqa: BLE001
+        run["orchestrator_resolve_error"] = f"{type(exc).__name__}: {exc}"
+        await emit({"type": "log", "level": "error", "message": f"Не удалось определить оркестратора: {exc}"})
+        return {}
+    meta = state.as_dict()
+    run.update(
+        {
+            "orchestrator": state.choice,
+            "orchestrator_label": state.label,
+            "orchestrator_requested": state.requested,
+            "orchestrator_chain": list(state.chain),
+            "orchestrator_source": state.source,
+            "orchestrator_probe": state.probe_mode,
+            "orchestrator_available": state.available,
+            "orchestrator_fallback_used": state.fallback_used,
+            "orchestrator_reason": state.reason_text(),
+        }
+    )
+    await emit(
+        {
+            "type": "log",
+            "level": "error" if state.fallback_used else "info",
+            "message": (
+                f"Оркестратор: {state.label} (цепочка: {', '.join(state.chain)}; "
+                f"проверка: {state.probe_mode}; источник настройки: {state.source})"
+                + (f" — откат, потому что {state.reason_text()}" if state.reason_text() else "")
+            ),
+        }
+    )
+    return meta
+
+
+def _merge_orchestrator_result(run: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """После прогона фиксируем ту модель, которая реально оркестрировала (могла смениться на ходу)."""
+    meta = result.get("orchestrator") or {}
+    stats = result.get("stats") or {}
+    final_key = meta.get("orchestrator_final") or stats.get("orchestrator") or run.get("orchestrator")
+    if final_key:
+        run["orchestrator"] = final_key
+    final_label = meta.get("orchestrator_final_label") or stats.get("orchestrator_label")
+    if final_label:
+        run["orchestrator_label"] = final_label
+    for field_name in ("orchestrator_requested", "orchestrator_source", "orchestrator_probe"):
+        if meta.get(field_name):
+            run[field_name] = meta[field_name]
+    if meta.get("orchestrator_chain") or stats.get("orchestrator_chain"):
+        run["orchestrator_chain"] = list(meta.get("orchestrator_chain") or stats.get("orchestrator_chain"))
+    reason = meta.get("orchestrator_reason") or stats.get("orchestrator_reason")
+    if reason:
+        run["orchestrator_reason"] = reason
+    if meta.get("orchestrator_fallback_used") or stats.get("orchestrator_fallback_used"):
+        run["orchestrator_fallback_used"] = True
+    if meta.get("analysis_model"):
+        run["analysis_model"] = meta["analysis_model"]
+        run["analysis_model_label"] = meta.get("analysis_model_label")
+    if meta.get("answer_from_analysis") is not None:
+        run["answer_from_analysis"] = bool(meta.get("answer_from_analysis"))
+    if stats.get("models_used"):
+        run["models_used"] = stats["models_used"]
+
+
 async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
     run = RUNS.get(run_id)
     if run is None:
@@ -294,6 +366,8 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
 
     user = run.get("_user")
     emit = _bridge_emit(run_id, main_loop) if main_loop is not None else (lambda event: _emit(run_id, event))
+    orchestrator_meta = await _resolve_orchestrator_meta(run, emit)
+    _persist(run)
     ctx = AgentContext(
         run_id=run_id,
         user=user,
@@ -306,6 +380,10 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         max_date=run.get("max_date"),
         allowed_tools=set(run.get("tools") or []),
         model_choice=str(run.get("model_choice") or DEFAULT_CHOICE),
+        orchestrator_choice=str(orchestrator_meta.get("orchestrator") or ""),
+        orchestrator_chain=list(orchestrator_meta.get("orchestrator_chain") or []),
+        orchestrator_info=dict(orchestrator_meta),
+        orchestrator_probe_mode=str(orchestrator_meta.get("orchestrator_probe") or "tools"),
         folder=str(run.get("folder") or "Агент"),
         emit=emit,
         artifacts_dir=artifacts_dir(run_id),
@@ -315,14 +393,18 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
     try:
         steps = run.get("steps") or []
         if steps:
-            # конструктор шагов: детерминированная цепочка
+            # конструктор шагов: детерминированная цепочка, LLM планирует только текст выводов,
+            # поэтому модель-оркестратор здесь не участвует
             from .pipeline import run_pipeline
 
             result = await run_pipeline(ctx, steps)
+            run["orchestrator_used"] = False
         else:
             result = await run_agent(ctx)
+            run["orchestrator_used"] = True
         run["answer"] = result.get("answer") or ""
         run["stats"] = result.get("stats") or {}
+        _merge_orchestrator_result(run, result)
         run["tool_calls"] = result.get("tool_calls") or []
         run["artifacts"] = result.get("artifacts") or []
         run["cost_usd"] = float((result.get("stats") or {}).get("cost_usd") or 0.0)

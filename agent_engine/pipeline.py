@@ -190,10 +190,17 @@ async def _run_chart_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) ->
 
 
 async def _run_llm_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
+    """Шаг «выводы ИИ» — это генерация текста, а не планирование.
+
+    Шаги цепочки заданы заранее и выполняются детерминированно, инструменты не выбираются
+    моделью, поэтому здесь используется модель анализа (выбор пользователя), а не
+    модель-оркестратор из настройки agent.orchestrator.
+    """
     from mlops import gateway
     from .loop import _load_prompt  # переиспользуем системный промпт аналитика
 
     choice = MODEL_CHOICES.get(getattr(ctx, "model_choice", DEFAULT_CHOICE)) or MODEL_CHOICES[DEFAULT_CHOICE]
+    ctx.last_choice_key = getattr(ctx, "model_choice", DEFAULT_CHOICE)
     prompt = render(step.get("prompt") or "", ctx, results)
     system = render(step.get("system") or "", ctx, results) or _load_prompt(
         "agent_system_v1",
