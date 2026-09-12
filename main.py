@@ -12622,6 +12622,209 @@ async def agent_tool_call(tool_name: str, request: Request, user_manager: UserMa
     return JSONResponse(body)
 
 
+# =============== DeepSeek Harness: единый центр задач Tellscope ===============
+# Пользователь описывает задачу обычным текстом, а ассистент либо объясняет план, либо сразу
+# выполняет её инструментами Tellscope, либо собирает цепочку шагов (агента), либо генерирует
+# DSL-workflow для конструктора Dify. Задачи хранятся по пользователю: data/<user_id>/harness_tasks.json,
+# поэтому каждый видит только свои задачи.
+
+class HarnessTaskRequest(BaseModel):
+    text: str
+    mode: str = "explain"
+    index: Optional[int] = None
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    model: Optional[str] = None
+
+
+def _harness_dataset_name(index: Optional[int]) -> str:
+    return _agent_dataset_name(index) if index is not None else ""
+
+
+@app.get("/harness/info", tags=["harness"])
+async def harness_info(user: User = Depends(current_user)):
+    """Что умеет DeepSeek Harness: режимы, модели, инструменты, ссылка на Dify."""
+    from agent_engine import harness as _harness
+
+    catalog = _agent_catalog()
+    return {
+        "modes": _harness.MODES,
+        "models": [
+            {"id": key, "label": value.get("label"), "tier": value.get("tier")}
+            for key, value in _AGENT_MODELS.items()
+        ],
+        "default_model": _harness.DEFAULT_MODEL,
+        "tools_total": catalog.get("total"),
+        "dify_url": _harness.DIFY_PUBLIC_URL,
+        "tasks_total": len(_harness.list_tasks(user.id, limit=200)),
+        "tokens_today": _agent_runs.tokens_today_for_user(user.id),
+        "tokens_per_day_limit": _agent_runs.MAX_TOKENS_PER_DAY,
+    }
+
+
+@app.get("/harness/tasks", tags=["harness"])
+async def harness_tasks(user: User = Depends(current_user)):
+    """Список задач пользователя (только свои)."""
+    from agent_engine import harness as _harness
+
+    tasks = _harness.list_tasks(user.id)
+    for task in tasks:  # подтягиваем актуальный статус запусков
+        run_id = task.get("run_id")
+        if run_id:
+            run = _agent_runs.get_run(run_id)
+            if run:
+                task["run_status"] = run.get("status")
+                task["run_cost_usd"] = run.get("cost_usd")
+    return {"tasks": tasks, "modes": _harness.MODES}
+
+
+@app.post("/harness/task", tags=["harness"])
+async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(current_user)):
+    """Создаёт задачу и выполняет выбранный режим: объяснить, выполнить, собрать цепочку или Dify-flow."""
+    from agent_engine import harness as _harness
+
+    text = (request.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Опишите задачу обычными словами")
+    modes = {item["id"] for item in _harness.MODES}
+    mode = request.mode if request.mode in modes else "explain"
+    if request.index is not None:
+        _guard_index_access(user, request.index)
+    dataset_name = _harness_dataset_name(request.index)
+    task = _harness.create_task(str(user.id), text, mode, request.index, dataset_name)
+
+    try:
+        if mode == "run":
+            run = _agent_runs.create_run(
+                user=user,
+                user_id=str(user.id),
+                task=text,
+                dataset_index=request.index,
+                dataset_name=dataset_name,
+                dataset_label=dataset_name,
+                min_date=request.min_date,
+                max_date=request.max_date,
+                tools=None,
+                model_choice=(request.model or _harness.DEFAULT_MODEL),
+                folder="DeepSeek Harness",
+            )
+            _agent_runs.start_run(run, user)
+            task = _harness.update_task(str(user.id), task["id"], {"status": "running", "run_id": run["run_id"]})
+            return {
+                "task": task,
+                "run_id": run["run_id"],
+                "stream": f"/api/ws/agent-run/{run['run_id']}",
+                "model": run.get("model_label"),
+            }
+
+        if mode == "explain":
+            result = await _harness.explain(user, text, request.index, dataset_name, request.model)
+            answer = result.get("summary") or ""
+        elif mode == "chain":
+            result = await _harness.make_chain(user, text, request.index, dataset_name, request.model)
+            agent = result.get("agent") or {}
+            answer = f"Собрана цепочка «{agent.get('name')}» из {len(result.get('steps') or [])} шагов — она лежит в «Мои агенты»."
+        else:
+            result = await _harness.make_flow(user, text, request.index, dataset_name, request.model)
+            path = _harness.flow_path(user.id, task["id"], (result.get("spec") or {}).get("title") or "flow")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(result.get("yaml") or "")
+            result.pop("yaml", None)
+            result["file"] = os.path.basename(path)
+            result["download"] = f"/api/harness/task/{task['id']}/file"
+            answer = f"Готов DSL-workflow «{(result.get('spec') or {}).get('title')}» на {result.get('nodes')} узлов — скачайте файл и импортируйте в Dify."
+        task = _harness.update_task(str(user.id), task["id"], {"status": "done", "result": result, "answer": answer})
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _harness.update_task(str(user.id), task["id"], {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:600]})
+        raise HTTPException(status_code=400, detail=str(exc)[:400]) from exc
+    return {"task": task}
+
+
+@app.get("/harness/task/{task_id}", tags=["harness"])
+async def harness_task_detail(task_id: str, user: User = Depends(current_user)):
+    """Детали задачи пользователя: план, цепочка, DSL, статус запуска."""
+    from agent_engine import harness as _harness
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    run_id = task.get("run_id")
+    if run_id:
+        run = _agent_runs.get_run(run_id)
+        if run:
+            task = dict(task)
+            task["run"] = {k: v for k, v in run.items() if k not in ("events", "_user")}
+    return {"task": task}
+
+
+@app.post("/harness/task/{task_id}/run", tags=["harness"])
+async def harness_task_run(task_id: str, user: User = Depends(current_user)):
+    """Выполняет задачу: собранную цепочку — как агента, план или текст — агентным циклом."""
+    from agent_engine import harness as _harness
+    from agent_engine import agents as _agent_agents_store
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if _agent_runs.active_runs_for_user(user.id) and len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
+        raise HTTPException(status_code=409, detail="Уже есть активная задача — дождитесь завершения")
+
+    agent_id = ((task.get("result") or {}).get("agent") or {}).get("id") if task.get("mode") == "chain" else None
+    if agent_id:
+        agent = _agent_agents_store.get_agent(user.id, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Агент из задачи не найден")
+        run = _agent_agents_store.start_agent_run(user.id, agent, user)
+        run_id = run["run_id"]
+    else:
+        dataset_index = task.get("dataset_index")
+        dataset_name = task.get("dataset_name") or ""
+        run = _agent_runs.create_run(
+            user=user,
+            user_id=str(user.id),
+            task=str(task.get("text") or ""),
+            dataset_index=dataset_index,
+            dataset_name=dataset_name,
+            dataset_label=dataset_name,
+            tools=None,
+            model_choice=_harness.DEFAULT_MODEL,
+            folder="DeepSeek Harness",
+        )
+        _agent_runs.start_run(run, user)
+        run_id = run["run_id"]
+    task = _harness.update_task(str(user.id), task_id, {"status": "running", "run_id": run_id})
+    return {"task": task, "run_id": run_id, "stream": f"/api/ws/agent-run/{run_id}"}
+
+
+@app.delete("/harness/task/{task_id}", tags=["harness"])
+async def harness_task_delete(task_id: str, user: User = Depends(current_user)):
+    """Удаляет задачу пользователя."""
+    from agent_engine import harness as _harness
+
+    if not _harness.delete_task(user.id, task_id):
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return {"ok": True, "deleted": task_id}
+
+
+@app.get("/harness/task/{task_id}/file", tags=["harness"])
+async def harness_task_file(task_id: str, user: User = Depends(current_user)):
+    """Скачивание DSL-файла, сгенерированного для Dify."""
+    from agent_engine import harness as _harness
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    file_name = ((task.get("result") or {}).get("file") or "").strip()
+    if not file_name:
+        raise HTTPException(status_code=404, detail="У задачи нет файла")
+    path = os.path.join(_harness.BACKEND_ROOT, "data", str(user.id), _harness.HARNESS_DIR_NAME, os.path.basename(file_name))
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(path, media_type="application/x-yaml", filename=os.path.basename(path))
+
+
 # ==================== Авторизация: вход с refresh-токеном ====================
 # Стандартный /auth/jwt/login отдаёт только access-токен (его обслуживает роутер FastAPI-Users),
 # поэтому фронтенд сохранял в cookie строку «undefined», обновление сессии не работало и после

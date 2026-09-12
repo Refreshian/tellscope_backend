@@ -36,6 +36,14 @@ MODEL_CHOICES: Dict[str, Dict[str, Any]] = {
         "price_out": 0.0,
         "tier": "free",
     },
+    "deepseek": {
+        "provider": "aitunnel",
+        "profile": "harness",
+        "label": "DeepSeek Chat — ассистент задач",
+        "price_in": 0.28,
+        "price_out": 0.42,
+        "tier": "cheap",
+    },
     "claude": {
         "provider": "aitunnel",
         "profile": "smart_agent_planner",

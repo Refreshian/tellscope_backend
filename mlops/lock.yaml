@@ -29,6 +29,7 @@ external:
     mosinform_insights: gpt-4.1-mini
     dashboard_qa: gpt-4.1-mini
     smart_agent_planner: claude-sonnet-4.5
+    harness: deepseek-chat
 
 prompts:
   mosinform_classify: classify_v1
