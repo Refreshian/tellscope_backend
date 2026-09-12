@@ -11785,6 +11785,25 @@ class AdminUserPatch(BaseModel):
     password: Optional[str] = None
 
 
+@app.get("/user-id", tags=["auth"])
+async def current_user_id(request: Request):
+    """Идентификатор текущего пользователя для фронтенда (гейт уже проверил токен)."""
+    import jwt as _jwt
+    from auth.auth import SECRET as _SECRET
+    token = ""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header[:7].lower() == "bearer ":
+        token = auth_header[7:].strip()
+    if not token:
+        token = request.cookies.get("token") or request.cookies.get("access_token") or ""
+    try:
+        payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        uid = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return {"user_id": str(uid), "id": uid}
+
+
 @app.get("/me")
 async def whoami(user: User = Depends(current_user)):
     return {"id": user.id, "email": user.email, "username": user.username,
@@ -12989,12 +13008,6 @@ async def login_with_refresh(
         print(f"refresh token store error: {exc}")
 
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
-
-
-@app.get("/user-id", tags=["auth"])
-async def current_user_id(user: User = Depends(current_user)):
-    """Идентификатор текущего пользователя (используется фронтендом при загрузке)."""
-    return {"user_id": str(user.id), "id": user.id, "email": getattr(user, "email", "")}
 
 
 @app.get("/auth/session", tags=["auth"])
