@@ -11582,6 +11582,8 @@ from ba_api import router as ba_router
 app.include_router(ba_router, dependencies=[Depends(current_user)])
 from information_summary import router as information_summary_router
 app.include_router(information_summary_router)
+from file_origin_api import router as file_origin_router
+app.include_router(file_origin_router)
 
 @app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
 async def graph_cluster_summary(request: Request):
