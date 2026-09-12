@@ -65,7 +65,9 @@ class ProgressTracker:
         self.sub_total = 0
         self.sub_units_done = 0
         self.sub_units_total = 0
+        self.sub_units_parallel = 0
         self.sub_started = 0.0
+        self._last_sub_eta = 0.0
         self._durations: List[float] = []
         self._stage_started = 0.0
         self._last_emit = 0.0
@@ -109,19 +111,15 @@ class ProgressTracker:
                 # Пачки ещё не вернулись: темпа нет, честной оценки пока быть не может.
                 return None
             if self.sub_total > 0 and self.sub_done > 0:
-                # Под-прогресс внутри шага. Пачки читаются параллельно и они неравные,
-                # поэтому темп считаем по пачкам, а по сообщениям — только как запасной вариант.
-                if self.sub_units_total > 1 and 0 < self.sub_units_done < self.sub_units_total:
-                    rate = max(0.0, now - self.sub_started) / float(self.sub_units_done)
-                    current = max(0.0, float(self.sub_units_total - self.sub_units_done) * rate)
+                current = self._sub_estimate(now)
+                known = current > 0
+                if not known and self._last_sub_eta:
+                    # Чтение закончилось, а шаг ещё идёт (сводка по темам, разбор моделью):
+                    # держим последнюю оценку, а не показываем «осталось 0 секунд».
+                    current = self._last_sub_eta
                     known = True
-                elif self.sub_done < self.sub_total:
-                    rate = max(0.0, now - self.sub_started) / float(self.sub_done)
-                    current = max(0.0, float(self.sub_total - self.sub_done) * rate)
-                    known = True
-                elif not self.total:
-                    # Чтение закончилось, а плана шагов нет: сколько ещё идти — неизвестно.
-                    return None
+                elif known and not self.total:
+                    self._last_sub_eta = current
             elif avg:
                 # Шаг без под-прогресса: опираемся на среднюю длительность шага.
                 current = avg
@@ -136,6 +134,35 @@ class ProgressTracker:
             # свободный агентный цикл: общая длительность заранее неизвестна
             return None
         return int(round(current))
+
+    def _sub_estimate(self, now: float) -> float:
+        """Оценка остатка внутри шага по под-прогрессу.
+
+        Пачки чтения текстов идут параллельно (три сразу), поэтому «последовательная»
+        оценка по числу прочитанных сообщений завышает остаток, а оценка «остальные пачки
+        закончатся вместе с уже завершённой самой медленной» — занижает. Берём среднее двух
+        границ, чтобы ошибка оставалась в пределах полуминуты, а не минут.
+        """
+        elapsed = max(0.0, now - self.sub_started)
+        if elapsed <= 0:
+            return 0.0
+        if self.sub_units_total > 1 and 0 < self.sub_units_done < self.sub_units_total:
+            rate = elapsed / float(self.sub_units_done)
+            upper = max(0.0, float(self.sub_units_total - self.sub_units_done) * rate)
+            unit_time = elapsed / float(self.sub_units_done)
+        elif self.sub_done < self.sub_total:
+            rate = elapsed / float(self.sub_done)
+            upper = max(0.0, float(self.sub_total - self.sub_done) * rate)
+            unit_time = elapsed
+        else:
+            return 0.0
+        if upper <= 0:
+            return 0.0
+        parallel = max(1, self.sub_units_parallel or self.sub_units_done or 1)
+        units_total = self.sub_units_total or 1
+        waves = -(-units_total // parallel)  # ceil: сколько «волн» пачек нужно всего
+        lower = max(0.0, unit_time * waves - elapsed)
+        return (upper + min(upper, lower)) / 2.0
 
     def eta_scope(self) -> str:
         if self.total:
@@ -222,7 +249,8 @@ class ProgressTracker:
         await self._emit(self.payload())
 
     async def sub(self, done: int, total: int, detail: str = "", stage: Optional[str] = None,
-                  units_done: Optional[int] = None, units_total: Optional[int] = None) -> None:
+                  units_done: Optional[int] = None, units_total: Optional[int] = None,
+                  units_parallel: Optional[int] = None) -> None:
         """Под-прогресс внутри шага: пачки чтения текстов и другие длинные под-операции.
 
         ``done``/``total`` — в сообщениях (то, что видит пользователь), ``units_*`` — в пачках:
@@ -232,12 +260,15 @@ class ProgressTracker:
             self.sub_stage = str(stage)
         if not self.sub_total:
             self.sub_started = time.time()
+            self._last_sub_eta = 0.0
         self.sub_total = max(0, _int(total))
         self.sub_done = max(0, min(_int(done), self.sub_total or _int(done)))
         if units_total is not None:
             self.sub_units_total = max(0, _int(units_total))
         if units_done is not None:
             self.sub_units_done = max(0, _int(units_done))
+        if units_parallel is not None:
+            self.sub_units_parallel = max(0, _int(units_parallel))
         if detail:
             self.detail = str(detail)
         await self._emit(self.payload())
@@ -263,7 +294,9 @@ class ProgressTracker:
         self.sub_total = 0
         self.sub_units_done = 0
         self.sub_units_total = 0
+        self.sub_units_parallel = 0
         self.sub_started = 0.0
+        self._last_sub_eta = 0.0
 
     # ----------------------------------------------------------------- heartbeat
 

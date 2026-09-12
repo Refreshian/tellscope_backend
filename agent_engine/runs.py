@@ -95,8 +95,15 @@ def _load_persisted(user_id: str, limit: int = 30) -> List[Dict[str, Any]]:
 def active_runs_for_user(user_id: Any) -> List[Dict[str, Any]]:
     out = []
     for run in RUNS.values():
-        if str(run.get("user_id")) == str(user_id) and run.get("status") in ("queued", "running"):
-            out.append(run)
+        if str(run.get("user_id")) != str(user_id):
+            continue
+        if run.get("status") not in ("queued", "running"):
+            continue
+        # Зависший запуск (нет событий и heartbeat) не должен занимать единственный слот
+        # пользователя: после перезапуска сервера такие записи иначе блокируют новые задачи.
+        if run_is_stale(run):
+            continue
+        out.append(run)
     return out
 
 
@@ -198,6 +205,16 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+            # Запись с диска этому процессу не принадлежит: если она числится активной,
+            # значит запуск был убит перезапуском сервера — помечаем прерванным, иначе
+            # такая «вечно идущая» запись занимает слот пользователя и путает статусы.
+            if str(data.get("status")) in ("queued", "running") and run_is_stale(data):
+                data["status"] = "interrupted"
+                data["error"] = "запуск прерван: сервер перезапускался, событий больше нет"
+                data["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                data["finished_ts"] = data["finished_ts"] or time.time()
+                data["progress_detail"] = data["error"]
+                _persist(data)
             RUNS[run_id] = data
             return data
         except Exception:
@@ -285,7 +302,7 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
 
 
 def active_runs_total() -> int:
-    return len([run for run in RUNS.values() if run.get("status") in ("queued", "running")])
+    return len([run for run in RUNS.values() if run.get("status") in ("queued", "running") and not run_is_stale(run)])
 
 
 # -------------------------------------------------------- прогресс, время, статусы задач
@@ -492,12 +509,20 @@ def reconcile_harness_tasks(user_id: Any) -> int:
                 patch = task_patch_from_run(run)
             elif run_is_stale(run, now):
                 idle = int((now - run_last_activity(run)) / 60.0)
+                # Гасим и сам запуск: иначе зависшая запись держит слот пользователя
+                # (одна активная задача на пользователя) и новые задачи не запускаются.
+                run["status"] = "interrupted"
+                run["error"] = f"запуск прерван: событий нет {idle} мин (сервер перезапускался или процесс убит)"
+                run["finished_at"] = run.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+                run["finished_ts"] = run.get("finished_ts") or now
+                run["progress_detail"] = run["error"]
+                _persist(run)
                 patch = {
                     "status": "failed",
                     "status_label": "прерван",
                     "run_status": "interrupted",
                     "run_progress": dict(run.get("progress") or {}),
-                    "error": f"запуск прерван: событий нет {idle} мин (сервер перезапускался или процесс убит)",
+                    "error": run["error"],
                 }
         if patch:
             try:
