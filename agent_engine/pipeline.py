@@ -22,6 +22,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from .loop import MODEL_CHOICES, DEFAULT_CHOICE
+from .progress import tracker as progress_tracker
 from .registry import execute as run_tool
 from .registry import get_tool
 
@@ -207,17 +208,32 @@ async def _run_llm_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> D
         "Ты аналитик соцмедиа и СМИ. Пиши деловым русским языком, без вводных фраз, только по переданным данным.",
     )
     extra = {"chat_template_kwargs": {"enable_thinking": False}} if choice.get("provider") == "vllm" else None
+    tracker = getattr(ctx, "progress", None)
     try:
-        result = await gateway.achat(
-            provider=choice["provider"],
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-            temperature=0.25,
-            max_tokens=int(step.get("max_tokens") or 1600),
-            timeout=420,
-            extra=extra,
-            profile=choice["profile"],
-            usage_ctx={"user_id": ctx.user_id, "case": "agent-mode"},
-        )
+        if tracker is not None:
+            # Шаг «выводы ИИ» длится десятки секунд — heartbeat виден в интерфейсе.
+            async with tracker.heartbeat():
+                result = await gateway.achat(
+                    provider=choice["provider"],
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                    temperature=0.25,
+                    max_tokens=int(step.get("max_tokens") or 1600),
+                    timeout=420,
+                    extra=extra,
+                    profile=choice["profile"],
+                    usage_ctx={"user_id": ctx.user_id, "case": "agent-mode"},
+                )
+        else:
+            result = await gateway.achat(
+                provider=choice["provider"],
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                temperature=0.25,
+                max_tokens=int(step.get("max_tokens") or 1600),
+                timeout=420,
+                extra=extra,
+                profile=choice["profile"],
+                usage_ctx={"user_id": ctx.user_id, "case": "agent-mode"},
+            )
         text = re.sub(r"<think>.*?</think>", "", result.content or "", flags=re.S | re.I).strip()
         _account_llm(ctx, result)
         return {"ok": bool(text), "text": text, "error": None if text else "модель вернула пустой ответ"}
@@ -265,9 +281,13 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     failed = 0
     executed = 0
     llm_steps = 0
+    plan = list((steps or [])[:MAX_STEPS])
+    # План известен заранее — интерфейс получает «шаг 4 из 12» и оценку остатка.
+    tracker = progress_tracker(ctx, total=len(plan))
+    await tracker.start_run()
     await ctx.event({"type": "start", "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"), "tools": ["шаги"], "token_budget": ctx.token_budget})
 
-    for number, step in enumerate((steps or [])[:MAX_STEPS], start=1):
+    for number, step in enumerate(plan, start=1):
         if ctx.out_of_time():
             ctx.notes.append("истёк лимит времени запуска")
             break
@@ -278,6 +298,7 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
         kind = str(step.get("kind") or "tool")
         title = render(step.get("title"), ctx, results) or STEP_KINDS.get(kind, kind)
         save_as = str(step.get("save_as") or f"step{number}")
+        await tracker.begin_stage(f"Шаг {number}. {title}", detail=STEP_KINDS.get(kind, kind))
         await ctx.event({"type": "tool_start", "name": kind, "title": f"Шаг {number}. {title}", "args": step.get("args") or {}})
 
         if kind == "tool":
@@ -322,6 +343,11 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "summary": outcome.get("error") or f"готово ({title})",
                 "error": outcome.get("error"),
             }
+        )
+        # Шаг завершён: инкремент счётчика, уточнение средней длительности шага и ETA.
+        await tracker.end_stage(
+            detail=outcome.get("error") or f"шаг {number} готов: {title}",
+            ok=bool(outcome.get("ok")),
         )
         if payload is not None:
             results[save_as + "_payload"] = payload

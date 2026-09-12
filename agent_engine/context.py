@@ -159,6 +159,9 @@ class AgentContext:
     emit: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
     artifacts_dir: str = ""
     deadline: float = 0.0
+    # Состояние прогресса запуска (agent_engine.progress.ProgressTracker): шаги, процент, ETA.
+    # Заполняется в runs.execute_run; шаги и инструменты пишут в него «что идёт сейчас».
+    progress: Any = None
 
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)

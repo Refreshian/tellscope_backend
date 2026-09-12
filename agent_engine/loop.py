@@ -304,6 +304,21 @@ def _request_extra(tools: Optional[List[dict]], force_tool: Optional[str],
     return extra or None
 
 
+def _progress(ctx) -> Any:
+    """Трекер прогресса запуска (None, если запуск не отслеживается)."""
+    return getattr(ctx, "progress", None)
+
+
+async def _achat(ctx, **kwargs):
+    """Вызов модели с heartbeat: пока модель отвечает, видно, что запуск жив."""
+    gateway = _gateway()
+    tracker = _progress(ctx)
+    if tracker is None:
+        return await gateway.achat(**kwargs)
+    async with tracker.heartbeat():
+        return await gateway.achat(**kwargs)
+
+
 async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int = 3000,
                     force_tool: Optional[str] = None, role: str = "orchestrator") -> Tuple[Any, bool]:
     """Возвращает (ChatResult, tools_supported). force_tool принудительно выбирает инструмент.
@@ -323,7 +338,7 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         choice = _choice(key)
         ctx.last_choice_key = key
         try:
-            result = await gateway.achat(
+            result = await _achat(ctx,
                 provider=choice["provider"],
                 messages=messages,
                 temperature=0.2,
@@ -347,7 +362,7 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
             )
             await ctx.log("Модель анализа недоступна — текст собран оркестратором", level="error")
             ctx.last_choice_key = fallback_key
-            return await gateway.achat(
+            return await _achat(ctx,
                 provider=fallback["provider"],
                 messages=messages,
                 temperature=0.2,
@@ -370,7 +385,7 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         await ctx.log(f"{choice['label']}: JSON-протокол вместо вызова инструментов", level="error")
         if JSON_PROTOCOL_HINT not in str(messages[0].get("content") or ""):
             messages[0]["content"] = str(messages[0].get("content") or "") + JSON_PROTOCOL_HINT
-        result = await gateway.achat(
+        result = await _achat(ctx,
             provider=choice["provider"],
             messages=messages,
             temperature=0.2,
@@ -386,7 +401,7 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         choice = _choice(key)
         ctx.last_choice_key = key
         try:
-            result = await gateway.achat(
+            result = await _achat(ctx,
                 provider=choice["provider"],
                 messages=messages,
                 temperature=0.2,
@@ -498,11 +513,26 @@ def _tool_payload(outcome: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": False, "error": outcome.get("error")}
 
 
+# Подсказки «что делается сейчас» для долгих инструментов: пользователю важно понимать,
+# что чтение текстов локальной моделью — это нормальные 2–3 минуты, а не зависание.
+TOOL_HINTS = {
+    "analyze_texts": "чтение текстов локальной моделью, обычно 2–3 минуты",
+    "deep_text_analysis": "подробный разбор темы моделью, обычно 1–3 минуты",
+    "build_report": "сборка отчёта DOCX/PDF",
+    "search_messages": "поиск сообщений в Elasticsearch",
+    "dataset_overview": "сводка по датасету",
+    "make_chart": "построение графика",
+}
+
+
 async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Выполняет один инструмент, стримит шаги в журнал и запоминает вызов."""
     spec = get_tool(name)
     if spec is None or name not in ctx.allowed_tools:
         return {"ok": False, "error": f"инструмент {name} недоступен"}
+    tracker = _progress(ctx)
+    if tracker is not None:
+        await tracker.begin_stage(f"Инструмент: {spec.title}", detail=TOOL_HINTS.get(name, "выполняется"))
     await ctx.event({"type": "tool_start", "name": name, "title": spec.title, "args": args})
     outcome = await execute(spec, ctx, args)
     summary = _summarize(name, outcome.get("result")) if outcome.get("ok") else str(outcome.get("error"))[:200]
@@ -518,6 +548,9 @@ async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "error": None if outcome.get("ok") else outcome.get("error"),
         }
     )
+    if tracker is not None:
+        # В свободном цикле общее число шагов неизвестно: показываем прогресс по факту.
+        await tracker.end_stage(detail=summary, ok=bool(outcome.get("ok")))
     return outcome
 
 
@@ -710,6 +743,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
         messages[0]["content"] += JSON_PROTOCOL_HINT
     tool_call_count = 0
     answer = ""
+    tracker = _progress(ctx)
     orchestrator_key = getattr(ctx, "orchestrator_choice", None) or ctx.model_choice
     await ctx.event(
         {
@@ -724,6 +758,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
             "token_budget": ctx.token_budget,
         }
     )
+    if tracker is not None:
+        # Свободный агентный цикл: число шагов заранее неизвестно, total не заполняем.
+        await tracker.start_run()
 
     for step in range(1, MAX_STEPS + 1):
         if ctx.out_of_time():
@@ -736,6 +773,11 @@ async def run_agent(ctx) -> Dict[str, Any]:
             ctx.notes.append(f"достигнут бюджет прогона: {ctx.tokens} токенов из {ctx.token_budget}")
             break
         _compact_history(messages)
+        if tracker is not None:
+            await tracker.set_stage(
+                f"Модель {_choice(orchestrator_key).get('label')}",
+                detail=f"выбирает следующий шаг (итерация {step})",
+            )
         try:
             result, tools_ok = await _call_llm(ctx, messages, tools_schema if use_tools else None)
         except Exception as exc:

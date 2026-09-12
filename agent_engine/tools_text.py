@@ -918,14 +918,46 @@ async def analyze_texts(
     semaphore = asyncio.Semaphore(PARALLEL_BATCHES)
     results: List[Dict[str, Any]] = []
     tokens_used = 0
+    # Прогресс по пачкам: это самый долгий шаг запуска, и раньше здесь было «тишина»
+    # на 2–3 минуты — пользователь не понимал, работает задача или зависла.
+    tracker = getattr(ctx, "progress", None)
+    read_done = 0
+    if tracker is not None:
+        await tracker.sub(
+            0,
+            selected,
+            stage="чтение текстов",
+            detail=f"читаю {selected} сообщений: пачек {len(batches)}, модель {model_label}",
+            units_done=0,
+            units_total=len(batches),
+        )
 
     async def worker(number: int, batch: List[Dict[str, Any]]) -> None:
-        nonlocal tokens_used
+        nonlocal tokens_used, read_done
         lines = [_message_line(doc["msg_id"], doc) for doc in batch]
         async with semaphore:
             outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines)
         tokens_used += int(outcome.get("tokens") or 0)
         results.append(outcome)
+        done_ok = bool(outcome.get("ok"))
+        if done_ok:
+            # Считаем прочитанным только то, что модель действительно разобрала.
+            read_done = min(selected, read_done + len(batch))
+        if tracker is not None:
+            batches_ok = len([item for item in results if item.get("ok")])
+            detail = (
+                f"прочитано {read_done} из {selected} сообщений (пачек: {batches_ok} из {len(batches)})"
+                if done_ok
+                else f"пачка {number} из {len(batches)} не разобрана: {str(outcome.get('error'))[:120]}"
+            )
+            await tracker.sub(
+                read_done,
+                selected,
+                stage="чтение текстов",
+                detail=detail,
+                units_done=batches_ok,
+                units_total=len(batches),
+            )
 
     await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
     parsed_batches = [item["parsed"] for item in results if item.get("ok")]

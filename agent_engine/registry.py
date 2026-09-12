@@ -203,13 +203,23 @@ def json_text(value: Any, max_chars: int = MAX_RESULT_CHARS) -> str:
 
 
 async def execute(spec: ToolSpec, ctx: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Выполняет инструмент с лимитом времени и безопасной обработкой ошибок."""
+    """Выполняет инструмент с лимитом времени и безопасной обработкой ошибок.
+
+    На время работы инструмента включается heartbeat (если запуск отслеживает прогресс):
+    самый долгий шаг — чтение текстов локальной моделью — идёт минутами, и без сигнала
+    «жив» интерфейс выглядел зависшим. Heartbeat гасится вместе с операцией.
+    """
     started = time.time()
     timeout = min(float(spec.timeout or 240.0), MAX_TOOL_TIMEOUT)
+    tracker = getattr(ctx, "progress", None)
     try:
         result = spec.handler(ctx, **(args or {}))
         if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout=timeout)
+            if tracker is not None:
+                async with tracker.heartbeat():
+                    result = await asyncio.wait_for(result, timeout=timeout)
+            else:
+                result = await asyncio.wait_for(result, timeout=timeout)
     except asyncio.TimeoutError:
         return {
             "ok": False,

@@ -12979,9 +12979,18 @@ async def harness_info(user: User = Depends(current_user)):
 
 @app.get("/harness/tasks", tags=["harness"])
 async def harness_tasks(user: User = Depends(current_user)):
-    """Список задач пользователя (только свои)."""
+    """Список задач пользователя (только свои).
+
+    Перед отдачей список чинится: статус задачи приводится к состоянию запуска (done/failed),
+    а зависшие запуски без событий помечаются прерванными. Иначе старые задачи навсегда
+    висели со статусом running, хотя запуск давно завершился.
+    """
     from agent_engine import harness as _harness
 
+    try:
+        _agent_runs.reconcile_harness_tasks(user.id)
+    except Exception as exc:  # noqa: BLE001 — список задач важнее служебной чистки
+        print(f"harness tasks reconcile error: {exc}")
     tasks = _harness.list_tasks(user.id)
     for task in tasks:  # подтягиваем актуальный статус запусков
         run_id = task.get("run_id")
@@ -12990,6 +12999,13 @@ async def harness_tasks(user: User = Depends(current_user)):
             if run:
                 task["run_status"] = run.get("status")
                 task["run_cost_usd"] = run.get("cost_usd")
+                task["run_progress"] = run.get("progress") or {}
+                task["duration_sec"] = run.get("duration_sec")
+                task["run_started_ts"] = run.get("started_ts")
+                task["run_finished_ts"] = run.get("finished_ts")
+                if _agent_runs.run_is_stale(run):
+                    task["run_status"] = "interrupted"
+                    task["stale"] = True
     return {"tasks": tasks, "modes": _harness.MODES}
 
 
@@ -13022,6 +13038,7 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
                 tools=None,
                 model_choice=(request.model or _harness.DEFAULT_MODEL),
                 folder="Центр задач",
+                mode=mode,
             )
             _agent_runs.start_run(run, user)
             task = _harness.update_task(str(user.id), task["id"], {"status": "running", "run_id": run["run_id"]})
@@ -13066,6 +13083,10 @@ async def harness_task_detail(task_id: str, user: User = Depends(current_user)):
     """Детали задачи пользователя: план, цепочка, DSL, статус запуска."""
     from agent_engine import harness as _harness
 
+    try:  # открытая задача тоже должна получить честный статус (done/failed/прерван)
+        _agent_runs.reconcile_harness_tasks(user.id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"harness task reconcile error: {exc}")
     task = _harness.get_task(user.id, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Задача не найдена")
@@ -13075,6 +13096,9 @@ async def harness_task_detail(task_id: str, user: User = Depends(current_user)):
         if run:
             task = dict(task)
             task["run"] = {k: v for k, v in run.items() if k not in ("events", "_user")}
+            if _agent_runs.run_is_stale(run):
+                task["run_status"] = "interrupted"
+                task["stale"] = True
     return {"task": task}
 
 
@@ -13110,6 +13134,7 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
             tools=None,
             model_choice=_harness.DEFAULT_MODEL,
             folder="Центр задач",
+            mode=str(task.get("mode") or "run"),
         )
         _agent_runs.start_run(run, user)
         run_id = run["run_id"]

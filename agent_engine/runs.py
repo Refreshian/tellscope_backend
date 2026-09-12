@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from .context import AGENT_RUNS_ROOT, AgentContext, to_unix_end, to_unix_start
 from .loop import DEFAULT_CHOICE, DEFAULT_TOKEN_BUDGET, MODEL_CHOICES, run_agent
+from .progress import ProgressTracker, human_duration
 from .registry import resolve_tools
 
 MAX_EVENTS = 800
@@ -22,6 +23,10 @@ MAX_RUNS_PER_DAY = 60
 MAX_TOKENS_PER_DAY = 1_500_000
 MIN_TOKEN_BUDGET = 20_000
 MAX_TOKEN_BUDGET = 2_000_000
+
+# Запуск без событий дольше этого времени считается прерванным (сервер перезапускался,
+# процесс убит): heartbeat во время длинных операций идёт каждые 10 секунд.
+STALE_AFTER_SEC = 240
 
 RUNS: Dict[str, Dict[str, Any]] = {}
 _SUBS: Dict[str, List[asyncio.Queue]] = {}
@@ -139,6 +144,7 @@ def create_run(
     folder: str = "Агент",
     token_budget: Optional[int] = None,
     steps: Optional[List[Dict[str, Any]]] = None,
+    mode: str = "",
 ) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
     try:
@@ -150,10 +156,15 @@ def create_run(
         "run_id": run_id,
         "user_id": str(user_id),
         "task": task,
+        "mode": str(mode or ""),
         "status": "queued",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_ts": time.time(),
         "started_at": None,
+        "started_ts": None,
         "finished_at": None,
+        "finished_ts": None,
+        "duration_sec": None,
         "model_choice": model_choice if model_choice in MODEL_CHOICES else DEFAULT_CHOICE,
         "model_label": (MODEL_CHOICES.get(model_choice) or MODEL_CHOICES[DEFAULT_CHOICE]).get("label"),
         "token_budget": budget,
@@ -227,6 +238,11 @@ async def _emit(run_id: str, event: Dict[str, Any]) -> None:
         events.append(event)
         if len(events) > MAX_EVENTS:
             del events[: len(events) - MAX_EVENTS]
+        # Свежесть запуска: по этим полям фронтенд показывает «последнее обновление N с назад»,
+        # а список задач понимает, что запуск без событий — прерванный.
+        run["last_event_ts"] = time.time()
+        if event.get("type") in ("progress", "heartbeat"):
+            run["progress"] = dict(event)
     for queue in list(_SUBS.get(run_id) or []):
         try:
             queue.put_nowait(event)
@@ -251,6 +267,7 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
     try:
         from mlops.runtime import register as register_job
 
+        progress = "100" if status in ("completed", "failed") else str((run.get("progress") or {}).get("percent") or 0)
         register_job(
             run["run_id"],
             product="agent-mode",
@@ -259,7 +276,7 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
             message=(run.get("task") or "")[:240],
             files=str(run.get("dataset_name") or ""),
             user_id=str(run.get("user_id") or ""),
-            progress="0",
+            progress=progress,
             prompt_id="agent_system_v1",
             model_id=str(run.get("model_label") or ""),
         )
@@ -269,6 +286,226 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
 
 def active_runs_total() -> int:
     return len([run for run in RUNS.values() if run.get("status") in ("queued", "running")])
+
+
+# -------------------------------------------------------- прогресс, время, статусы задач
+
+def _parse_local_ts(value: Any) -> float:
+    """'2026-09-12 20:15:03' (локальное время сервера) → unix-секунды."""
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return time.mktime(time.strptime(text[:19], fmt))
+        except Exception:
+            continue
+    return 0.0
+
+
+def run_last_activity(run: Dict[str, Any]) -> float:
+    """Когда запуск последний раз подавал признаки жизни.
+
+    Сначала — фактические события (progress/heartbeat), затем старт, затем создание записи.
+    """
+    for key in ("last_event_ts",):
+        value = run.get(key)
+        if value:
+            try:
+                return float(value)
+            except Exception:
+                pass
+    progress = run.get("progress") or {}
+    events = run.get("events") or []
+    if events:
+        stamp = str((events[-1] or {}).get("ts") or "")
+        if stamp:
+            try:
+                from datetime import datetime
+
+                return datetime.fromisoformat(stamp).timestamp()
+            except Exception:
+                pass
+    if progress.get("elapsed"):
+        started = run.get("started_ts")
+        if started:
+            try:
+                return float(started) + float(progress.get("elapsed") or 0)
+            except Exception:
+                pass
+    for key in ("started_ts", "finished_ts"):
+        value = run.get(key)
+        if value:
+            try:
+                return float(value)
+            except Exception:
+                pass
+    for key in ("started_at", "finished_at", "created_at"):
+        parsed = _parse_local_ts(run.get(key))
+        if parsed:
+            return parsed
+    return 0.0
+
+
+def run_is_stale(run: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """Запуск числится активным, но событий нет дольше STALE_AFTER_SEC."""
+    if str(run.get("status") or "") not in ("queued", "running"):
+        return False
+    last = run_last_activity(run)
+    if not last:
+        return False
+    return (now or time.time()) - last > STALE_AFTER_SEC
+
+
+def history_step_seconds(user_id: Any, mode: str = "") -> float:
+    """Среднее время одного шага по последним удачным запускам — база для первой оценки ETA.
+
+    Простая оценка: берём завершённые запуски того же режима (или все, если режим не совпал),
+    считаем длительность / число шагов и усредняем по последним восьми.
+    """
+    samples: List[float] = []
+    for item in _load_persisted(str(user_id), limit=40):
+        if str(item.get("status")) != "completed":
+            continue
+        if mode and str(item.get("mode") or "") and str(item.get("mode")) != mode:
+            continue
+        duration = item.get("duration_sec")
+        steps = int((item.get("stats") or {}).get("steps") or 0)
+        try:
+            duration = float(duration)
+        except Exception:
+            duration = 0.0
+        if not duration and item.get("started_at") and item.get("finished_at"):
+            duration = _parse_local_ts(item.get("finished_at")) - _parse_local_ts(item.get("started_at"))
+        if duration > 0 and steps > 0:
+            samples.append(duration / float(steps))
+        if len(samples) >= 8:
+            break
+    if not samples:
+        return 0.0
+    return sum(samples) / float(len(samples))
+
+
+def history_run_seconds(user_id: Any, mode: str = "") -> float:
+    """Средняя длительность прошлых запусков того же режима — подсказка «обычно это ~N минут»."""
+    samples: List[float] = []
+    for item in _load_persisted(str(user_id), limit=40):
+        if str(item.get("status")) != "completed":
+            continue
+        if mode and str(item.get("mode") or "") and str(item.get("mode")) != mode:
+            continue
+        try:
+            duration = float(item.get("duration_sec") or 0)
+        except Exception:
+            duration = 0.0
+        if not duration and item.get("started_at") and item.get("finished_at"):
+            duration = _parse_local_ts(item.get("finished_at")) - _parse_local_ts(item.get("started_at"))
+        if duration > 5:
+            samples.append(duration)
+        if len(samples) >= 8:
+            break
+    if not samples:
+        return 0.0
+    return sum(samples) / float(len(samples))
+
+
+def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Приводит запись задачи Центра ИИ-задач в соответствие с её запуском."""
+    ok = str(run.get("status")) == "completed"
+    answer = str(run.get("answer") or "")
+    return {
+        "status": "done" if ok else "failed",
+        "status_label": "выполнено" if ok else "неуспешно",
+        "run_status": str(run.get("status") or ""),
+        "finished_at": run.get("finished_at"),
+        "duration_sec": run.get("duration_sec"),
+        "answer": answer[:2000],
+        "error": run.get("error"),
+        "run_progress": dict(run.get("progress") or {}),
+    }
+
+
+def sync_harness_task(run: Dict[str, Any]) -> int:
+    """По завершении запуска обновляет статус задачи в data/<user>/harness_tasks.json.
+
+    Без этого задачи навсегда оставались в статусе running, хотя запуск уже completed.
+    """
+    try:
+        from . import harness as harness_store
+
+        user_id = run.get("user_id")
+        run_id = str(run.get("run_id") or "")
+        if not user_id or not run_id:
+            return 0
+        changed = 0
+        for task in harness_store.list_tasks(user_id, limit=200):
+            if str(task.get("run_id") or "") != run_id:
+                continue
+            harness_store.update_task(user_id, task.get("id"), task_patch_from_run(run))
+            changed += 1
+        return changed
+    except Exception:
+        return 0
+
+
+def reconcile_harness_tasks(user_id: Any) -> int:
+    """Чинит зависшие задачи: статус в хранилище приводится к состоянию запуска.
+
+    * запуск завершён, а задача всё ещё running → done/failed с текстом ошибки;
+    * запуск активен, но событий нет дольше STALE_AFTER_SEC → «прерван»;
+    * записи запуска нет вовсе (сервер перезапускался) → «прерван».
+    """
+    try:
+        from . import harness as harness_store
+
+        tasks = harness_store.list_tasks(user_id, limit=200)
+    except Exception:
+        return 0
+    now = time.time()
+    changed = 0
+    for task in tasks:
+        if str(task.get("status") or "") not in ("running", "new", "queued"):
+            continue
+        run_id = str(task.get("run_id") or "")
+        patch: Optional[Dict[str, Any]] = None
+        if not run_id:
+            created = _parse_local_ts(task.get("created_at"))
+            if created and now - created > STALE_AFTER_SEC:
+                patch = {
+                    "status": "failed",
+                    "status_label": "прерван",
+                    "run_status": "interrupted",
+                    "error": "задача осталась без запуска (сервер перезапускался) — запустите её снова",
+                }
+        else:
+            run = get_run(run_id)
+            if run is None:
+                created = _parse_local_ts(task.get("created_at"))
+                if created and now - created > STALE_AFTER_SEC:
+                    patch = {
+                        "status": "failed",
+                        "status_label": "прерван",
+                        "run_status": "interrupted",
+                        "error": "запись запуска не найдена: задача прервана, запустите её снова",
+                    }
+            elif str(run.get("status")) in ("completed", "failed"):
+                patch = task_patch_from_run(run)
+            elif run_is_stale(run, now):
+                idle = int((now - run_last_activity(run)) / 60.0)
+                patch = {
+                    "status": "failed",
+                    "status_label": "прерван",
+                    "run_status": "interrupted",
+                    "run_progress": dict(run.get("progress") or {}),
+                    "error": f"запуск прерван: событий нет {idle} мин (сервер перезапускался или процесс убит)",
+                }
+        if patch:
+            try:
+                harness_store.update_task(user_id, task.get("id"), patch)
+                changed += 1
+            except Exception:
+                continue
+    return changed
 
 
 def _bridge_emit(run_id: str, main_loop: asyncio.AbstractEventLoop):
@@ -361,6 +598,8 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         return
     run["status"] = "running"
     run["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    run["started_ts"] = time.time()
+    run["last_event_ts"] = run["started_ts"]
     _register_job(run, "running")
     _persist(run)
 
@@ -390,8 +629,18 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         deadline=time.time() + RUN_BUDGET_SEC,
         token_budget=int(run.get("token_budget") or DEFAULT_TOKEN_BUDGET),
     )
+    # Прогресс запуска: сколько шагов в плане (если план есть), сколько сделано и сколько осталось.
+    steps_plan = run.get("steps") or []
+    tracker = ProgressTracker(
+        ctx,
+        total=len(steps_plan),
+        history_step_sec=history_step_seconds(run.get("user_id"), str(run.get("mode") or "")),
+        history_run_sec=history_run_seconds(run.get("user_id"), str(run.get("mode") or "")),
+        mode=str(run.get("mode") or ""),
+    )
+    ctx.progress = tracker
     try:
-        steps = run.get("steps") or []
+        steps = steps_plan
         if steps:
             # конструктор шагов: детерминированная цепочка, LLM планирует только текст выводов,
             # поэтому модель-оркестратор здесь не участвует
@@ -428,8 +677,24 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
     finally:
         run.pop("_user", None)
         run["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        run["finished_ts"] = time.time()
+        started_ts = run.get("started_ts") or run["finished_ts"]
+        run["duration_sec"] = round(max(0.0, run["finished_ts"] - float(started_ts)), 1)
+        # Финальное событие прогресса: «выполнено за 3 мин 20 с» (или причина ошибки).
+        status = str(run.get("status") or "completed")
+        if status == "completed":
+            detail = f"выполнено за {human_duration(run['duration_sec'])}"
+        else:
+            detail = f"неуспешно за {human_duration(run['duration_sec'])}: {run.get('error') or 'причина не указана'}"
+        try:
+            await tracker.finish_run(status, detail=detail)
+        except Exception:
+            pass
+        run["progress_detail"] = detail
         _persist(run)
-        _register_job(run, str(run.get("status") or "completed"))
+        _register_job(run, status)
+        # Статус задачи в хранилище приводим в соответствие с завершившимся запуском.
+        sync_harness_task(run)
         await emit({"type": "done", "status": run.get("status"), "error": run.get("error")})
         for queue in list(_SUBS.get(run_id) or []):
             try:
