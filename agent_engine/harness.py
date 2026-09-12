@@ -218,7 +218,7 @@ def _tools_brief() -> str:
 
 
 PLANNER_SYSTEM = (
-    "Ты DeepSeek Harness — центр задач аналитической платформы Tellscope (аналитика соцмедиа и СМИ). "
+    "Ты ИИ-ассистент платформы Tellscope — аналитика соцмедиа и СМИ. "
     "Ты знаешь инструменты платформы, её конструктор цепочек и визуальный конструктор Dify. "
     "Отвечай деловым русским языком, без воды, только по делу. Если данных не хватает — прямо скажи, "
     "какой датасет или период нужен."
@@ -243,7 +243,7 @@ def _plan_prompt(text: str, index: Optional[int], dataset_name: str) -> str:
 
 
 CHAINS_SYSTEM = (
-    "Ты DeepSeek Harness — конструктор цепочек Tellscope. Ты собираешь цепочки шагов, "
+    "Ты ИИ-ассистент Tellscope и собираешь цепочки шагов. Ты собираешь цепочки шагов, "
     "которые выполняются детерминированно: шаг → шаг → отчёт. Пиши по-русски и только валидный JSON."
 )
 
@@ -270,7 +270,7 @@ def _chain_prompt(text: str, index: Optional[int], dataset_name: str) -> str:
 
 
 FLOWS_SYSTEM = (
-    "Ты DeepSeek Harness — конструктор Dify-workflow. Ты описываешь цепочку узлов Dify для аналитики "
+    "Ты ИИ-ассистент Tellscope и собираешь workflow для визуального конструктора Dify. Ты описываешь цепочку узлов Dify для аналитики "
     "соцмедиа и СМИ и отвечаешь только валидным JSON."
 )
 
@@ -366,7 +366,7 @@ async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_
             "name": str(data.get("name") or f"Задача: {text[:60]}")[:200],
             "description": str(data.get("description") or f"Цепочка, собранная DeepSeek Harness по задаче: {text[:200]}"),
             "instruction": str(data.get("instruction") or text)[:2000],
-            "folder": str(data.get("folder") or "DeepSeek Harness")[:80],
+            "folder": str(data.get("folder") or "Центр задач")[:80],
             "dataset_index": index,
             "dataset_name": dataset_name,
             "model": _model_choice(model_choice),
@@ -401,7 +401,7 @@ def build_dify_dsl(spec: Dict[str, Any], index: Optional[int]) -> str:
     """Собирает DSL-файл Dify: старт → инструменты → разбор моделью → отчёт → End."""
     title = str(spec.get("title") or "Tellscope — задача")[:120]
     subtitle = str(spec.get("subtitle") or "Аналитика соцмедиа и СМИ")[:200]
-    folder = str(spec.get("folder") or "DeepSeek Harness")[:80]
+    folder = str(spec.get("folder") or "Центр задач")[:80]
     tools = [item for item in (spec.get("tools") or []) if isinstance(item, dict) and item.get("tool")][:10]
     sections = [item for item in (spec.get("report_sections") or []) if isinstance(item, dict)][:6] or [
         {"heading": "Аналитика и выводы", "ask": "ключевые факты, тональность и выводы"}
@@ -552,7 +552,7 @@ def build_dify_dsl(spec: Dict[str, Any], index: Optional[int]) -> str:
         ("title", title, "constant"),
         ("subtitle", subtitle, "constant"),
         ("folder", folder, "constant"),
-        ("author", "DeepSeek Harness", "constant"),
+        ("author", "ИИ-ассистент Tellscope", "constant"),
     ]
     lines = [
         "desc: ''",

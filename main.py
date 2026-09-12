@@ -12706,7 +12706,7 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
                 max_date=request.max_date,
                 tools=None,
                 model_choice=(request.model or _harness.DEFAULT_MODEL),
-                folder="DeepSeek Harness",
+                folder="Центр задач",
             )
             _agent_runs.start_run(run, user)
             task = _harness.update_task(str(user.id), task["id"], {"status": "running", "run_id": run["run_id"]})
@@ -12790,7 +12790,7 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
             dataset_label=dataset_name,
             tools=None,
             model_choice=_harness.DEFAULT_MODEL,
-            folder="DeepSeek Harness",
+            folder="Центр задач",
         )
         _agent_runs.start_run(run, user)
         run_id = run["run_id"]
