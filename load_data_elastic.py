@@ -119,12 +119,23 @@ def split_text_into_chunks_optimized(text, max_tokens=MAX_TOKENS, overlap=OVERLA
         logger.error(f"Ошибка разбивки текста: {e}")
         return []
 
+# Поля вовлечённости Brand Analytics: аудитория, комментарии, лайки, репосты, просмотры, ER,
+# аудитория СМИ, дубли и индекс СМИ (цитируемость). BA отдаёт их числами либо пустой строкой —
+# пустая строка означает, что площадка метрику не публикует (типично для отзовиков и рекомендаций).
+# Приводим такие значения к 0, чтобы поле оставалось ЧИСЛОВЫМ в Elasticsearch: иначе динамический
+# маппинг делает его text, max-агрегация и сортировка в agent_engine.tools_text падают,
+# и инструмент analyze_texts уходит в fallback, хотя счётчики в данных есть.
+ENGAGEMENT_NUMERIC_FIELDS = [
+    "audienceCount", "commentsCount", "likesCount", "repostsCount", "viewsCount",
+    "er", "massMediaAudience", "duplicateCount", "citeIndex",
+]
+
 def validate_document_numeric_fields(doc):
     """Валидация числовых полей документа с детальным логированием"""
     if not isinstance(doc, dict):
         return doc
     
-    numeric_fields = ["timeCreate", "audienceCount"]
+    numeric_fields = ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS
     
     for field in numeric_fields:
         if field in doc:
@@ -202,7 +213,7 @@ def process_documents_batch(documents_batch):
             logger.debug(f"Документ {idx} ПОСЛЕ валидации: timeCreate={document.get('timeCreate')}, audienceCount={document.get('audienceCount')}")
             
             # Критическая проверка
-            for field in ["timeCreate", "audienceCount"]:
+            for field in ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS:
                 if field in document:
                     value = document[field]
                     if value is None:
@@ -239,7 +250,7 @@ def process_documents_batch(documents_batch):
             metadata = document.copy()
             
             # 🔍 ФИНАЛЬНАЯ ПРОВЕРКА МЕТАДАННЫХ
-            for key in ["timeCreate", "audienceCount"]:
+            for key in ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS:
                 if key in metadata and metadata[key] is None:
                     logger.error(f"❌ Найден None в метаданных для ключа {key}")
                     metadata[key] = 0
@@ -271,7 +282,7 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         logger.info(f"Проверка первых 3 документов на None значения...")
         for i, doc in enumerate(documents[:3]):
             if isinstance(doc, dict):
-                for field in ["timeCreate", "audienceCount"]:
+                for field in ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS:
                     if field in doc:
                         value = doc[field]
                         logger.info(f"  Документ {i}, поле {field}: {value} (type: {type(value)})")
@@ -302,7 +313,7 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         
         for doc_id, text, chunks, metadata in results:
             # 🔍 ПРОВЕРКА МЕТАДАННЫХ
-            for field in ["timeCreate", "audienceCount"]:
+            for field in ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS:
                 if field in metadata:
                     value = metadata[field]
                     if value is None:
@@ -365,7 +376,7 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         
         for doc_id, text, (start, end), metadata in index_info:
             # 🔍 ФИНАЛЬНАЯ ПРОВЕРКА ПЕРЕД ДОБАВЛЕНИЕМ
-            for field in ["timeCreate", "audienceCount"]:
+            for field in ["timeCreate"] + ENGAGEMENT_NUMERIC_FIELDS:
                 if field in metadata:
                     value = metadata[field]
                     if value is None:
@@ -694,6 +705,17 @@ def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None
                     "hub": {"type": "keyword"},
                     "city": {"type": "keyword"},
                     "audienceCount": {"type": "integer"},
+                    # Явные числовые типы: динамический маппинг делал viewsCount/citeIndex text
+                    # (BA присылает "" для площадок без счётчиков), после чего сортировка и
+                    # max-агрегация по вовлечённости в analyze_texts ломались целиком.
+                    "commentsCount": {"type": "long"},
+                    "likesCount": {"type": "long"},
+                    "repostsCount": {"type": "long"},
+                    "viewsCount": {"type": "long"},
+                    "massMediaAudience": {"type": "long"},
+                    "duplicateCount": {"type": "long"},
+                    "citeIndex": {"type": "long"},
+                    "er": {"type": "float"},
                     "url": {"type": "text", "index": False}
                 }
             },

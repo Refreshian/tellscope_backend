@@ -7,7 +7,10 @@
 
   * topics     — темы с числом сообщений, долей, средней тональностью и 2–3 цитатами
                  (цитата всегда дословная, с датой, площадкой, автором и ссылкой);
-  * highlights — ключевые сообщения по вовлечённости (с откатом на рейтинг отзыва и объём текста);
+  * highlights — ключевые сообщения по вовлечённости: комментарии, репосты, лайки, просмотры,
+                 аудитория, ER, аудитория СМИ (если счётчиков в источнике нет — откат на оценку
+                 отзыва, объём текста и число юридических/эмоциональных маркеров, и это прямо
+                 помечается в отчёте);
   * categories — сопоставление тем с фиксированным каркасом категорий;
   * summary    — аналитический текст по темам и цитатам;
   * stats      — сколько сообщений прочитано, сколько батчей, время, модель, токены.
@@ -70,8 +73,10 @@ CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
     ("сроки", ("срок", "задержк", "опозда", "вовремя", "просроч", "долго ждал", "неделю", "месяц ждал")),
 ]
 
-# Поля вовлечённости. В датасетах Brand Analytics они есть, но заполнены не всегда —
-# поэтому ниже есть честный откат на рейтинг отзыва и объём текста.
+# Поля вовлечённости Brand Analytics. В выгрузке BA («полнотекстовые сообщения», JSON) они есть
+# всегда: audienceCount, commentsCount, likesCount, repostsCount, viewsCount, er, massMediaAudience,
+# duplicateCount, citeIndex. Отзовики и сайты-рекомендации (otzovik.com, irecommend.ru) счётчики не
+# публикуют — там BA отдаёт нули, и инструмент честно уходит в fallback (см. NO_ENGAGEMENT_NOTE).
 ENGAGEMENT_WEIGHTS = {
     "commentsCount": 3.0,
     "repostsCount": 4.0,
@@ -82,8 +87,57 @@ ENGAGEMENT_WEIGHTS = {
     "viewsCount": 0.02,
     "duplicateCount": 0.5,
 }
-# Числовые поля, по которым можно считать max-агрегацию в Elasticsearch (viewsCount — text).
-ENGAGEMENT_AGG_FIELDS = ["commentsCount", "likesCount", "repostsCount", "audienceCount", "er", "massMediaAudience"]
+# Порядок показа метрик в основании ранжирования (stats.importance_basis) и в отчёте.
+ENGAGEMENT_ORDER = [
+    "commentsCount", "repostsCount", "likesCount", "viewsCount",
+    "audienceCount", "er", "massMediaAudience",
+]
+ENGAGEMENT_LABELS = {
+    "commentsCount": "комментарии",
+    "repostsCount": "репосты",
+    "likesCount": "лайки",
+    "viewsCount": "просмотры",
+    "audienceCount": "аудитория",
+    "er": "ER",
+    "massMediaAudience": "аудитория СМИ",
+    "duplicateCount": "дубли",
+}
+# Подписи метрик для промпта модели (естественные «комментариев 12, лайков 3»).
+PROMPT_METRICS = [
+    ("commentsCount", "комментариев"),
+    ("likesCount", "лайков"),
+    ("repostsCount", "репостов"),
+    ("viewsCount", "просмотров"),
+    ("audienceCount", "аудитория"),
+    ("massMediaAudience", "аудитория СМИ"),
+]
+# Поля, по которым считается max-агрегация в Elasticsearch и определяется, заполнена ли
+# вовлечённость в срезе. Агрегируем только по числовым полям индекса — см. _numeric_engagement_fields.
+ENGAGEMENT_AGG_FIELDS = list(ENGAGEMENT_ORDER)
+# Порядок сортировки в Elasticsearch: от «трудного» действия к «лёгкому».
+ENGAGEMENT_SORT_ORDER = ["commentsCount", "repostsCount", "likesCount", "viewsCount", "audienceCount"]
+# Запас кандидатов, когда вовлечённость заполнена: итоговый топ считает _importance по ВСЕМ метрикам,
+# поэтому одной сортировки Elasticsearch по комментариям мало.
+ENGAGEMENT_POOL_FACTOR = 4
+ENGAGEMENT_POOL_MAX = 400
+# Числовые типы Elasticsearch, по которым безопасно считать max и сортировать.
+ES_NUMERIC_TYPES = {
+    "long", "integer", "short", "byte", "double", "float", "half_float",
+    "scaled_float", "unsigned_long",
+}
+
+# Откат, когда счётчиков в источнике нет: юридический и эмоциональный накал сообщения.
+LEGAL_MARKERS = (
+    "суд", "иск", "претензи", "роспотребнадзор", "прокурат", "юрист", "адвокат", "закон",
+    "штраф", "жалоб", "нарушен", "обман", "фальсифи", "мошенн", "компенсац", "незаконн",
+)
+EMOTION_MARKERS = (
+    "ужас", "кошмар", "отврат", "возмут", "наглост", "хамств", "развод", "позор",
+    "катастроф", "никогда больше", "не советую", "испортил", "потерял", "обманул",
+    "беспредел", "отвратительн",
+)
+MARKER_WEIGHT = 6.0
+NO_ENGAGEMENT_NOTE = "в источнике нет данных о вовлечённости (площадка не публикует счётчики)"
 
 TONE_LABELS = {-1: "негатив", 0: "нейтрал", 1: "позитив"}
 
@@ -201,6 +255,39 @@ def _gateway_model_label() -> str:
 
 # ------------------------------------------------------------------ выборка сообщений
 
+def _markers(text: str) -> Dict[str, int]:
+    """Юридические и эмоциональные маркеры текста — сигнал важности, когда счётчиков нет."""
+    low = _flat(text).lower()
+    legal = sum(1 for marker in LEGAL_MARKERS if marker in low)
+    emotion = sum(1 for marker in EMOTION_MARKERS if marker in low)
+    return {"legal": legal, "emotion": emotion, "total": legal + emotion}
+
+
+def _markers_basis(markers: Dict[str, Any]) -> str:
+    return "юридических %s, эмоциональных %s" % (markers.get("legal") or 0, markers.get("emotion") or 0)
+
+
+def _fmt_num(value: Any) -> str:
+    """Число по-русски: 24 672 вместо 24672.0."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number.is_integer():
+        return "{:,.0f}".format(number).replace(",", " ")
+    return ("%.2f" % number).rstrip("0").rstrip(".")
+
+
+def _engagement_basis(doc: Dict[str, Any]) -> str:
+    """Перечень метрик, по которым реально посчитана важность сообщения."""
+    parts = [
+        "%s %s" % (ENGAGEMENT_LABELS.get(field, field), _fmt_num(doc.get(field)))
+        for field in ENGAGEMENT_ORDER
+        if doc.get(field)
+    ]
+    return ", ".join(parts) or "счётчики нулевые"
+
+
 def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
     """Нормализует документ Elasticsearch: текст, атрибуция и все метрики вовлечённости."""
     src = hit.get("_source") or {}
@@ -221,6 +308,7 @@ def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
         "rating": _num(src.get("review_rating")),
         "chars": len(raw_text),
     }
+    doc["markers"] = _markers(raw_text)
     engagement = 0.0
     for field, weight in ENGAGEMENT_WEIGHTS.items():
         value = _num(src.get(field))
@@ -234,16 +322,90 @@ def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
 def _importance(doc: Dict[str, Any], engagement_available: bool) -> Tuple[float, str]:
     """Важность сообщения.
 
-    Основной сигнал — вовлечённость (комментарии, репосты, лайки, просмотры, аудитория).
-    Если в срезе она не заполнена (типично для выгрузок отзывов Brand Analytics), используется
-    рейтинг отзыва и объём текста: чем ниже оценка и длиннее текст, тем информативнее отзыв.
+    Основной сигнал — вовлечённость: комментарии, репосты, лайки, просмотры, аудитория, ER,
+    аудитория СМИ. Метрики берутся из самой выгрузки Brand Analytics, а не оцениваются моделью.
+
+    Если в срезе счётчиков нет (типично для отзовиков и сайтов-рекомендаций, которые их вообще
+    не публикуют), работает честный и прозрачный откат: важнее то сообщение, у которого ниже
+    оценка отзыва, длиннее текст и больше юридических и эмоциональных маркеров. Основание расчёта
+    всегда возвращается текстом и попадает в stats.importance_basis и в отчёт.
     """
     if engagement_available and doc.get("engagement"):
-        return float(doc["engagement"]), "вовлечённость (комментарии/репосты/лайки/просмотры)"
+        return float(doc["engagement"]), "вовлечённость (" + _engagement_basis(doc) + ")"
+    markers = doc.get("markers") or {}
+    marker_points = float(markers.get("total") or 0) * MARKER_WEIGHT
     rating = doc.get("rating")
     if rating is not None:
-        return round((5.0 - rating) * 20.0 + min(doc.get("chars") or 0, 3000) / 300.0, 2), "рейтинг отзыва + объём текста"
-    return round((doc.get("chars") or 0) / 100.0, 2), "объём текста (вовлечённость в датасете не заполнена)"
+        score = round((5.0 - rating) * 20.0 + min(doc.get("chars") or 0, 3000) / 300.0 + marker_points, 2)
+        return score, "оценка отзыва + объём текста + маркеры (%s) — %s" % (
+            _markers_basis(markers), NO_ENGAGEMENT_NOTE)
+    score = round((doc.get("chars") or 0) / 100.0 + marker_points, 2)
+    return score, "объём текста + маркеры (%s) — %s" % (_markers_basis(markers), NO_ENGAGEMENT_NOTE)
+
+
+def _numeric_engagement_fields(index_name: str) -> List[str]:
+    """Поля вовлечённости, которые в индексе реально числовые.
+
+    Старые датасеты создавались до явного маппинга, поэтому viewsCount и citeIndex попадали в
+    Elasticsearch как text (BA присылает пустую строку). max-агрегация по text-полю падает целиком,
+    и раньше это выключало вовлечённость во всём срезе, хотя счётчики в данных были.
+    """
+    from .tools_data import _es
+
+    try:
+        mappings = _es().indices.get_mapping(index=index_name)
+    except Exception:
+        return []
+    props = (list(mappings.values())[0].get("mappings") or {}).get("properties") or {}
+    candidates = list(ENGAGEMENT_ORDER) + [f for f in ENGAGEMENT_WEIGHTS if f not in ENGAGEMENT_ORDER]
+    return [
+        field for field in candidates
+        if (props.get(field) or {}).get("type") in ES_NUMERIC_TYPES
+    ]
+
+
+def _engagement_agg(index_name: str, query: Dict[str, Any], fields: List[str]) -> Dict[str, float]:
+    """Max по полям вовлечённости. Одно «плохое» поле не должно выключать вовлечённость целиком."""
+    from .tools_data import _es
+
+    if not fields:
+        return {}
+    body = {"size": 0, "query": query, "aggs": {field: {"max": {"field": field}} for field in fields}}
+    try:
+        agg = _es().search(index=index_name, body=body).get("aggregations") or {}
+        return {field: float((agg.get(field) or {}).get("value") or 0) for field in fields}
+    except Exception:
+        pass
+    out: Dict[str, float] = {}
+    for field in fields:
+        try:
+            one = _es().search(
+                index=index_name,
+                body={"size": 0, "query": query, "aggs": {"v": {"max": {"field": field}}}},
+            ).get("aggregations") or {}
+            out[field] = float((one.get("v") or {}).get("value") or 0)
+        except Exception:
+            continue
+    return out
+
+
+def _engagement_script(fields: List[str]) -> Optional[Dict[str, Any]]:
+    """Runtime-поле __engagement — та же взвешенная сумма метрик, что считает _importance.
+
+    Нужно, чтобы Elasticsearch отдавал именно верхушку по вовлечённости, а не верхушку по
+    комментариям: сообщение с большой аудиторией и малым числом реакций иначе вытеснялось бы
+    из выборки. Имена полей и веса берутся из ENGAGEMENT_WEIGHTS, скрипт собирается на сервере.
+    """
+    parts = []
+    for field in fields:
+        weight = ENGAGEMENT_WEIGHTS.get(field)
+        if not weight:
+            continue
+        parts.append("s += (doc['%s'].size()==0 ? 0.0 : doc['%s'].value) * %s;" % (
+            field, field, float(weight)))
+    if not parts:
+        return None
+    return {"type": "double", "script": {"source": "double s = 0.0; " + " ".join(parts) + " emit(s);"}}
 
 
 def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, Any]:
@@ -253,39 +415,51 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
     query = _query(None, lo, hi, tone)
     total = _exact_count(index_name, query)
 
-    body = {
-        "size": 0,
-        "query": query,
-        "aggs": {field: {"max": {"field": field}} for field in ENGAGEMENT_AGG_FIELDS},
-    }
-    engagement_available = False
-    try:
-        agg = (_es().search(index=index_name, body=body).get("aggregations") or {})
-        engagement_available = any(float((agg.get(field) or {}).get("value") or 0) > 0 for field in ENGAGEMENT_AGG_FIELDS)
-    except Exception:
-        agg = {}
+    numeric = _numeric_engagement_fields(index_name)
+    agg_fields = [field for field in ENGAGEMENT_AGG_FIELDS if field in numeric]
+    engagement_max = _engagement_agg(index_name, query, agg_fields)
+    engagement_available = any(value > 0 for value in engagement_max.values())
+    engagement_fields = [f for f in ENGAGEMENT_ORDER if engagement_max.get(f, 0) > 0]
 
-    # Отбор: при заполненной вовлечённости берём самое вовлекающее, иначе — самые свежие
-    # сообщения среза (в отзывах Brand Analytics счётчики обычно нулевые).
+    # Отбор кандидатов. Если вовлечённость заполнена, Elasticsearch считает по runtime-полю
+    # __engagement ту же взвешенную величину, что и _importance, и мы забираем с запасом именно
+    # верхушку по ней. Если счётчиков нет (отзовики и сайты-рекомендации в Brand Analytics) —
+    # берём самые свежие сообщения среза. Способы отсортированы от лучшего к запасному: текстовый
+    # или отсутствующий в старом индексе столбец не должен ломать выборку.
+    runtime = None
+    size = int(limit)
+    candidate_specs: List[Optional[Dict[str, Any]]] = []
     if engagement_available:
-        sort_spec = [
-            {"commentsCount": {"order": "desc"}},
-            {"repostsCount": {"order": "desc"}},
-            {"likesCount": {"order": "desc"}},
-            {"timeCreate": {"order": "desc"}},
-        ]
-    else:
-        sort_spec = [{"timeCreate": {"order": "desc"}}]
-    search_body = {
-        "size": int(limit),
-        "_source": SOURCE_FIELDS,
-        "query": query,
-        "sort": sort_spec,
-    }
-    try:
-        res = _es().search(index=index_name, body=search_body)
-    except Exception as exc:
-        raise ToolError(f"Ошибка выборки сообщений: {exc}") from exc
+        size = min(max(int(limit) * ENGAGEMENT_POOL_FACTOR, int(limit)), ENGAGEMENT_POOL_MAX)
+        runtime = _engagement_script(numeric)
+        if runtime:
+            candidate_specs.append([{"__engagement": {"order": "desc"}}, {"timeCreate": {"order": "desc"}}])
+        candidate_specs.append(
+            [{field: {"order": "desc"}} for field in ENGAGEMENT_SORT_ORDER
+             if field in numeric and engagement_max.get(field, 0) > 0]
+            + [{"timeCreate": {"order": "desc"}}]
+        )
+    candidate_specs.append([{"timeCreate": {"order": "desc"}}])
+
+    res = None
+    last_exc: Optional[Exception] = None
+    for sort_spec in candidate_specs:
+        search_body: Dict[str, Any] = {
+            "size": size,
+            "_source": SOURCE_FIELDS,
+            "query": query,
+            "sort": sort_spec,
+        }
+        if runtime and sort_spec and "__engagement" in sort_spec[0]:
+            search_body["runtime_mappings"] = {"__engagement": runtime}
+        try:
+            res = _es().search(index=index_name, body=search_body)
+            break
+        except Exception as exc:  # noqa: BLE001 — пробуем следующий способ отбора
+            last_exc = exc
+            res = None
+    if res is None:
+        raise ToolError(f"Ошибка выборки сообщений: {last_exc}") from last_exc
 
     hits = (res.get("hits") or {}).get("hits") or []
     docs: List[Dict[str, Any]] = []
@@ -301,6 +475,7 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
     # m1 — самое важное сообщение среза: модель видит важное первым, ключевые сообщения
     # отчёта отбираются по этой же величине.
     docs.sort(key=lambda item: -float(item.get("importance") or 0))
+    docs = docs[: int(limit)]
     lines: List[str] = []
     docs_by_id: Dict[str, Dict[str, Any]] = {}
     for pos, doc in enumerate(docs, start=1):
@@ -314,7 +489,9 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
         "lines": lines,
         "messages_in_slice": total,
         "engagement_available": engagement_available,
-        "engagement_max": {field: (agg.get(field) or {}).get("value") for field in ENGAGEMENT_AGG_FIELDS},
+        "engagement_fields": engagement_fields,
+        "engagement_max": engagement_max,
+        "engagement_numeric_fields": numeric,
     }
 
 
@@ -323,12 +500,9 @@ def _message_line(msg_id: str, doc: Dict[str, Any]) -> str:
     metrics = []
     if doc.get("rating") is not None:
         metrics.append(f"рейтинг {doc['rating']:g}")
-    if doc.get("commentsCount"):
-        metrics.append(f"комментариев {doc['commentsCount']:g}")
-    if doc.get("likesCount"):
-        metrics.append(f"лайков {doc['likesCount']:g}")
-    if doc.get("repostsCount"):
-        metrics.append(f"репостов {doc['repostsCount']:g}")
+    for field, label in PROMPT_METRICS:
+        if doc.get(field):
+            metrics.append(f"{label} {doc[field]:g}")
     tail = (", " + ", ".join(metrics)) if metrics else ""
     return "[%s] (%s, %s, %s%s) %s" % (
         msg_id, doc.get("hub") or "источник", doc.get("date") or "", doc.get("tone") or "—", tail,
@@ -554,6 +728,11 @@ def _highlight_entry(doc: Dict[str, Any], why: str, *, model_picked: bool) -> Di
         "rating": doc.get("rating"),
         "importance": doc.get("importance"),
         "importance_basis": doc.get("importance_basis"),
+        "engagement": doc.get("engagement"),
+        "metrics": {
+            field: doc.get(field) for field in ENGAGEMENT_ORDER if doc.get(field)
+        },
+        "markers": doc.get("markers") or {},
     }
 
 
@@ -639,6 +818,8 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
             "rating": item.get("rating"),
             "importance": item.get("importance"),
             "importance_basis": item.get("importance_basis") or "",
+            "engagement": item.get("engagement"),
+            "metrics": item.get("metrics") or {},
         }
         for item in highlights[:limit]
     ]
@@ -848,6 +1029,15 @@ async def analyze_texts(
     if failed:
         scope_note += f" Не разобрано пачек: {failed}."
 
+    engagement_available = bool(found.get("engagement_available"))
+    engagement_fields = found.get("engagement_fields") or []
+    if engagement_available:
+        engagement_note = "Ранжирование ключевых сообщений: вовлечённость (" + ", ".join(
+            ENGAGEMENT_LABELS.get(field, field) for field in engagement_fields) + ")."
+    else:
+        engagement_note = NO_ENGAGEMENT_NOTE.capitalize() + " — важные сообщения отобраны по оценке отзыва, объёму текста и маркерам."
+        scope_note += " Метрики вовлечённости: " + NO_ENGAGEMENT_NOTE + "."
+
     seconds = round(time.time() - started, 1)
     return {
         "index": idx,
@@ -857,6 +1047,7 @@ async def analyze_texts(
         "messages_in_slice": int(found.get("messages_in_slice") or 0),
         "messages_analyzed": total_read,
         "engagement_available": bool(found.get("engagement_available")),
+        "engagement_fields": found.get("engagement_fields") or [],
         "engagement_max": compact(found.get("engagement_max") or {}, max_items=10, max_str=40),
         "tone_counts": {"negative": negative, "neutral": neutral, "positive": positive},
         # topics/categories/highlights отдаём как есть (без compact): compact добавляет в список
@@ -881,11 +1072,15 @@ async def analyze_texts(
             "local_model_tokens": tokens_used,
             "cost_usd": 0.0,
             "importance_basis": docs[0].get("importance_basis") if docs else "",
-            "engagement_available": bool(found.get("engagement_available")),
+            "engagement_available": engagement_available,
+            "engagement_fields": engagement_fields,
+            "engagement_max": found.get("engagement_max") or {},
+            "engagement_note": engagement_note,
         },
         "note": (
             "Раздел report_section обязательно передай в build_report (findings с темами, долями и цитатами "
             "попадут в DOCX/PDF отдельным блоком). Пояснения к каждому графику строй на этих темах и цитатах, "
-            "а не только на статистике. Цитаты уже сверены с текстами сообщений."
+            "а не только на статистике. Цитаты уже сверены с текстами сообщений. "
+            + engagement_note
         ),
     }

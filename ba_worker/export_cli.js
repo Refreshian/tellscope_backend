@@ -1,5 +1,21 @@
 
 // BA export CLI: node export_cli.js <themeId> <outDir> [tsf] [tst]
+//
+// Что выгружаем: в интерфейсе Brand Analytics кнопка Export (data-testid="export-selector-toggle")
+// предлагает только три вида выгрузки, опций «вовлечённость/ER/колонки» там нет:
+//   * analytic report — Excel / PDF / Word (сводные таблицы, не сообщения);
+//   * full text messages — CSV (лимит 200 000) и JSON (без лимита);
+//   * message snippets — CSV / Excel (лимит 500 000).
+// Берём именно «full text messages → JSON» (export-selector-messages-json): вместе с текстом он
+// отдаёт метрики вовлечённости, которые считает сам Brand Analytics:
+//   commentsCount, likesCount, repostsCount, viewsCount, audienceCount, er, massMediaAudience,
+//   duplicateCount, citeIndex, review_rating, toneMark.
+// Отзовики и сайты-рекомендации (otzovik.com, irecommend.ru, dreamjob.ru) счётчиков не публикуют —
+// Brand Analytics отдаёт по ним нули и пустой viewsCount. Это данные источника, а не потеря при
+// выгрузке: agent_engine/tools_text.py в таком случае честно помечает в отчёте, что вовлечённости
+// в источнике нет, и ранжирует сообщения по оценке, объёму текста и маркерам.
+// Публичного REST API у Brand Analytics для аккаунта не подключено (в .env_ba только логин/пароль),
+// поэтому выгрузка идёт через интерфейс, а готовность файла ждём до 10 минут.
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
@@ -84,6 +100,18 @@ async function ensureLogin(page) {
   await sleep(30000);
   const files = fs.existsSync(outDir) ? fs.readdirSync(outDir).filter(f=>f.endsWith('.json')) : [];
   if (!files.length) throw new Error('no file downloaded');
+  // Диагностика в stderr: stdout должен содержать только путь к файлу, его читает ba_import.py.
+  try {
+    const full = path.join(outDir, files[0]);
+    if (fs.statSync(full).size <= 64 * 1024 * 1024) {
+      const docs = JSON.parse(fs.readFileSync(full, 'utf8'));
+      if (Array.isArray(docs)) {
+        const fields = ['commentsCount','likesCount','repostsCount','viewsCount','audienceCount','er','massMediaAudience','citeIndex','duplicateCount'];
+        const withMetrics = docs.filter(d => fields.some(f => Number(d[f]) > 0)).length;
+        console.error('ENGAGEMENT docs_with_metrics=' + withMetrics + '/' + docs.length);
+      }
+    }
+  } catch (e) { console.error('ENGAGEMENT check skipped: ' + (e && e.message)); }
   console.log(outDir + '/' + files[0]);
   await browser.close();
 })().catch(e => { console.error('ERR ' + (e && e.message)); process.exit(1); });
