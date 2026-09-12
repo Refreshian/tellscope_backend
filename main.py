@@ -209,6 +209,26 @@ def _public_path(path: str) -> bool:
     return path in PUBLIC_EXACT or path.startswith(PUBLIC_PREFIXES)
 
 
+_ROUTE_RE = None
+
+
+def _known_route(path: str) -> bool:
+    """True, если путь соответствует зарегистрированному маршруту приложения."""
+    global _ROUTE_RE
+    if _ROUTE_RE is None:
+        import re as _re
+        pats = []
+        try:
+            for r in getattr(app, "routes", []):
+                p = getattr(r, "path", None)
+                if isinstance(p, str) and p:
+                    pats.append(_re.compile("^" + _re.sub(r"\{[^}]+\}", "[^/]+", p) + "$"))
+        except Exception:
+            pats = []
+        _ROUTE_RE = pats
+    return any(p.match(path) for p in _ROUTE_RE)
+
+
 class AuthGate:
     """ASGI-middleware: 401 на всё, что не в белом списке и пришло без токена."""
 
@@ -259,6 +279,9 @@ class AuthGate:
                 except Exception:
                     ok = False
 
+        if not ok and not _known_route(path):
+            # такого маршрута нет — пусть роутер ответит 404, а не 401
+            return await self.app(scope, receive, send)
         if not ok:
             body = b'{"detail":"Unauthorized"}'
             await send({
@@ -12966,6 +12989,12 @@ async def login_with_refresh(
         print(f"refresh token store error: {exc}")
 
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
+
+@app.get("/user-id", tags=["auth"])
+async def current_user_id(user: User = Depends(current_user)):
+    """Идентификатор текущего пользователя (используется фронтендом при загрузке)."""
+    return {"user_id": str(user.id), "id": user.id, "email": getattr(user, "email", "")}
 
 
 @app.get("/auth/session", tags=["auth"])
