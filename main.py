@@ -196,6 +196,86 @@ app = FastAPI(
     lifespan=combined_lifespan
 )
 
+# ---------------------------------------------------------------------------
+# Гейт авторизации: без валидного JWT (Authorization: Bearer, cookie token /
+# tellscope_refresh_token) либо сервисного токена (X-Service-Token) недоступно
+# ничего, кроме белого списка ниже.
+PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/models", "/chat"}
+PUBLIC_PREFIXES = ("/auth/", "/static/", "/favicon")
+
+
+def _public_path(path: str) -> bool:
+    return path in PUBLIC_EXACT or path.startswith(PUBLIC_PREFIXES)
+
+
+class AuthGate:
+    """ASGI-middleware: 401 на всё, что не в белом списке и пришло без токена."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        path = scope.get("path") or ""
+        if scope.get("method") == "OPTIONS" or _public_path(path):
+            return await self.app(scope, receive, send)
+
+        headers = {}
+        for k, v in scope.get("headers") or []:
+            try:
+                headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+            except Exception:
+                pass
+
+        token = ""
+        auth = headers.get("authorization", "")
+        if auth[:7].lower() == "bearer ":
+            token = auth[7:].strip()
+        if not token:
+            for pair in headers.get("cookie", "").split(";"):
+                if "=" in pair:
+                    name, value = pair.split("=", 1)
+                    if name.strip() in ("token", "access_token", "tellscope_refresh_token"):
+                        token = value.strip()
+                        break
+
+        ok = False
+        if token:
+            try:
+                import jwt as _jwt
+                from auth.auth import SECRET as _SECRET
+                payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
+                ok = bool(payload.get("sub"))
+            except Exception:
+                ok = False
+        if not ok:
+            service_token = headers.get("x-service-token", "").strip()
+            if service_token:
+                try:
+                    from agent_engine.service_api import match_service_token
+                    ok = bool(match_service_token(service_token))
+                except Exception:
+                    ok = False
+
+        if not ok:
+            body = b'{"detail":"Unauthorized"}'
+            await send({
+                "type": "http.response.start",
+                "status": 401,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b"Bearer"),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        return await self.app(scope, receive, send)
+
+
+app.add_middleware(AuthGate)
+# ---------------------------------------------------------------------------
 # Настройка CORS
 origins = [
     "http://localhost",
