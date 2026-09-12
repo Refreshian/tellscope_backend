@@ -103,7 +103,7 @@ def _existing_dataset(theme_title: str) -> Optional[Dict[str, Any]]:
                 pass
         return text
 
-    words = [w for w in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", _n(theme_title)) if len(w) >= 4]
+    words = [w for w in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", _n(theme_title)) if len(w) >= 3]
     if not words:
         return None
     best, best_score = None, 0
