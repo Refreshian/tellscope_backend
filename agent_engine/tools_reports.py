@@ -61,6 +61,34 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _coerce_list(value: Any, name: str) -> List[Any]:
+    """Приводит параметр к списку. Строки с JSON принимаются: так параметры приходят
+    из Dify, MCP и обычных HTTP-вызовов, где массивы передаются текстом."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(f"{name}: ожидается список или JSON-строка со списком ({exc})") from exc
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        raise ToolError(f"{name}: ожидается список, а пришло {type(value).__name__}")
+    out: List[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            stripped = item.strip()
+            if stripped[:1] in ("{", "["):
+                try:
+                    item = json.loads(stripped)
+                except Exception:  # noqa: BLE001
+                    pass
+        out.append(item)
+    return out
+
+
 @tool(
     "list_reports",
     title="Готовые отчёты",
@@ -134,10 +162,15 @@ async def make_chart(
     note: str = "",
 ):
     plt = _mpl()
+    categories = _coerce_list(categories, "categories")
+    series = _coerce_list(series, "series")
     if not categories:
         raise ToolError("categories не может быть пустым")
     if not series:
         raise ToolError("нужен хотя бы один ряд данных (series)")
+    series = [s for s in series if isinstance(s, dict) and s.get("values") is not None]
+    if not series:
+        raise ToolError('series: ожидается список объектов вида [{"name": "ряд", "values": [1, 2, 3]}]')
     cats = [str(c) for c in categories]
     fig, ax = plt.subplots(figsize=(10, 5.4), dpi=170)
     idx = list(range(len(cats)))
@@ -412,13 +445,7 @@ async def build_report(
     folder: Optional[str] = None,
     author: str = "агент Tellscope",
 ):
-    if isinstance(sections, str):
-        try:
-            sections = json.loads(sections)
-        except Exception as exc:
-            raise ToolError(f"sections передан строкой, но это не JSON: {exc}") from exc
-    if isinstance(sections, dict):
-        sections = [sections]
+    sections = _coerce_list(sections, "sections")
     if not sections:
         raise ToolError(
             "Нужны заголовок и разделы: вызовите build_report с аргументами "

@@ -32,7 +32,7 @@ STEP_KINDS = {
     "report": "Собрать отчёт DOCX/PDF",
 }
 
-MAX_STEPS = 14
+MAX_STEPS = 16
 
 _PLACEHOLDER = re.compile(r"\{\{\s*([^}]+?)\s*\}\}")
 

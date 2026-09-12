@@ -189,6 +189,103 @@ PRESETS: List[Dict[str, Any]] = [
              "sections": [{"heading": "Разбор темы", "text": "{{synthesis.text}}", "chart_ids": ["chart1"]}]},
         ],
     },
+    {
+        "id": "subtopic_report",
+        "name": "Отчёт по подтеме: тональность, авторы, цепочки, негатив и позитив",
+        "description": (
+            "Готовая цепочка из 14 шагов: поисковые слова подтемы → ИИ-аналитика → тональность, авторы и рейтинг СМИ, "
+            "цепочки авторов, примеры негатива и позитива → три графика → выводы ИИ → отчёт DOCX/PDF. "
+            "Свою подтему (поисковые слова) укажите в шагах 1, 4, 5, 6 и 7 вместо слова «просрочка»."
+        ),
+        "instruction": (
+            "Собери отчёт по подтеме: тональность, авторы, цепочки авторов, негатив, позитив и выводы."
+        ),
+        "tools": [
+            "search_messages",
+            "tonality_summary",
+            "media_rating",
+            "chain_graph",
+            "ai_analytics",
+            "make_chart",
+            "build_report",
+        ],
+        "folder": "Отчёт по подтеме",
+        "token_budget": 150000,
+        "schedule": {"enabled": False, "mode": "manual", "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5]},
+        "steps": [
+            {"kind": "tool", "title": "1. Поиск сообщений по подтеме", "tool": "search_messages",
+             "args": {"phrase": "просрочка", "limit": 30, "sort": "relevance"}, "save_as": "search"},
+            {"kind": "tool", "title": "2. Тональность: всего и по площадкам", "tool": "tonality_summary",
+             "save_as": "tonality"},
+            {"kind": "tool", "title": "3. Рейтинг СМИ и авторов", "tool": "media_rating",
+             "args": {"limit": 12}, "save_as": "media"},
+            {"kind": "tool", "title": "4. Цепочки авторов по подтеме", "tool": "chain_graph",
+             "args": {"phrase": "просрочка"}, "save_as": "chain"},
+            {"kind": "tool", "title": "5. Негатив: примеры сообщений", "tool": "search_messages",
+             "args": {"phrase": "просрочка", "tone": "негатив", "limit": 15, "sort": "relevance"},
+             "save_as": "negative"},
+            {"kind": "tool", "title": "6. Позитив: примеры сообщений", "tool": "search_messages",
+             "args": {"phrase": "просрочка", "tone": "позитив", "limit": 15, "sort": "relevance"},
+             "save_as": "positive"},
+            {"kind": "tool", "title": "7. ИИ-аналитика по подтеме", "tool": "ai_analytics",
+             "args": {"query_str": "просрочка"}, "save_as": "ai"},
+            {"kind": "chart", "title": "Тональность по подтеме", "from": "{{tonality.tonality_total}}",
+             "label_field": "tone", "value_field": "count", "chart_type": "pie",
+             "series_name": "Сообщений", "save_as": "chart_tone"},
+            {"kind": "chart", "title": "Динамика упоминаний по месяцам", "from": "{{search.monthly_dynamics}}",
+             "label_field": "month", "value_field": "count", "chart_type": "line",
+             "series_name": "Сообщений", "save_as": "chart_dynamics"},
+            {"kind": "chart", "title": "Топ авторов негатива", "from": "{{tonality.top_negative_authors}}",
+             "label_field": "author", "value_field": "posts_in_top1000", "chart_type": "hbar",
+             "series_name": "Постов в топ-1000", "save_as": "chart_authors"},
+            {"kind": "llm", "title": "8. Раздел «Тональность»", "save_as": "sum_tone", "max_tokens": 900,
+             "prompt": (
+                 "Подтема: {{search.phrase}}. Датасет: {{search.index_name}}, период {{search.period.from}} — {{search.period.to}}.\n\n"
+                 "Найдено по подтеме: {{search.messages_found}} сообщений; формулировки поиска: {{search.search_terms}}.\n"
+                 "Тональность по подтеме: {{search.tonality}}; тональность по всему датасету: {{tonality.tonality_total}}.\n"
+                 "Тональность по площадкам: {{tonality.tonality_by_hub}}.\n"
+                 "Динамика по месяцам: {{search.monthly_dynamics}}.\n"
+                 "Примеры негатива: {{negative.examples}}\n"
+                 "Примеры позитива: {{positive.examples}}\n\n"
+                 "Напиши раздел отчёта «Тональность и динамика»: 1) сколько сообщений по подтеме и как это выглядит на фоне "
+                 "датасета; 2) доли негатива, нейтрала и позитива, чего больше и как меняется по месяцам; 3) какие площадки "
+                 "дают негатив, а какие позитив; 4) конкретные претензии из негатива (3–4 с формулировками и ссылками); "
+                 "5) что хвалят в позитиве (3 пункта). Только факты из данных, без вводных фраз, объём 5–8 абзацев."
+             )},
+            {"kind": "llm", "title": "9. Раздел «Авторы и цепочки»", "save_as": "sum_authors", "max_tokens": 900,
+             "prompt": (
+                 "Подтема: {{search.phrase}}. Датасет: {{search.index_name}}, период {{search.period.from}} — {{search.period.to}}.\n\n"
+                 "Авторы негатива: {{tonality.top_negative_authors}}\n"
+                 "Авторы позитива: {{tonality.top_positive_authors}}\n"
+                 "Рейтинг СМИ (всего публикаций: {{media.smi_messages_total}}): негативные {{media.negative_smi}}; "
+                 "позитивные {{media.positive_smi}}; лента публикаций {{media.media_feed}}\n"
+                 "Цепочки распространения: статистика {{chain.stats}}; топ распространителей {{chain.top_spreaders}}; "
+                 "кластеры {{chain.clusters}}; хронология {{chain.timeline_summary}}\n"
+                 "Что показывает встроенная ИИ-аналитика ({{ai.total_rows}} сообщений): {{ai.examples}}\n\n"
+                 "Напиши раздел отчёта «Авторы и цепочки распространения»: 1) кто задаёт повестку по подтеме — топ-5 авторов "
+                 "с цифрами; 2) кто разгоняет негатив и кто поддерживает позитив; 3) как инфоповод расходится: первоисточник, "
+                 "кто подхватил, через какие площадки, сколько времени заняла волна; 4) какие кластеры сообщений появились; "
+                 "5) какие СМИ пишут по теме. Только факты из данных, 4–6 абзацев."
+             )},
+            {"kind": "llm", "title": "10. Выводы и рекомендации", "save_as": "sum_conclusions", "max_tokens": 800,
+             "prompt": (
+                 "Подтема: {{search.phrase}}. Найдено {{search.messages_found}} сообщений, тональность: {{search.tonality}}.\n\n"
+                 "Раздел «Тональность»:\n{{sum_tone.text}}\n\n"
+                 "Раздел «Авторы и цепочки»:\n{{sum_authors.text}}\n\n"
+                 "Сформулируй 5–7 нумерованных выводов и рекомендаций: что происходит с подтемой, где риск, что делать "
+                 "в первую очередь, за чем следить дальше. Каждый пункт — одно-два предложения, с цифрами из данных."
+             )},
+            {"kind": "report", "title": "11. Сборка отчёта DOCX/PDF", "save_as": "report",
+             "report_title": "Отчёт по подтеме: {{search.phrase}}",
+             "subtitle": "Датасет {{search.index_name}}, период {{search.period.from}} — {{search.period.to}}",
+             "folder": "Отчёт по подтеме",
+             "sections": [
+                 {"heading": "Тональность и динамика", "text": "{{sum_tone.text}}", "chart_ids": ["chart1", "chart2"]},
+                 {"heading": "Авторы и цепочки распространения", "text": "{{sum_authors.text}}", "chart_ids": ["chart3"]},
+                 {"heading": "Выводы и рекомендации", "text": "{{sum_conclusions.text}}"},
+             ]},
+        ],
+    },
 ]
 
 _PRESET_BY_ID = {preset["id"]: preset for preset in PRESETS}
