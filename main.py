@@ -726,6 +726,36 @@ app.include_router(
 
 current_user = fastapi_users.current_user()
 
+
+async def current_user_any(
+    request: Request,
+    user_manager: UserManager = Depends(get_user_manager),
+):
+    """Пользователь по Bearer-заголовку ИЛИ по cookie с токеном.
+
+    Нужен для файлов, которые открываются обычной навигацией браузера
+    (скачивание артефактов): там нет заголовка Authorization, но есть cookie.
+    """
+    token = ""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header[:7].lower() == "bearer ":
+        token = auth_header[7:].strip()
+    if not token:
+        token = (request.cookies.get("token")
+                 or request.cookies.get("access_token")
+                 or request.cookies.get("tellscope_refresh_token")
+                 or "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    strategy = auth_backend.get_strategy()
+    try:
+        user = await strategy.read_token(token, user_manager)
+    except Exception:
+        user = None
+    if user is None or not getattr(user, "is_active", False):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user
+
 # indexes = {1: "rosbank_01.02.2024-07.02.2024", 2: "skillfactory_zaprosy_na_obuchenie_15.01.2024-21.01.2024", 3:'rosbank_19.02.2024-29.02.2024', 
 #            4: "rosbank_14.03.2024-14.03.2024_fullday", 5: "r_13.03.2024-14.03.2024_full", 6: "rosbank_22.03.2024-24.03.2024", 
 #            7: "monitoring_tem_19.03.2024-25.03.2024", 8: 'rosbank_26.03.2024-01.04.2024', 9: 'tehfob', 10: 'transport_01.01.2024-09.04.2024', 
@@ -12242,7 +12272,7 @@ async def agent_run_status(run_id: str, user: User = Depends(current_user)):
 
 
 @app.get("/agent/artifact/{run_id}/{file_name}", tags=["agent mode"])
-async def agent_artifact(run_id: str, file_name: str, user: User = Depends(current_user)):
+async def agent_artifact(run_id: str, file_name: str, user: User = Depends(current_user_any)):
     """Скачивание артефакта запуска (графики, промежуточные файлы)."""
     run = _agent_runs.get_run(run_id)
     if not run:
@@ -12963,7 +12993,7 @@ async def harness_task_delete(task_id: str, user: User = Depends(current_user)):
 
 
 @app.get("/harness/task/{task_id}/file", tags=["harness"])
-async def harness_task_file(task_id: str, user: User = Depends(current_user)):
+async def harness_task_file(task_id: str, user: User = Depends(current_user_any)):
     """Скачивание DSL-файла, сгенерированного для Dify."""
     from agent_engine import harness as _harness
 
