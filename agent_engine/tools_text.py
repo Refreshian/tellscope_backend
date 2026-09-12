@@ -1050,6 +1050,11 @@ async def analyze_texts(
             found = retry
     docs, docs_by_id, lines = found["docs"], found["docs_by_id"], found["lines"]
     if not docs:
+        if not int(found.get("messages_in_slice") or 0):
+            # За выбранный период сообщений нет вообще: помечаем запуск как «данные не найдены»,
+            # иначе модель напишет отчёт-заглушку и запуск закроется как успешный.
+            ctx.no_data = "данные за период не найдены"
+            await ctx.log("За указанный период сообщений нет — данные не найдены", level="error")
         return {
             "index": idx,
             "index_name": index_name,

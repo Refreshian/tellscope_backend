@@ -644,6 +644,23 @@ async def build_report(
     sections = [s for s in sections if isinstance(s, dict) and (s.get("heading") or s.get("text"))]
 
     # -------- запрет отчёта-заглушки: без данных и графиков отчёт не считается успешным --------
+    no_data_markers = ("не найдены", "нет данных", "не обнаружено", "отсутствуют данные")
+
+    def _is_stub_section(section: Dict[str, Any]) -> bool:
+        """Раздел-заглушка «данных нет»: длинный текст про отсутствие данных — это не данные.
+
+        Без этой проверки модель обходила защиту: писала абзац «в датасете нет сообщений
+        за период» на 150+ символов, отчёт считался содержательным, и запуск закрывался
+        как успешный, хотя данных в срезе не было.
+        """
+        if section.get("findings") or section.get("highlights") or section.get("chart_ids"):
+            return False
+        heading = str(section.get("heading") or "").lower()
+        text = str(section.get("text") or "").lower()
+        if any(marker in heading for marker in no_data_markers):
+            return True
+        return any(marker in text for marker in no_data_markers) and len(text) < 900
+
     def _report_has_data() -> bool:
         for chart in (ctx.charts or {}).values():
             data = chart.get("data") if isinstance(chart, dict) else None
@@ -665,7 +682,7 @@ async def build_report(
             # Раздел с темами и цитатами из текстов — это тоже данные, а не заглушка
             if _finding_rows(section.get("findings")) or _finding_rows(section.get("highlights")):
                 return True
-            if len(text) >= 150:
+            if len(text) >= 150 and not _is_stub_section(section):
                 return True
         return False
 
