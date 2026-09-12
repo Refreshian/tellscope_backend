@@ -16,27 +16,88 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def to_unix(value: Any) -> Optional[int]:
-    """Приводит 'YYYY-MM-DD', ISO-строку или число к unix-секундам."""
+def local_tz():
+    """Часовой пояс пользователя: системная зона процесса (на проде — Europe/Moscow, UTC+3)."""
+    return datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
+
+
+LOCAL_TZ = local_tz()
+
+DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y")
+DATETIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M:%S")
+
+
+def _local_day(day: datetime, end: bool) -> int:
+    """Сутки в локальной зоне: 00:00:00 для начала периода, 23:59:59 для конца."""
+    if end:
+        day = day.replace(hour=23, minute=59, second=59)
+    return int(day.replace(tzinfo=LOCAL_TZ).timestamp())
+
+
+def _parse_datetime(text: str) -> Optional[datetime]:
+    """Дата со временем: смещение ('+03:00', 'Z') учитывается, без смещения — локальная зона."""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    parsed: Optional[datetime] = None
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        for fmt in DATETIME_FORMATS:
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except Exception:
+                continue
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=LOCAL_TZ)
+
+
+def to_unix(value: Any, end: bool = False) -> Optional[int]:
+    """Приводит 'YYYY-MM-DD', ISO-строку или число к unix-секундам.
+
+    Дата без времени — это полные сутки в локальном времени пользователя (MSK, UTC+3):
+    начало суток (00:00:00) для min_date и конец суток (23:59:59) для max_date (end=True).
+    Иначе терялись бы сообщения, попавшие в первые часы суток.
+    """
     if value in (None, "", "null"):
         return None
     if isinstance(value, (int, float)):
         return int(value)
     text = str(value).strip()
-    if not text:
+    if not text or text in ("null", "None"):
         return None
     if text.isdigit():
         return int(text)
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d.%m.%Y"):
+    if len(text) == 10:  # только дата — границы суток в локальной зоне
+        for fmt in DATE_FORMATS:
+            try:
+                return _local_day(datetime.strptime(text, fmt), end)
+            except Exception:
+                continue
+    parsed = _parse_datetime(text)
+    if parsed is not None:
+        return int(parsed.timestamp())
+    for fmt in DATE_FORMATS:  # нестандартная запись даты, например '2026-9-10'
         try:
-            return int(datetime.strptime(text[: len(fmt) + 3 if fmt.endswith("%S") else len(fmt)], fmt).replace(tzinfo=timezone.utc).timestamp())
+            return _local_day(datetime.strptime(text, fmt), end)
         except Exception:
             continue
     try:
-        cleaned = text.replace("Z", "+00:00")
-        return int(datetime.fromisoformat(cleaned).timestamp())
+        return int(float(text))
     except Exception:
         return None
+
+
+def to_unix_start(value: Any) -> Optional[int]:
+    """Начало периода: дата без времени — 00:00:00 локального времени."""
+    return to_unix(value, end=False)
+
+
+def to_unix_end(value: Any) -> Optional[int]:
+    """Конец периода: дата без времени — 23:59:59 локального времени (сутки включительно)."""
+    return to_unix(value, end=True)
 
 
 def compact(value: Any, max_items: int = 15, max_str: int = 260, depth: int = 0, max_depth: int = 5) -> Any:

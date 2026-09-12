@@ -10,7 +10,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from .context import AGENT_RUNS_ROOT, AgentContext, to_unix
+from .context import AGENT_RUNS_ROOT, AgentContext, to_unix_end, to_unix_start
 from .loop import DEFAULT_CHOICE, DEFAULT_TOKEN_BUDGET, MODEL_CHOICES, run_agent
 from .registry import resolve_tools
 
@@ -163,8 +163,8 @@ def create_run(
         "dataset_index": dataset_index,
         "dataset_name": dataset_name,
         "dataset_label": dataset_label,
-        "min_date": to_unix(min_date),
-        "max_date": to_unix(max_date),
+        "min_date": to_unix_start(min_date),
+        "max_date": to_unix_end(max_date),
         "folder": folder or "Агент",
         "answer": "",
         "stats": {},

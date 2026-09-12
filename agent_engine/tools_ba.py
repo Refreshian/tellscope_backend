@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from .context import to_unix_end, to_unix_start
 from .registry import ToolError, tool
 from .tools_data import _norm_text, _split_name
 
@@ -31,15 +32,10 @@ def _period(date_from: str, date_to: str) -> "tuple[str, str]":
             return ""
         if text.isdigit():
             return text
-        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
-            try:
-                day = datetime.strptime(text[: len(fmt) + 2 if fmt == "%d.%m.%Y" else 10], fmt)
-                if end:
-                    day = day + timedelta(days=1) - timedelta(seconds=1)
-                return str(int(day.timestamp()))
-            except Exception:
-                continue
-        raise ToolError(f"Не понял дату «{text}»: используйте формат ГГГГ-ММ-ДД")
+        stamp = to_unix_end(text) if end else to_unix_start(text)
+        if stamp is None:
+            raise ToolError(f"Не понял дату «{text}»: используйте формат ГГГГ-ММ-ДД")
+        return str(stamp)
 
     return parse(date_from, False), parse(date_to, True)
 

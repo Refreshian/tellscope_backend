@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi.encoders import jsonable_encoder
 
-from .context import compact, to_unix
+from .context import compact, to_unix, to_unix_end, to_unix_start
 from .registry import ToolError, tool
 
 INDEXES_PKL = "/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl"
@@ -217,8 +217,13 @@ def guard(ctx: Any, index: Optional[int] = None):
 
 
 def dates(ctx: Any, min_date: Any = None, max_date: Any = None):
-    lo = to_unix(min_date) if min_date is not None else ctx.min_date
-    hi = to_unix(max_date) if max_date is not None else ctx.max_date
+    """Границы периода в unix: min_date — начало суток (00:00:00), max_date — конец суток (23:59:59).
+
+    Дата без времени трактуется как полные сутки в локальном времени пользователя (MSK, UTC+3),
+    поэтому сообщения первых часов суток больше не выпадают из среза.
+    """
+    lo = to_unix_start(min_date) if min_date is not None else ctx.min_date
+    hi = to_unix_end(max_date) if max_date is not None else ctx.max_date
     return lo, hi
 
 
