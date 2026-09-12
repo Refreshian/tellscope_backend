@@ -48,6 +48,34 @@ agent:
   orchestrator_fallbacks: [deepseek, qwen]
   orchestrator_probe: tools
 
+# Веса и шкала ранжирования «ключевых сообщений» в analyze_texts (agent_engine/tools_text.py).
+# Меняется без правки кода: правка этого файла подхватывается на следующем запуске инструмента
+# (кэш чтения привязан к mtime файла), рестарт приложения не требуется.
+#   scale: log | sqrt | linear — сжимающая шкала вместо линейной суммы (по умолчанию log);
+#   weights — вес поля в сумме weight * f(value):
+#       комментарии/репосты/лайки — реальные реакции людей, вес высокий;
+#       просмотры/аудитория/аудитория СМИ — потенциал охвата, вес низкий, чтобы сообщество
+#       на 2 млн подписчиков с нулём реакций не вытесняло обсуждение;
+#       er — намеренно 0: в выгрузке BA ER = commentsCount + likesCount + repostsCount,
+#       то есть те же реакции, и в сумме он давал двойной счёт;
+#   enabled: false — вовсе не учитывать счётчики (честный откат на оценку/объём/маркеры).
+# Переопределение окружением (приоритет выше этого файла):
+#   TELLSCOPE_ENGAGEMENT_WEIGHTS="commentsCount=3,repostsCount=4,likesCount=2,er=0"
+#   TELLSCOPE_ENGAGEMENT_SCALE=log
+#   TELLSCOPE_ENGAGEMENT_ENABLED=true
+engagement:
+  enabled: true
+  scale: log
+  weights:
+    commentsCount: 3
+    repostsCount: 4
+    likesCount: 2
+    viewsCount: 0.5
+    audienceCount: 0.5
+    massMediaAudience: 0.5
+    er: 0
+    duplicateCount: 0.5
+
 prompts:
   mosinform_classify: classify_v1
   mosinform_insights: insights_v1

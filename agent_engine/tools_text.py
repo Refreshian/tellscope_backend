@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -77,20 +78,46 @@ CATEGORY_KEYWORDS: List[Tuple[str, Tuple[str, ...]]] = [
 # всегда: audienceCount, commentsCount, likesCount, repostsCount, viewsCount, er, massMediaAudience,
 # duplicateCount, citeIndex. Отзовики и сайты-рекомендации (otzovik.com, irecommend.ru) счётчики не
 # публикуют — там BA отдаёт нули, и инструмент честно уходит в fallback (см. NO_ENGAGEMENT_NOTE).
+# Веса по умолчанию — из кода: без настройки поведение остаётся предсказуемым и воспроизводимым.
+# Переопределяются в mlops/lock.yaml (секция engagement) и переменными окружения
+# TELLSCOPE_ENGAGEMENT_WEIGHTS / TELLSCOPE_ENGAGEMENT_SCALE / TELLSCOPE_ENGAGEMENT_ENABLED;
+# читает их mlops.lock.engagement_cfg, применяет _engagement_config ниже.
+#
+# Почему значения именно такие:
+#  * er ИСКЛЮЧЁН (вес 0). В выгрузке Brand Analytics ER = commentsCount + likesCount + repostsCount,
+#    то есть те же самые реакции: раньше он прибавлялся к сумме и удваивал их вклад. Если ER нужен
+#    как «плотность», включайте его вес осознанно — это снова двойной счёт.
+#  * аудитория и просмотры — это потенциал охвата, а не реакция людей, поэтому их вес ниже, чем у
+#    комментариев и репостов: сообщество на 2 млн подписчиков с нулём реакций не должно обгонять
+#    сообщение с 260 комментариями и 839 лайками.
+#  * duplicateCount — мягкий сигнал перепечатки, низкий вес.
 ENGAGEMENT_WEIGHTS = {
     "commentsCount": 3.0,
     "repostsCount": 4.0,
     "likesCount": 2.0,
-    "audienceCount": 1.0,
-    "er": 1.0,
-    "massMediaAudience": 1.0,
-    "viewsCount": 0.02,
+    "viewsCount": 0.5,
+    "audienceCount": 0.5,
+    "massMediaAudience": 0.5,
+    "er": 0.0,
     "duplicateCount": 0.5,
+}
+
+# Шкала сжатия метрик — вместо линейной суммы, чтобы один выброс не забивал топ.
+# Порядок значений внутри поля сохраняется, меняется только размах:
+#   log    — f(v) = log1p(v)  (по умолчанию: аудитория 2 184 064 даёт 14.6, а не 2 184 064)
+#   sqrt   — f(v) = sqrt(v)
+#   linear — f(v) = v         (прежнее поведение: для сравнения и совместимости)
+ENGAGEMENT_SCALES = ("log", "sqrt", "linear")
+ENGAGEMENT_SCALE = "log"
+ENGAGEMENT_SCALE_LABELS = {
+    "log": "логарифмическая шкала",
+    "sqrt": "корневая шкала",
+    "linear": "линейная шкала",
 }
 # Порядок показа метрик в основании ранжирования (stats.importance_basis) и в отчёте.
 ENGAGEMENT_ORDER = [
     "commentsCount", "repostsCount", "likesCount", "viewsCount",
-    "audienceCount", "er", "massMediaAudience",
+    "audienceCount", "er", "massMediaAudience", "duplicateCount",
 ]
 ENGAGEMENT_LABELS = {
     "commentsCount": "комментарии",
@@ -278,14 +305,89 @@ def _fmt_num(value: Any) -> str:
     return ("%.2f" % number).rstrip("0").rstrip(".")
 
 
+def _engagement_config() -> Tuple[Dict[str, float], str, bool]:
+    """Активные веса, шкала и признак «включено»: дефолты из кода + mlops (lock.yaml и окружение).
+
+    Настройку читает mlops.lock.engagement_cfg. Если настройки нет или она битая, работают дефолтные
+    веса из кода: поведение без конфигурации предсказуемо, а опечатка в YAML не должна ронять инструмент.
+    """
+    weights = dict(ENGAGEMENT_WEIGHTS)
+    scale = ENGAGEMENT_SCALE
+    enabled = True
+    try:
+        from mlops.lock import engagement_cfg
+
+        cfg = engagement_cfg() or {}
+    except Exception:
+        cfg = {}
+    raw_weights = cfg.get("weights")
+    if isinstance(raw_weights, dict):
+        for field, value in raw_weights.items():
+            number = _num(value)
+            if number is not None and number >= 0:
+                weights[str(field)] = float(number)
+    raw_scale = str(cfg.get("scale") or "").strip().lower()
+    if raw_scale in ENGAGEMENT_SCALES:
+        scale = raw_scale
+    if cfg.get("enabled") is not None:
+        enabled = bool(cfg.get("enabled"))
+    if not any(weight > 0 for weight in weights.values()):
+        enabled = False  # все веса обнулили настройкой — это и есть выключение вовлечённости
+    return weights, scale, enabled
+
+
+def _scale_value(value: Any, scale: str) -> float:
+    """Сжимающее преобразование одной метрики: sum(weight * f(value)) вместо weight * value."""
+    number = _num(value)
+    if number is None or number <= 0:
+        return 0.0
+    if scale == "linear":
+        return float(number)
+    if scale == "sqrt":
+        return math.sqrt(float(number))
+    return math.log1p(float(number))
+
+
+def _scale_painless(source: str, scale: str) -> str:
+    """Та же формула на Painless — для runtime-поля Elasticsearch в _engagement_script.
+
+    Без сжатия отбор кандидатов в ES разошёлся бы с итоговым ранжированием в _importance,
+    и в топ попадали бы не те сообщения, что посчитал инструмент.
+    """
+    safe = "Math.max(0.0, %s)" % source
+    if scale == "linear":
+        return safe
+    if scale == "sqrt":
+        return "Math.sqrt(%s)" % safe
+    return "Math.log(1.0 + %s)" % safe
+
+
+def _engagement_weights_brief(weights: Dict[str, float]) -> str:
+    """Краткая запись применённых весов: «репосты 4, комментарии 3, лайки 2»."""
+    rows = sorted(
+        ((field, float(weight)) for field, weight in weights.items() if weight),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return ", ".join(
+        "%s %s" % (ENGAGEMENT_LABELS.get(field, field), _fmt_num(weight)) for field, weight in rows[:6]
+    ) or "нет"
+
+
 def _engagement_basis(doc: Dict[str, Any]) -> str:
-    """Перечень метрик, по которым реально посчитана важность сообщения."""
+    """Основание сортировки: применённая шкала, веса и ФАКТИЧЕСКИЕ значения метрик.
+
+    В отчёт идут реальные числа из выгрузки (2 184 064), а не логарифмы: пользователь должен видеть,
+    на чём основан порядок. Сжатие — деталь расчёта, поэтому в строке указана только сама шкала.
+    """
+    weights, scale, _enabled = _engagement_config()
     parts = [
         "%s %s" % (ENGAGEMENT_LABELS.get(field, field), _fmt_num(doc.get(field)))
         for field in ENGAGEMENT_ORDER
-        if doc.get(field)
+        if doc.get(field) and weights.get(field)
     ]
-    return ", ".join(parts) or "счётчики нулевые"
+    tail = ", ".join(parts) or "счётчики нулевые"
+    return "вовлечённость (%s; веса: %s): %s" % (
+        ENGAGEMENT_SCALE_LABELS.get(scale, scale), _engagement_weights_brief(weights), tail)
 
 
 def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
@@ -309,12 +411,14 @@ def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
         "chars": len(raw_text),
     }
     doc["markers"] = _markers(raw_text)
+    weights, scale, _enabled = _engagement_config()
     engagement = 0.0
-    for field, weight in ENGAGEMENT_WEIGHTS.items():
+    for field in sorted(set(weights) | set(ENGAGEMENT_WEIGHTS)):
         value = _num(src.get(field))
         doc[field] = value
-        if value:
-            engagement += value * weight
+        weight = weights.get(field)
+        if value and weight:
+            engagement += _scale_value(value, scale) * float(weight)
     doc["engagement"] = round(engagement, 2)
     return doc
 
@@ -322,8 +426,11 @@ def _doc_from_hit(hit: Dict[str, Any]) -> Dict[str, Any]:
 def _importance(doc: Dict[str, Any], engagement_available: bool) -> Tuple[float, str]:
     """Важность сообщения.
 
-    Основной сигнал — вовлечённость: комментарии, репосты, лайки, просмотры, аудитория, ER,
+    Основной сигнал — вовлечённость: комментарии, репосты, лайки, просмотры, аудитория,
     аудитория СМИ. Метрики берутся из самой выгрузки Brand Analytics, а не оцениваются моделью.
+    Считается сумма weight_field * f(value_field), где f — сжимающая шкала (по умолчанию
+    логарифмическая), поэтому крупное сообщество с нулём реакций не вытесняет обсуждение.
+    ER в сумму не входит: в BA это сумма тех же реакций (см. ENGAGEMENT_WEIGHTS).
 
     Если в срезе счётчиков нет (типично для отзовиков и сайтов-рекомендаций, которые их вообще
     не публикуют), работает честный и прозрачный откат: важнее то сообщение, у которого ниже
@@ -331,7 +438,7 @@ def _importance(doc: Dict[str, Any], engagement_available: bool) -> Tuple[float,
     всегда возвращается текстом и попадает в stats.importance_basis и в отчёт.
     """
     if engagement_available and doc.get("engagement"):
-        return float(doc["engagement"]), "вовлечённость (" + _engagement_basis(doc) + ")"
+        return float(doc["engagement"]), _engagement_basis(doc)
     markers = doc.get("markers") or {}
     marker_points = float(markers.get("total") or 0) * MARKER_WEIGHT
     rating = doc.get("rating")
@@ -394,15 +501,19 @@ def _engagement_script(fields: List[str]) -> Optional[Dict[str, Any]]:
 
     Нужно, чтобы Elasticsearch отдавал именно верхушку по вовлечённости, а не верхушку по
     комментариям: сообщение с большой аудиторией и малым числом реакций иначе вытеснялось бы
-    из выборки. Имена полей и веса берутся из ENGAGEMENT_WEIGHTS, скрипт собирается на сервере.
+    из выборки. Имена полей, веса и шкала берутся из активной настройки вовлечённости,
+    скрипт собирается на сервере.
     """
+    weights, scale, enabled = _engagement_config()
+    if not enabled:
+        return None
     parts = []
     for field in fields:
-        weight = ENGAGEMENT_WEIGHTS.get(field)
+        weight = weights.get(field)
         if not weight:
             continue
-        parts.append("s += (doc['%s'].size()==0 ? 0.0 : doc['%s'].value) * %s;" % (
-            field, field, float(weight)))
+        raw = "(doc['%s'].size()==0 ? 0.0 : doc['%s'].value)" % (field, field)
+        parts.append("s += (%s) * %s;" % (_scale_painless(raw, scale), float(weight)))
     if not parts:
         return None
     return {"type": "double", "script": {"source": "double s = 0.0; " + " ".join(parts) + " emit(s);"}}
@@ -418,7 +529,8 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
     numeric = _numeric_engagement_fields(index_name)
     agg_fields = [field for field in ENGAGEMENT_AGG_FIELDS if field in numeric]
     engagement_max = _engagement_agg(index_name, query, agg_fields)
-    engagement_available = any(value > 0 for value in engagement_max.values())
+    engagement_enabled = _engagement_config()[2]
+    engagement_available = engagement_enabled and any(value > 0 for value in engagement_max.values())
     engagement_fields = [f for f in ENGAGEMENT_ORDER if engagement_max.get(f, 0) > 0]
 
     # Отбор кандидатов. Если вовлечённость заполнена, Elasticsearch считает по runtime-полю
@@ -492,6 +604,7 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
         "engagement_fields": engagement_fields,
         "engagement_max": engagement_max,
         "engagement_numeric_fields": numeric,
+        "engagement_enabled": engagement_enabled,
     }
 
 
@@ -1063,9 +1176,22 @@ async def analyze_texts(
 
     engagement_available = bool(found.get("engagement_available"))
     engagement_fields = found.get("engagement_fields") or []
+    engagement_weights, engagement_scale, engagement_enabled = _engagement_config()
     if engagement_available:
-        engagement_note = "Ранжирование ключевых сообщений: вовлечённость (" + ", ".join(
-            ENGAGEMENT_LABELS.get(field, field) for field in engagement_fields) + ")."
+        engagement_note = (
+            "Ранжирование ключевых сообщений: вовлечённость (" + ", ".join(
+                ENGAGEMENT_LABELS.get(field, field) for field in engagement_fields
+                if engagement_weights.get(field)) + "), "
+            + ENGAGEMENT_SCALE_LABELS.get(engagement_scale, engagement_scale) + ", веса: "
+            + _engagement_weights_brief(engagement_weights) + "."
+        )
+    elif not engagement_enabled:
+        engagement_note = (
+            "Ранжирование по вовлечённости отключено настройкой (mlops/lock.yaml: "
+            "engagement.enabled=false) — важные сообщения отобраны по оценке отзыва, "
+            "объёму текста и маркерам."
+        )
+        scope_note += " Метрики вовлечённости не учитывались: ранжирование отключено настройкой."
     else:
         engagement_note = NO_ENGAGEMENT_NOTE.capitalize() + " — важные сообщения отобраны по оценке отзыва, объёму текста и маркерам."
         scope_note += " Метрики вовлечённости: " + NO_ENGAGEMENT_NOTE + "."
@@ -1108,6 +1234,8 @@ async def analyze_texts(
             "engagement_fields": engagement_fields,
             "engagement_max": found.get("engagement_max") or {},
             "engagement_note": engagement_note,
+            "engagement_scale": engagement_scale,
+            "engagement_weights": {f: w for f, w in engagement_weights.items() if w},
         },
         "note": (
             "Раздел report_section обязательно передай в build_report (findings с темами, долями и цитатами "

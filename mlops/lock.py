@@ -72,6 +72,76 @@ def external_cfg(profile: str = "dashboard_qa") -> dict:
     }
 
 
+# --- Вовлечённость: веса и шкала ранжирования «ключевых сообщений» (agent_engine/tools_text.py).
+# Дефолты живут в коде инструмента, здесь только переопределения: без настройки поведение
+# остаётся предсказуемым. Приоритет — окружение, затем lock.yaml:
+#   1) TELLSCOPE_ENGAGEMENT_WEIGHTS="commentsCount=3,repostsCount=4,likesCount=2,er=0"
+#      TELLSCOPE_ENGAGEMENT_SCALE=log|sqrt|linear
+#      TELLSCOPE_ENGAGEMENT_ENABLED=true|false
+#   2) lock.yaml:  engagement: {weights: {...}, scale: log, enabled: true}
+def _engagement_env_weights(raw: str) -> dict:
+    """Разбирает TELLSCOPE_ENGAGEMENT_WEIGHTS: «commentsCount=3,repostsCount=4»."""
+    out: dict = {}
+    for chunk in str(raw or "").replace(";", ",").split(","):
+        if "=" not in chunk:
+            continue
+        field, _, value = chunk.partition("=")
+        field = field.strip()
+        value = value.strip().replace(",", ".")
+        if not field or not value:
+            continue
+        try:
+            out[field] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+@lru_cache(maxsize=64)
+def _lock_engagement_cached(path_str: str, mtime: float) -> dict:
+    """Секция engagement из lock-файла. Кэш привязан к mtime файла, поэтому правка YAML
+    подхватывается на следующем запуске инструмента — без рестарта приложения."""
+    try:
+        data = yaml.safe_load(Path(path_str).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    section = data.get("engagement") or {}
+    return section if isinstance(section, dict) else {}
+
+
+def _lock_engagement() -> dict:
+    for path in _LOCK_CANDIDATES:
+        try:
+            if path and path.exists():
+                return _lock_engagement_cached(str(path), path.stat().st_mtime)
+        except Exception:
+            continue
+    return {}
+
+
+def engagement_cfg() -> dict:
+    """Активные веса и шкала вовлечённости: lock.yaml + окружение (окружение приоритетнее)."""
+    lock = _lock_engagement()
+    lock_weights = lock.get("weights") if isinstance(lock.get("weights"), dict) else {}
+    env_weights = _engagement_env_weights(os.environ.get("TELLSCOPE_ENGAGEMENT_WEIGHTS") or "")
+    env_scale = os.environ.get("TELLSCOPE_ENGAGEMENT_SCALE") or ""
+    env_enabled = os.environ.get("TELLSCOPE_ENGAGEMENT_ENABLED")
+    enabled = lock.get("enabled")
+    if env_enabled not in (None, ""):
+        enabled = str(env_enabled).strip().lower() in ("1", "true", "yes", "on", "да")
+    return {
+        "weights": {**(lock_weights or {}), **env_weights},
+        "scale": env_scale or lock.get("scale") or "",
+        "enabled": True if enabled is None else bool(enabled),
+        "source": {
+            "lock": bool(lock),
+            "env_weights": bool(env_weights),
+            "env_scale": bool(env_scale),
+            "env_enabled": env_enabled not in (None, ""),
+        },
+    }
+
+
 def prompt_id(name: str, default: str) -> str:
     prompts = load_lock().get("prompts") or {}
     return str(prompts.get(name) or default)
@@ -317,4 +387,10 @@ def public_lock() -> dict:
             "source": agent.get("source"),
         },
         "prompts": lock.get("prompts") or {},
+        # Прозрачность ранжирования «ключевых сообщений»: что реально применено.
+        "engagement": {
+            "weights": (engagement_cfg().get("weights") or {}),
+            "scale": engagement_cfg().get("scale") or None,
+            "enabled": bool(engagement_cfg().get("enabled")),
+        },
     }
