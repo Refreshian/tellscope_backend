@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DeepSeek Harness — единый центр задач Tellscope.
+"""Центр задач Tellscope — ассистент ИИ-аналитики соцмедиа и СМИ.
 
 Пользователь описывает задачу обычным текстом, а ассистент:
 
@@ -364,7 +364,7 @@ async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_
         user.id,
         {
             "name": str(data.get("name") or f"Задача: {text[:60]}")[:200],
-            "description": str(data.get("description") or f"Цепочка, собранная DeepSeek Harness по задаче: {text[:200]}"),
+            "description": str(data.get("description") or f"Цепочка собрана ассистентом по задаче: {text[:200]}"),
             "instruction": str(data.get("instruction") or text)[:2000],
             "folder": str(data.get("folder") or "Центр задач")[:80],
             "dataset_index": index,
