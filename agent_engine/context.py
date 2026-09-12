@@ -92,6 +92,12 @@ class AgentContext:
     charts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Раздел подробного разбора (deep_text_analysis) — обязан попасть в итоговый отчёт
     deep_analysis: Optional[Dict[str, Any]] = None
+    # Чтение текстов (analyze_texts): темы и цитаты, обязательные для отчёта
+    text_analysis: Optional[Dict[str, Any]] = None
+    # Сколько негативных сообщений в срезе — нужно для правила качества отчёта
+    negative_in_slice: int = 0
+    # Заполняется build_report: в срезе есть негатив, но в отчёте нет темы с цитатой
+    text_gap: str = ""
     llm_calls: int = 0
     tokens: int = 0
     cost_usd: float = 0.0
