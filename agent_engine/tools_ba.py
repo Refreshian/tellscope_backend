@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -84,6 +85,38 @@ def _best_theme(query: str, themes: List[Dict[str, Any]]) -> Optional[Dict[str, 
     timeout=570.0,
     cost=3,
 )
+def _existing_dataset(theme_title: str) -> Optional[Dict[str, Any]]:
+    """Уже загруженный в Tellscope датасет по названию темы (без выгрузки из Brand Analytics)."""
+    try:
+        from . import tools_data as _td
+        items = _td.datasets_public()
+    except Exception:
+        return None
+    norm = getattr(_td, "_norm_text", None)
+
+    def _n(text: str) -> str:
+        text = str(text or "").lower()
+        if norm:
+            try:
+                return norm(text)
+            except Exception:
+                pass
+        return text
+
+    words = [w for w in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", _n(theme_title)) if len(w) >= 4]
+    if not words:
+        return None
+    best, best_score = None, 0
+    for item in items or []:
+        hay = _n(str(item.get("name") or "")) + " " + _n(str(item.get("label") or ""))
+        score = sum(1 for word in words if word in hay)
+        if score > best_score:
+            best, best_score = item, score
+    if best is None or best_score < max(1, len(words) - 1):
+        return None
+    return best
+
+
 async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
                         wait_seconds: Optional[int] = None) -> Dict[str, Any]:
     """Загружает тему из Brand Analytics и возвращает новый датасет."""
@@ -107,6 +140,23 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
                 "Аккаунт Brand Analytics не подключён: добавьте логин и пароль BA в разделе настроек Tellscope"
             )
         raise ToolError(f"В Brand Analytics нет темы «{theme}». Доступные темы: {titles}")
+
+    # Тема могла выгружаться раньше — тогда берём готовый датасет, а не идём в BA
+    existing = _existing_dataset(str(match.get("title") or theme))
+    if existing:
+        return {
+            "status": "используется ранее загруженный датасет",
+            "theme": match.get("title"),
+            "dataset": existing.get("name"),
+            "index": existing.get("index"),
+            "label": existing.get("label") or existing.get("name"),
+            "period": existing.get("period") or "",
+            "hint": (
+                f"Тема «{match.get('title')}» уже выгружалась в Tellscope: работайте с датасетом "
+                f"«{existing.get('label') or existing.get('name')}» (index {existing.get('index')}) — "
+                "новая выгрузка из Brand Analytics не нужна"
+            ),
+        }
 
     tsf, tst = _period(date_from, date_to)
     job_id = uuid.uuid4().hex[:12]

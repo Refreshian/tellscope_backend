@@ -12,7 +12,7 @@ async function ensureLogin(page) {
   if (fs.existsSync(COOKIES)) {
     try { await page.setCookie(...JSON.parse(fs.readFileSync(COOKIES,'utf8'))); } catch(e) {}
   }
-  await page.goto(BA + '/summary', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.goto(BA + '/summary', { waitUntil: 'domcontentloaded', timeout: 600000 });
   await sleep(5000);
   const has = await page.evaluate(() => !!document.querySelector('[data-testid="export-selector-toggle"]'));
   if (has) return true;
@@ -20,7 +20,7 @@ async function ensureLogin(page) {
     const b=[...document.querySelectorAll('a,button')].find(x=>/войти|вход|sign in|login/i.test((x.textContent||'').trim()) && (x.textContent||'').trim().length<25);
     if(b){b.click(); return true;} return false;
   });
-  if (!clicked) await page.goto(BA + '/account/login/', { waitUntil:'domcontentloaded', timeout:60000 }).catch(()=>{});
+  if (!clicked) await page.goto(BA + '/account/login/', { waitUntil:'domcontentloaded', timeout: 600000 }).catch(()=>{});
   await sleep(4000);
   const filled = await page.evaluate((em, pw) => {
     const inputs=[...document.querySelectorAll('input')];
@@ -53,7 +53,7 @@ async function ensureLogin(page) {
   await cdp.send('Page.setDownloadBehavior', { behavior:'allow', downloadPath: outDir });
   await ensureLogin(page);
   const qs = tsf && tst ? '?tsf=' + tsf + '&tst=' + tst : '';
-  await page.goto(BA + '/report/' + themeId + '/summary' + qs, { waitUntil:'domcontentloaded', timeout:60000 });
+  await page.goto(BA + '/report/' + themeId + '/summary' + qs, { waitUntil:'domcontentloaded', timeout: 600000 });
   await sleep(9000);
   const a = await page.evaluate(() => {
     const t=document.querySelector('[data-testid="export-selector-toggle"]');
@@ -81,7 +81,7 @@ async function ensureLogin(page) {
     const e=all.find(e=>{const s=(e.textContent||'').trim(); return (s==='Download'||s==='Скачать') && e.getBoundingClientRect().width>0;});
     if(e) e.click();
   });
-  await sleep(12000);
+  await sleep(30000);
   const files = fs.existsSync(outDir) ? fs.readdirSync(outDir).filter(f=>f.endsWith('.json')) : [];
   if (!files.length) throw new Error('no file downloaded');
   console.log(outDir + '/' + files[0]);
