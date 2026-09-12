@@ -200,8 +200,9 @@ app = FastAPI(
 # Гейт авторизации: без валидного JWT (Authorization: Bearer, cookie token /
 # tellscope_refresh_token) либо сервисного токена (X-Service-Token) недоступно
 # ничего, кроме белого списка ниже.
-PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/models", "/chat"}
-PUBLIC_PREFIXES = ("/auth/", "/static/", "/favicon")
+PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/models", "/chat",
+                "/auth/login", "/auth/refresh", "/auth/logout", "/auth/session"}
+PUBLIC_PREFIXES = ("/auth/jwt/", "/static/", "/favicon")
 
 
 def _public_path(path: str) -> bool:
@@ -697,11 +698,7 @@ app.include_router(
     tags=["auth"],
 )
 
-app.include_router(
-    fastapi_users.get_register_router(UserRead, UserCreate),
-    prefix="/auth",
-    tags=["auth"], 
-)
+# Публичная регистрация отключена: см. POST /auth/register (только superuser) ниже.
 
 
 current_user = fastapi_users.current_user()
@@ -11639,6 +11636,22 @@ def _folder_guard(owner_user_id, folder, user, need_write=False):
         raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
 
 current_superuser = fastapi_users.current_user(active=True, superuser=True)
+
+
+@app.post("/auth/register", tags=["auth"])
+async def register_admin_only(body: UserCreate, admin: User = Depends(current_superuser)):
+    """Публичная регистрация закрыта: завести пользователя может только администратор."""
+    from auth.manager import UserManager
+    from auth.database import SQLAlchemyUserDatabase
+    async with async_session_maker() as session:
+        udb = SQLAlchemyUserDatabase(session, AuthUser)
+        mgr = UserManager(udb)
+        try:
+            user = await mgr.create(body, safe=False, request=None)
+        except Exception as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        return {"id": user.id, "email": user.email, "username": user.username,
+                "is_superuser": bool(user.is_superuser), "role_id": body.role_id}
 
 @app.get("/admin/users")
 async def admin_users(admin: User = Depends(current_superuser)):
