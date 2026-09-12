@@ -330,4 +330,4 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     if answer:
         await ctx.event({"type": "answer", "text": answer})
     await ctx.event({"type": "final", "answer": answer or "Шаги выполнены, смотрите артефакты запуска.", "artifacts": ctx.artifacts, "stats": stats})
-    return {"answer": answer or "Шаги выполнены, смотрите артефакты запуска.", "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts}
+    return {"answer": answer or "Шаги выполнены, смотрите артефакты запуска.", "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts, "no_data": bool(getattr(ctx, "no_data", False))}

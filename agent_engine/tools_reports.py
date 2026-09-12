@@ -455,6 +455,38 @@ async def build_report(
     if not title or not str(title).strip():
         raise ToolError('Укажите title — название отчёта, например "Аналитический отчёт по бренду"')
     sections = [s for s in sections if isinstance(s, dict) and (s.get("heading") or s.get("text"))]
+
+    # -------- запрет отчёта-заглушки: без данных и графиков отчёт не считается успешным --------
+    def _report_has_data() -> bool:
+        for chart in (ctx.charts or {}).values():
+            data = chart.get("data") if isinstance(chart, dict) else None
+            series = (data or {}).get("series") if isinstance(data, dict) else (chart.get("series") if isinstance(chart, dict) else None)
+            for item in (series or []):
+                values = item.get("values") if isinstance(item, dict) else None
+                for value in (values or []):
+                    try:
+                        if abs(float(value)) > 0:
+                            return True
+                    except (TypeError, ValueError):
+                        if str(value).strip():
+                            return True
+        for section in sections:
+            text = str(section.get("text") or "").strip()
+            rows = section.get("items") or section.get("bullets") or section.get("values") or section.get("rows")
+            if rows:
+                return True
+            if len(text) >= 150:
+                return True
+        return False
+
+    if not _report_has_data():
+        ctx.no_data = "данные за период не найдены"
+        sections = [{
+            "heading": "Данные за период не найдены",
+            "text": ("В выбранном датасете нет сообщений за указанный период, поэтому отчёт не сформирован. "
+                     "Запуск помечен как неуспешный. Проверьте период и тему датасета "
+                     "(или выгрузите тему из Brand Analytics за нужные даты) и повторите запуск."),
+        }]
     if not sections:
         raise ToolError("Ни один раздел не содержит heading или text — проверьте структуру sections")
     # Подробный разбор темы (deep_text_analysis) обязан попасть в документ — добавляем, если модель забыла

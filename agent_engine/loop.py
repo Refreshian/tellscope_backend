@@ -636,4 +636,4 @@ async def run_agent(ctx) -> Dict[str, Any]:
         "notes": ctx.notes,
     }
     await ctx.event({"type": "final", "answer": answer, "artifacts": ctx.artifacts, "stats": stats})
-    return {"answer": answer, "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts}
+    return {"answer": answer, "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts, "no_data": bool(getattr(ctx, "no_data", False))}

@@ -326,12 +326,7 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         run["tool_calls"] = result.get("tool_calls") or []
         run["artifacts"] = result.get("artifacts") or []
         run["cost_usd"] = float((result.get("stats") or {}).get("cost_usd") or 0.0)
-        run["no_data"] = bool(result.get("no_data"))
-        if run.get("no_data"):
-            run["status"] = "failed"
-            run["error"] = "данные за период не найдены — отчёт не сформирован"
-        else:
-            run["status"] = "completed" if run["answer"] else "failed"
+        run["status"] = "completed" if run["answer"] else "failed"
         if not run["answer"]:
             run["error"] = "агент не сформировал ответ"
     except Exception as exc:
