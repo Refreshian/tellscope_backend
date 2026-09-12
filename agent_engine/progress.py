@@ -71,6 +71,8 @@ class ProgressTracker:
         self._durations: List[float] = []
         self._stage_started = 0.0
         self._last_emit = 0.0
+        # Сколько heartbeat-обёрток открыто сейчас: вложенные не создают вторую задачу.
+        self._beats = 0
 
     # ------------------------------------------------------------------ расчёты
 
@@ -306,9 +308,18 @@ class ProgressTracker:
 
         Задача гасится в ``finally``, поэтому фоновых задач не остаётся и поток запуска
         не ломается; если emit недоступен (инструмент вызван вне запуска) — ничего не делаем.
+        Вложенные вызовы (registry.execute → инструмент с собственным heartbeat) не создают
+        второй цикл heartbeat: работает один, самый внешний.
         """
         task: Optional[asyncio.Task] = None
-        if getattr(self.ctx, "emit", None) is not None:
+        self._beats += 1
+        if self._beats == 1 and getattr(self.ctx, "emit", None) is not None:
+            # Первый «жив» отправляем сразу: между короткими шагами (графики, отчёты) иначе
+            # набегала пауза больше 15 секунд, пока новый цикл heartbeat дойдёт до первого тика.
+            try:
+                await self._emit(self.payload("heartbeat"))
+            except Exception:
+                pass
             try:
                 task = asyncio.ensure_future(self._beat(stage, float(interval or HEARTBEAT_SEC)))
             except Exception:
@@ -316,6 +327,7 @@ class ProgressTracker:
         try:
             yield
         finally:
+            self._beats = max(0, self._beats - 1)
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,18 +37,28 @@ from .registry import ToolError, tool
 from .tools_llm import _extract_json, _qwen
 
 # ---------------------------------------------------------------- параметры разбора
-BATCH_SIZE = 15          # сообщений в одной пачке (допустимо 15–25)
+# Замеры на датасете 1105 (41 сообщение): пачка из 15–20 сообщений — это один вызов Qwen
+# на ~90–110 с, и время почти не зависит от размера пачки (доминирует генерация JSON),
+# поэтому по умолчанию пачки крупнее, а чтение идёт параллельно: 41 сообщение = 3 пачки
+# одной волной ≈ столько же, сколько одна пачка. Пачки и параллелизм можно переопределить
+# переменными окружения (TELLSCOPE_TEXTS_BATCH_SIZE / TELLSCOPE_TEXTS_PARALLEL) без правки кода.
+BATCH_SIZE = int(os.environ.get("TELLSCOPE_TEXTS_BATCH_SIZE") or 20)   # сообщений в пачке (15–25)
 MIN_BATCH_SIZE = 15
 MAX_BATCH_SIZE = 25
-MAX_BATCHES = 6          # ограничение по времени запуска инструмента
+MAX_BATCHES = 8          # покрывает MAX_MESSAGES при минимальной пачке (120 / 15 = 8)
 MAX_MESSAGES = 120
 DEFAULT_LIMIT = 60
+# Меньше одной пачки просить бессмысленно: модель не увидит срез целиком, а пользователь —
+# «прочитано 15 из 41». Такой предел инструмент поднимает до DEFAULT_LIMIT сам.
+MIN_USEFUL_LIMIT = 20
 
 MESSAGE_CHARS = 480      # обрезка текста сообщения в промпте (max_model_len vLLM = 8192)
 BATCH_CHAR_BUDGET = 9000  # страховка по длине промпта пачки
 BATCH_MAX_TOKENS = 1500
 SUMMARY_MAX_TOKENS = 1100
-PARALLEL_BATCHES = 3
+# Пачки читаются параллельно: 4 запроса × (≈3 000 токенов промпта + 1 500 генерации) далеко
+# от max_model_len 8192 и от max-num-seqs 32, память vLLM не упирается.
+PARALLEL_BATCHES = int(os.environ.get("TELLSCOPE_TEXTS_PARALLEL") or 4)
 
 MODEL_LABEL = "Qwen3-32B-FP8 (vLLM, локально, без оплаты)"
 
@@ -950,7 +961,8 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
         "упаковка, сроки, другое), ключевые сообщения по вовлечённости и аналитический текст. "
         "Вызывай этот инструмент ПЕРЕД build_report, чтобы выводы и пояснения к графикам опирались на темы "
         "и цитаты из текстов, а не только на статистику. Обязателен, когда в срезе есть негатив: "
-        "причины жалоб нужно подтверждать цитатами."
+        "причины жалоб нужно подтверждать цитатами. По умолчанию читается ВЕСЬ срез периода (несколько "
+        "пачек параллельно, обычно 1,5–2,5 минуты), limit и batch_size указывать не нужно."
     ),
     parameters={
         "type": "object",
@@ -958,9 +970,9 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
             "index": {"type": "string", "description": "тема: название датасета или её номер; по умолчанию — выбранный в интерфейсе"},
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD, ISO или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD, ISO или unix-секунды"},
-            "tone": {"type": "string", "enum": ["all", "negative", "positive", "neutral"], "description": "какие сообщения читать, по умолчанию все"},
-            "limit": {"type": "integer", "description": "сколько сообщений прочитать (по умолчанию 60, максимум 120)"},
-            "batch_size": {"type": "integer", "description": "сообщений в одной пачке для модели, 15–25 (по умолчанию 15)"},
+            "tone": {"type": "string", "enum": ["all", "negative", "positive", "neutral"], "description": "какие сообщения читать: all — весь срез периода (по умолчанию), negative только сужает срез до негатива"},
+            "limit": {"type": "integer", "description": "сколько сообщений прочитать: по умолчанию весь срез, не больше 60 (максимум 120). Занижать не нужно — меньше 20 инструмент поднимает до 60 сам"},
+            "batch_size": {"type": "integer", "description": "сообщений в одной пачке для модели, 15–25 (по умолчанию 20); указывать не обязательно"},
             "focus": {"type": "string", "description": "на что смотреть в первую очередь (например «причины возвратов»)"},
         },
     },
@@ -976,6 +988,7 @@ async def analyze_texts(
     limit: int = DEFAULT_LIMIT,
     batch_size: int = BATCH_SIZE,
     focus: Optional[str] = None,
+    parallel: Optional[int] = None,
 ):
     from .tools_data import _iso, _require_period, dates, guard
 
@@ -984,8 +997,22 @@ async def analyze_texts(
     lo, hi = dates(ctx, min_date, max_date)
     lo, hi = _require_period(index_name, lo, hi)
 
-    limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_MESSAGES))
+    # Служебный параметр (нет в схеме инструмента): сколько пачек читать одновременно.
+    # Нужен для замеров и тонкой настройки под нагрузку vLLM.
+    parallel_batches = max(1, min(int(parallel or PARALLEL_BATCHES), MAX_BATCHES))
+
     batch_size = max(MIN_BATCH_SIZE, min(int(batch_size or BATCH_SIZE), MAX_BATCH_SIZE))
+    requested_limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_MESSAGES))
+    limit = requested_limit
+    if limit < MIN_USEFUL_LIMIT:
+        # Планировщик (или внешний вызов) мог поставить предел «на одну пачку» — например 15,
+        # как размер пачки по умолчанию. Тогда срез оставался непрочитанным: пользователь видел
+        # «прочитано 15 из 41» и тишину в журнале. Читаем весь срез до DEFAULT_LIMIT.
+        limit = DEFAULT_LIMIT
+        await ctx.log(
+            f"Предел чтения {requested_limit} меньше одной пачки — читаю весь срез "
+            f"(до {DEFAULT_LIMIT} сообщений, пачек по {batch_size})"
+        )
     focus_text = f" Особое внимание: {_flat(focus)}." if _flat(focus) else ""
     scope = f" за период {_iso(lo)} — {_iso(hi)}" + (f" (тональность: {tone})" if str(tone).lower() not in ("all", "any", "") else "")
 
@@ -1011,10 +1038,17 @@ async def analyze_texts(
     read_ids = {doc["msg_id"] for batch in batches for doc in batch}
     docs_by_id = {mid: doc for mid, doc in found["docs_by_id"].items() if mid in read_ids}
     selected = len(read_ids)
+    slice_total = int(found.get("messages_in_slice") or 0) or len(docs)
     if selected < len(docs):
         await ctx.log(
             f"Читаю {selected} сообщений из {len(docs)} отобранных "
             f"(пачек не больше {MAX_BATCHES} по {batch_size} сообщений)"
+        )
+    if selected < slice_total:
+        # Не скрываем это от пользователя: в срезе больше сообщений, чем читаем.
+        await ctx.log(
+            f"В срезе {slice_total} сообщений, читаю {selected}: предел чтения {limit}. "
+            f"Для полного среза вызывайте инструмент без limit (по умолчанию {DEFAULT_LIMIT}, максимум {MAX_MESSAGES})"
         )
     if not docs_by_id:
         raise ToolError("Не удалось подготовить сообщения для чтения — повторите запуск")
@@ -1028,39 +1062,50 @@ async def analyze_texts(
         f"Тональность среза: негатив {negative}, нейтрал {neutral}, позитив {positive}"
     )
 
-    semaphore = asyncio.Semaphore(PARALLEL_BATCHES)
+    semaphore = asyncio.Semaphore(parallel_batches)
     results: List[Dict[str, Any]] = []
     tokens_used = 0
-    # Прогресс по пачкам: это самый долгий шаг запуска, и раньше здесь было «тишина»
-    # на 2–3 минуты — пользователь не понимал, работает задача или зависла.
+    # Прогресс по пачкам: это самый долгий шаг запуска, и раньше здесь была «тишина» на 2–3 минуты —
+    # пользователь не понимал, работает задача или зависла. Теперь на старте сообщаем, сколько
+    # сообщений и пачек читаем и сколько это обычно занимает, после каждой пачки обновляем прогресс,
+    # а между пачками идёт heartbeat (не реже раза в 8 секунд).
     tracker = getattr(ctx, "progress", None)
     read_done = 0
+    batches_done = 0
+    reading_started = time.time()
     if tracker is not None:
+        waves = -(-len(batches) // max(1, parallel_batches))
         await tracker.sub(
             0,
             selected,
             stage="чтение текстов",
-            detail=f"читаю {selected} сообщений: пачек {len(batches)}, модель {model_label}",
+            detail=(
+                f"читаю {selected} сообщений среза: пачек {len(batches)} по {batch_size}, "
+                f"{min(parallel_batches, len(batches))} параллельно (обычно ~{waves * 2} мин)"
+            ),
             units_done=0,
             units_total=len(batches),
-            units_parallel=PARALLEL_BATCHES,
+            units_parallel=parallel_batches,
         )
 
     async def worker(number: int, batch: List[Dict[str, Any]]) -> None:
-        nonlocal tokens_used, read_done
+        nonlocal tokens_used, read_done, batches_done
+        batch_started = time.time()
         lines = [_message_line(doc["msg_id"], doc) for doc in batch]
         async with semaphore:
             outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines)
         tokens_used += int(outcome.get("tokens") or 0)
         results.append(outcome)
         done_ok = bool(outcome.get("ok"))
+        batches_done += 1
         if done_ok:
             # Считаем прочитанным только то, что модель действительно разобрала.
             read_done = min(selected, read_done + len(batch))
         if tracker is not None:
             batches_ok = len([item for item in results if item.get("ok")])
             detail = (
-                f"прочитано {read_done} из {selected} сообщений (пачек: {batches_ok} из {len(batches)})"
+                f"прочитано {read_done} из {selected} сообщений "
+                f"(пачек: {batches_ok} из {len(batches)}, последняя за {time.time() - batch_started:.0f} с)"
                 if done_ok
                 else f"пачка {number} из {len(batches)} не разобрана: {str(outcome.get('error'))[:120]}"
             )
@@ -1071,10 +1116,28 @@ async def analyze_texts(
                 detail=detail,
                 units_done=batches_ok,
                 units_total=len(batches),
-                units_parallel=PARALLEL_BATCHES,
+                units_parallel=parallel_batches,
             )
 
-    await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
+    if tracker is not None:
+        # Свой heartbeat внутри чтения: даже если инструмент вызван в обход registry,
+        # в интерфейсе не будет «мёртвой» тишины дольше 8–15 секунд.
+        async with tracker.heartbeat("чтение текстов"):
+            await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
+        await tracker.sub(
+            read_done,
+            selected,
+            stage="чтение текстов",
+            detail=(
+                f"чтение завершено: {read_done} из {selected} сообщений, "
+                f"пачек {batches_done} из {len(batches)}, {time.time() - reading_started:.0f} с"
+            ),
+            units_done=batches_done,
+            units_total=len(batches),
+            units_parallel=parallel_batches,
+        )
+    else:
+        await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
     parsed_batches = [item["parsed"] for item in results if item.get("ok")]
     failed = len([item for item in results if not item.get("ok")])
     if not parsed_batches:
