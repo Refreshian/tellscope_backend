@@ -25,6 +25,7 @@ HTTP-клиент не создаётся.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -32,7 +33,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .context import compact
+from .context import RunCancelled, compact
 from .registry import ToolError, tool
 from .tools_llm import _extract_json, _qwen
 
@@ -651,6 +652,24 @@ def _chunks(docs: List[Dict[str, Any]], batch_size: int) -> List[List[Dict[str, 
     return batches
 
 
+async def _cancel_watcher(ctx, tasks: List[Any]) -> None:
+    """Гасит незавершённые пачки, как только пользователь остановил запуск.
+
+    Отмена asyncio-задачи закрывает HTTP-запрос к vLLM: сервер видит обрыв клиента и
+    освобождает слот генерации, поэтому очередь модели не забивается.
+    """
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            if ctx.cancelled():
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                return
+    except asyncio.CancelledError:
+        raise
+
+
 # ------------------------------------------------------------- разбор пачек моделью
 
 async def _run_batch(ctx, number: int, total: int, scope: str, focus: str, batch: List[str]) -> Dict[str, Any]:
@@ -1017,6 +1036,18 @@ async def analyze_texts(
     scope = f" за период {_iso(lo)} — {_iso(hi)}" + (f" (тональность: {tone})" if str(tone).lower() not in ("all", "any", "") else "")
 
     found = _fetch_slice(index_name, lo, hi, tone, limit)
+    if not found["docs"] and (ctx.min_date or ctx.max_date) and (lo, hi) != (ctx.min_date, ctx.max_date):
+        # Модель могла указать период «от себя». Если по периоду задачи сообщения есть,
+        # читаем период задачи: иначе запуск заканчивается впустую («прочитано 0 сообщений»),
+        # а отчёт помечается неполным из-за отсутствия тем и цитат.
+        retry = _fetch_slice(index_name, ctx.min_date, ctx.max_date, tone, limit)
+        if retry["docs"]:
+            await ctx.log(
+                f"По периоду {_iso(lo)} — {_iso(hi)} сообщений нет — читаю период задачи "
+                f"{_iso(ctx.min_date)} — {_iso(ctx.max_date)}"
+            )
+            lo, hi = ctx.min_date, ctx.max_date
+            found = retry
     docs, docs_by_id, lines = found["docs"], found["docs_by_id"], found["lines"]
     if not docs:
         return {
@@ -1093,6 +1124,8 @@ async def analyze_texts(
         batch_started = time.time()
         lines = [_message_line(doc["msg_id"], doc) for doc in batch]
         async with semaphore:
+            # Остановка: не отправляем в vLLM новые пачки, если пользователь нажал «остановить».
+            ctx.check_cancelled()
             outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines)
         tokens_used += int(outcome.get("tokens") or 0)
         results.append(outcome)
@@ -1119,11 +1152,29 @@ async def analyze_texts(
                 units_parallel=parallel_batches,
             )
 
+    tasks = [asyncio.ensure_future(worker(n, batch)) for n, batch in enumerate(batches, start=1)]
+    watcher = None
+    if getattr(ctx, "cancel_check", None) is not None:
+        # Пока пачки читаются, следим за остановкой: незавершённые пачки гасим сразу,
+        # чтобы не держать очередь vLLM и не оставлять висящих задач.
+        watcher = asyncio.ensure_future(_cancel_watcher(ctx, tasks))
+    try:
+        if tracker is not None:
+            # Свой heartbeat внутри чтения: даже если инструмент вызван в обход registry,
+            # в интерфейсе не будет «мёртвой» тишины дольше 8–15 секунд.
+            async with tracker.heartbeat("чтение текстов"):
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+    if ctx.cancelled():
+        # Пользователь остановил запуск: выходим наверх, execute_run поставит статус cancelled.
+        raise RunCancelled("остановлено пользователем")
     if tracker is not None:
-        # Свой heartbeat внутри чтения: даже если инструмент вызван в обход registry,
-        # в интерфейсе не будет «мёртвой» тишины дольше 8–15 секунд.
-        async with tracker.heartbeat("чтение текстов"):
-            await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
         await tracker.sub(
             read_done,
             selected,
@@ -1136,8 +1187,6 @@ async def analyze_texts(
             units_total=len(batches),
             units_parallel=parallel_batches,
         )
-    else:
-        await asyncio.gather(*(worker(n, batch) for n, batch in enumerate(batches, start=1)))
     parsed_batches = [item["parsed"] for item in results if item.get("ok")]
     failed = len([item for item in results if not item.get("ok")])
     if not parsed_batches:

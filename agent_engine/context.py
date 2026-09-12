@@ -100,6 +100,15 @@ def to_unix_end(value: Any) -> Optional[int]:
     return to_unix(value, end=True)
 
 
+class RunCancelled(BaseException):
+    """Запуск остановлен пользователем.
+
+    Наследуемся от BaseException, а не от Exception: обработчики вида «except Exception»
+    внутри инструментов (registry.execute, разбор пачек) не должны глотать остановку —
+    она обязана дойти до execute_run и завершить запуск статусом cancelled.
+    """
+
+
 def compact(value: Any, max_items: int = 15, max_str: int = 260, depth: int = 0, max_depth: int = 5) -> Any:
     """Сжимает структуру ответа до размера, пригодного для передачи в LLM."""
     if depth > max_depth:
@@ -162,6 +171,10 @@ class AgentContext:
     # Состояние прогресса запуска (agent_engine.progress.ProgressTracker): шаги, процент, ETA.
     # Заполняется в runs.execute_run; шаги и инструменты пишут в него «что идёт сейчас».
     progress: Any = None
+    # Проверка «пользователь остановил запуск»: функцию кладёт runs.execute_run.
+    # Движок спрашивает её на безопасных точках и прекращает работу, не ломая уже
+    # сохранённые артефакты.
+    cancel_check: Optional[Callable[[], bool]] = None
 
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
@@ -187,6 +200,20 @@ class AgentContext:
 
     def out_of_time(self) -> bool:
         return self.time_left() <= 5
+
+    def cancelled(self) -> bool:
+        """Пользователь попросил остановить запуск."""
+        if self.cancel_check is None:
+            return False
+        try:
+            return bool(self.cancel_check())
+        except Exception:
+            return False
+
+    def check_cancelled(self) -> None:
+        """Точка остановки: вызывается в цикле агента, в шагах цепочки и между пачками чтения."""
+        if self.cancelled():
+            raise RunCancelled("остановлено пользователем")
 
     async def event(self, payload: Dict[str, Any]) -> None:
         if self.emit is None:

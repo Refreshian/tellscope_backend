@@ -10,7 +10,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-from .context import AGENT_RUNS_ROOT, AgentContext, to_unix_end, to_unix_start
+from .context import AGENT_RUNS_ROOT, AgentContext, RunCancelled, now_iso, to_unix_end, to_unix_start
 from .loop import DEFAULT_CHOICE, DEFAULT_TOKEN_BUDGET, MODEL_CHOICES, run_agent
 from .progress import ProgressTracker, human_duration
 from .registry import resolve_tools
@@ -27,6 +27,9 @@ MAX_TOKEN_BUDGET = 2_000_000
 # Запуск без событий дольше этого времени считается прерванным (сервер перезапускался,
 # процесс убит): heartbeat во время длинных операций идёт каждые 10 секунд.
 STALE_AFTER_SEC = 240
+
+# Завершённые состояния запуска: их не отменяют, и они не занимают слот пользователя.
+TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
 
 RUNS: Dict[str, Dict[str, Any]] = {}
 _SUBS: Dict[str, List[asyncio.Queue]] = {}
@@ -284,7 +287,7 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
     try:
         from mlops.runtime import register as register_job
 
-        progress = "100" if status in ("completed", "failed") else str((run.get("progress") or {}).get("percent") or 0)
+        progress = "100" if status in TERMINAL_STATUSES else str((run.get("progress") or {}).get("percent") or 0)
         register_job(
             run["run_id"],
             product="agent-mode",
@@ -303,6 +306,70 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
 
 def active_runs_total() -> int:
     return len([run for run in RUNS.values() if run.get("status") in ("queued", "running") and not run_is_stale(run)])
+
+
+# ------------------------------------------------------------------ остановка запуска
+
+def run_cancelled(run_id: str) -> bool:
+    """Проверка для движка: пользователь попросил остановить этот запуск."""
+    run = RUNS.get(run_id)
+    return bool(run and run.get("cancel_requested"))
+
+
+def is_terminal(run: Dict[str, Any]) -> bool:
+    return str(run.get("status") or "") in TERMINAL_STATUSES
+
+
+def _mark_cancelled(run: Dict[str, Any], message: str) -> None:
+    """Переводит запись запуска в статус «остановлено пользователем»."""
+    now = time.time()
+    started_ts = run.get("started_ts")
+    run["status"] = "cancelled"
+    run["error"] = message
+    run["finished_at"] = run.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+    run["finished_ts"] = run.get("finished_ts") or now
+    if started_ts:
+        run["duration_sec"] = round(max(0.0, float(run["finished_ts"]) - float(started_ts)), 1)
+    run["progress_detail"] = message
+    _persist(run)
+
+
+async def announce_cancel(run_id: str) -> None:
+    """Пишет отметку об остановке в поток запуска — она сразу видна в журнале шагов."""
+    await _emit(
+        run_id,
+        {
+            "ts": now_iso(),
+            "type": "log",
+            "level": "error",
+            "message": "Пользователь остановил запуск — останавливаюсь на ближайшем шаге, "
+                       "уже собранные артефакты сохраняются",
+        },
+    )
+
+
+def request_cancel(run_id: str, user_id: Any = None) -> Dict[str, Any]:
+    """Просит остановить запуск. Возвращает {found, forbidden, status, message}.
+
+    Флаг ``cancel_requested`` проверяет движок (цикл агента, шаги цепочки, пачки чтения
+    текстов), поэтому отмена срабатывает быстро и без обрыва HTTP-клиента vLLM.
+    """
+    run = get_run(run_id)
+    if run is None:
+        return {"found": False, "status": "", "message": "Запуск не найден"}
+    if user_id is not None and str(run.get("user_id")) != str(user_id):
+        return {"found": False, "forbidden": True, "status": str(run.get("status") or ""), "message": "Нет доступа к этому запуску"}
+    status = str(run.get("status") or "")
+    if is_terminal(run):
+        return {"found": True, "status": status, "message": "Запуск уже завершён", "already": True}
+    run["cancel_requested"] = True
+    run["cancel_requested_at"] = time.time()
+    if status == "queued":
+        # Ещё не стартовал — гасим сразу, рабочий поток даже не начнёт работу.
+        _mark_cancelled(run, "остановлено пользователем до старта")
+    else:
+        _persist(run)
+    return {"found": True, "status": str(run.get("status") or ""), "message": "Останавливаю запуск"}
 
 
 # -------------------------------------------------------- прогресс, время, статусы задач
@@ -428,16 +495,24 @@ def history_run_seconds(user_id: Any, mode: str = "") -> float:
 
 def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
     """Приводит запись задачи Центра ИИ-задач в соответствие с её запуском."""
-    ok = str(run.get("status")) == "completed"
+    status = str(run.get("status") or "")
+    ok = status == "completed"
+    cancelled = status == "cancelled"
     answer = str(run.get("answer") or "")
+    if ok:
+        task_status, label = "done", "выполнено"
+    elif cancelled:
+        task_status, label = "cancelled", "остановлено пользователем"
+    else:
+        task_status, label = "failed", "неуспешно"
     return {
-        "status": "done" if ok else "failed",
-        "status_label": "выполнено" if ok else "неуспешно",
-        "run_status": str(run.get("status") or ""),
+        "status": task_status,
+        "status_label": label,
+        "run_status": status,
         "finished_at": run.get("finished_at"),
         "duration_sec": run.get("duration_sec"),
         "answer": answer[:2000],
-        "error": run.get("error"),
+        "error": run.get("error") if not ok else None,
         "run_progress": dict(run.get("progress") or {}),
     }
 
@@ -505,7 +580,7 @@ def reconcile_harness_tasks(user_id: Any) -> int:
                         "run_status": "interrupted",
                         "error": "запись запуска не найдена: задача прервана, запустите её снова",
                     }
-            elif str(run.get("status")) in ("completed", "failed"):
+            elif str(run.get("status")) in TERMINAL_STATUSES:
                 patch = task_patch_from_run(run)
             elif run_is_stale(run, now):
                 idle = int((now - run_last_activity(run)) / 60.0)
@@ -621,6 +696,12 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
     run = RUNS.get(run_id)
     if run is None:
         return
+    if str(run.get("status")) == "cancelled":
+        # Пользователь остановил запуск, пока он стоял в очереди — работу не начинаем.
+        run["finished_at"] = run.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+        _persist(run)
+        sync_harness_task(run)
+        return
     run["status"] = "running"
     run["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     run["started_ts"] = time.time()
@@ -653,6 +734,9 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         artifacts_dir=artifacts_dir(run_id),
         deadline=time.time() + RUN_BUDGET_SEC,
         token_budget=int(run.get("token_budget") or DEFAULT_TOKEN_BUDGET),
+        # Остановка: движок спрашивает этот флаг в цикле агента, между шагами цепочки
+        # и между пачками чтения текстов.
+        cancel_check=lambda: run_cancelled(run_id),
     )
     # Прогресс запуска: сколько шагов в плане (если план есть), сколько сделано и сколько осталось.
     steps_plan = run.get("steps") or []
@@ -695,6 +779,13 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
             run["status"] = "completed" if run["answer"] else "failed"
         if not run["answer"]:
             run["error"] = "агент не сформировал ответ"
+    except RunCancelled:
+        # Пользователь нажал «остановить»: запуск завершается корректно, статус cancelled,
+        # уже собранные артефакты и файлы отчёта остаются на месте.
+        run["status"] = "cancelled"
+        run["error"] = "остановлено пользователем"
+        run["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        await emit({"type": "log", "level": "error", "message": "Запуск остановлен пользователем (статус cancelled)"})
     except Exception as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"
@@ -709,6 +800,11 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         status = str(run.get("status") or "completed")
         if status == "completed":
             detail = f"выполнено за {human_duration(run['duration_sec'])}"
+        elif status == "cancelled":
+            detail = (
+                f"остановлено пользователем через {human_duration(run['duration_sec'])}; "
+                f"собранные артефакты и файлы отчёта сохранены"
+            )
         else:
             detail = f"неуспешно за {human_duration(run['duration_sec'])}: {run.get('error') or 'причина не указана'}"
         try:

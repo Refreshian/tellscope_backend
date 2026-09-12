@@ -11582,8 +11582,6 @@ from ba_api import router as ba_router
 app.include_router(ba_router, dependencies=[Depends(current_user)])
 from information_summary import router as information_summary_router
 app.include_router(information_summary_router)
-from file_origin_api import router as file_origin_router
-app.include_router(file_origin_router)
 
 @app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
 async def graph_cluster_summary(request: Request):
@@ -12377,6 +12375,32 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
     }
 
 
+@app.post("/agent/run/{run_id}/cancel", tags=["agent mode"])
+async def agent_run_cancel(run_id: str, user: User = Depends(current_user)):
+    """Останавливает запуск: движок прекращает работу на ближайшей безопасной точке.
+
+    Флаг отмены проверяют цикл агента, шаги цепочки и пачки чтения текстов, поэтому
+    запуск завершается быстро, статус становится cancelled, а уже собранные артефакты
+    и файлы отчёта остаются на месте.
+    """
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_cancel(run_id)
+    if not info.get("already"):
+        # Отметка об остановке сразу попадает в журнал шагов и в поток запуска.
+        await _agent_runs.announce_cancel(run_id)
+    return {
+        "ok": bool(info.get("found")),
+        "run_id": run_id,
+        "status": info.get("status"),
+        "cancel_requested": not info.get("already"),
+        "message": info.get("message"),
+    }
+
+
 @app.get("/agent/run/{run_id}", tags=["agent mode"])
 async def agent_run_status(run_id: str, user: User = Depends(current_user)):
     """Состояние запуска: статус, журнал шагов, ответ, артефакты."""
@@ -13076,6 +13100,40 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
         _harness.update_task(str(user.id), task["id"], {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:600]})
         raise HTTPException(status_code=400, detail=str(exc)[:400]) from exc
     return {"task": task}
+
+
+@app.post("/harness/task/{task_id}/cancel", tags=["harness"])
+async def harness_task_cancel(task_id: str, user: User = Depends(current_user)):
+    """Останавливает запуск задачи Центра ИИ-задач (кнопка «остановить» в интерфейсе).
+
+    Доступ только владельцу задачи (или суперпользователю): без токена зависимость
+    current_user отдаёт 401.
+    """
+    from agent_engine import harness as _harness
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    run_id = str(task.get("run_id") or "")
+    if not run_id:
+        raise HTTPException(status_code=409, detail="У задачи нет запуска — останавливать нечего")
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_cancel(run_id)
+    if not info.get("already"):
+        await _agent_runs.announce_cancel(run_id)
+    task = _harness.get_task(user.id, task_id)
+    return {
+        "ok": bool(info.get("found")),
+        "task": task,
+        "run_id": run_id,
+        "status": info.get("status"),
+        "cancel_requested": not info.get("already"),
+        "message": info.get("message"),
+    }
 
 
 @app.get("/harness/task/{task_id}", tags=["harness"])

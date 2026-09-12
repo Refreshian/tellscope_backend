@@ -149,12 +149,34 @@ def system_prompt(ctx) -> str:
     return base + "\n".join(context)
 
 
+def _fmt_period(value: Any) -> str:
+    """Unix-секунды периода → дата для подсказки модели."""
+    try:
+        return time.strftime("%d.%m.%Y", time.localtime(int(value)))
+    except Exception:
+        return ""
+
+
 def user_prompt(ctx) -> str:
     lines = [f"Задача пользователя: {ctx.task}", ""]
     lines.append(
         "Работай по шагам: сначала пойми, какие данные нужны, затем вызывай инструменты и используй их результаты. "
         "Все цифры в ответе должны опираться на данные инструментов."
     )
+    # Датасет и период выбраны в интерфейсе: без этой подсказки модель иногда придумывает свои даты,
+    # инструмент честно возвращает «сообщений нет», и запуск заканчивается впустую.
+    chosen = []
+    if ctx.dataset_label or ctx.dataset_name:
+        chosen.append(f"датасет: {ctx.dataset_label or ctx.dataset_name}")
+    if ctx.min_date or ctx.max_date:
+        period = " — ".join(part for part in (_fmt_period(ctx.min_date), _fmt_period(ctx.max_date)) if part)
+        chosen.append(f"период: {period} (задан в интерфейсе)")
+    if chosen:
+        lines.append(
+            "Выбранные пользователем данные — " + "; ".join(chosen) + ". Инструментам передавай именно этот "
+            "период (min_date/max_date), другие даты не придумывай: если не уверен в датах — не указывай их вовсе, "
+            "инструмент возьмёт период пользователя."
+        )
     if wants_report(ctx.task) and "build_report" in ctx.allowed_tools:
         lines.append(
             "Пользователь просит отчёт. Обязательный порядок: собрать данные инструментами, ПРОЧИТАТЬ ТЕКСТЫ "
@@ -533,6 +555,7 @@ async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     spec = get_tool(name)
     if spec is None or name not in ctx.allowed_tools:
         return {"ok": False, "error": f"инструмент {name} недоступен"}
+    ctx.check_cancelled()
     tracker = _progress(ctx)
     if tracker is not None:
         await tracker.begin_stage(f"Инструмент: {spec.title}", detail=TOOL_HINTS.get(name, "выполняется"))
@@ -554,6 +577,8 @@ async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if tracker is not None:
         # В свободном цикле общее число шагов неизвестно: показываем прогресс по факту.
         await tracker.end_stage(detail=summary, ok=bool(outcome.get("ok")))
+    # Остановка могла прийти, пока инструмент работал.
+    ctx.check_cancelled()
     return outcome
 
 
@@ -614,20 +639,27 @@ async def _ensure_texts(ctx, messages: List[dict], tools_schema: List[dict]) -> 
 
 
 async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
-    """Гарантирует, что при запросе отчёта файл действительно собран.
+    """Гарантирует, что при запросе отчёта файл собран И тексты прочитаны.
 
     Перед сборкой добиваемся чтения текстов (analyze_texts), иначе причины жалоб останутся
-    без цитат и отчёт будет помечен как неполный.
+    без цитат и отчёт будет помечен как неполный (защита ctx.text_gap). Если модель успела
+    собрать отчёт без чтения текстов, отчёт пересобирается — иначе запуск зря закончится
+    неуспешным, хотя данные в срезе есть.
     """
     if "build_report" not in ctx.allowed_tools:
         return False
     texts_done = any(call.get("name") == "analyze_texts" for call in ctx.tool_calls)
-    if any(call.get("name") == "build_report" for call in ctx.tool_calls):
+    report_done = any(call.get("name") == "build_report" for call in ctx.tool_calls)
+    if report_done and texts_done:
         return True
     if ctx.out_of_time():
-        return False
+        return report_done
     if not texts_done:
         await _ensure_texts(ctx, messages, tools_schema)
+        texts_done = any(call.get("name") == "analyze_texts" for call in ctx.tool_calls)
+    if report_done and not texts_done:
+        # Тексты прочитать не удалось: отчёт остаётся как есть, text_gap честно пометит его неполным.
+        return True
     instruction = (
         "Собери итоговый отчёт прямо сейчас: вызови инструмент build_report с заголовком, разделами "
         "(динамика, тональность, площадки, инфоповоды, выводы), графиками по их chart_id и ссылками на источники. "
@@ -766,6 +798,8 @@ async def run_agent(ctx) -> Dict[str, Any]:
         await tracker.start_run()
 
     for step in range(1, MAX_STEPS + 1):
+        # Остановка пользователем: проверяем перед каждым обращением к модели.
+        ctx.check_cancelled()
         if ctx.out_of_time():
             ctx.notes.append("истёк лимит времени запуска")
             break
@@ -795,6 +829,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
         ctx.llm_calls += 1
         _account(ctx, result)
         content, calls = _parse_message(result)
+        # Модель ответила: если пользователь остановил запуск во время вызова,
+        # не запускаем следующие инструменты.
+        ctx.check_cancelled()
 
         if use_tools and calls:
             messages.append({"role": "assistant", "content": content or "", "tool_calls": calls})
