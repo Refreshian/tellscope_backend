@@ -12622,6 +12622,25 @@ async def agent_tool_call(tool_name: str, request: Request, user_manager: UserMa
     return JSONResponse(body)
 
 
+# ============================ Темы (датасеты) для интерфейса ============================
+# Отдаём уникальные темы с читаемыми подписями: их показывают выбор темы в интерфейсе
+# и подсказка в конструкторе Dify, чтобы пользователю не нужно было знать числовой index.
+
+@app.get("/agent/datasets", tags=["agent mode"])
+async def agent_datasets(user: User = Depends(current_user)):
+    """Список доступных тем: подпись, период, название датасета и номер индекса."""
+    from agent_engine.tools_data import datasets_public
+
+    items = []
+    for item in datasets_public():
+        try:
+            _guard_index_access(user, item["index"])
+        except Exception:
+            continue
+        items.append(item)
+    return {"datasets": items, "total": len(items), "note": "тему можно указывать названием или index"}
+
+
 # =============== DeepSeek Harness: единый центр задач Tellscope ===============
 # Пользователь описывает задачу обычным текстом, а ассистент либо объясняет план, либо сразу
 # выполняет её инструментами Tellscope, либо собирает цепочку шагов (агента), либо генерирует

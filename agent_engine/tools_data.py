@@ -53,14 +53,156 @@ def _stem(name: Any) -> str:
     return low[:-5] if low.endswith(".json") else low
 
 
-def resolve_index(ctx: Any, index: Optional[int] = None) -> int:
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def _norm_text(value: Any) -> str:
+    """Нормализует название темы: нижний регистр, транслит кириллицы, только буквы и цифры."""
+    text = _stem(value).lower()
+    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+_NICE_WORDS = {
+    "kfc": "KFC", "smi": "СМИ", "oiv": "ОИВ", "ba": "БА", "orvi": "ОРВИ", "vk": "VK",
+    "tg": "TG", "gis": "2ГИС", "rrb": "РСХБ", "ai": "ИИ",
+    "jan": "январь", "feb": "февраль", "mar": "март", "apr": "апрель", "may": "май",
+    "jun": "июнь", "jul": "июль", "aug": "август", "sep": "сентябрь", "oct": "октябрь",
+    "nov": "ноябрь", "dec": "декабрь",
+}
+
+
+def _nice_word(word: str) -> str:
+    """kfc → KFC, may → май, platon → Платон."""
+    low = word.lower()
+    if low in _NICE_WORDS:
+        return _NICE_WORDS[low]
+    if word.isupper():
+        return word
+    return word.capitalize()
+
+
+def _split_name(name: str) -> "tuple[str, str]":
+    """«platon_13.10.2025-30.11.2025» → («Платон», «13.10.2025 — 30.11.2025»)."""
+    import re as _re
+
+    text = _stem(name)
+    period = ""
+    match = _re.search(r"(\d{2}\.\d{2}\.\d{4})\s*[-–]\s*(\d{2}\.\d{2}\.\d{4})", text)
+    if match:
+        period = f"{match.group(1)} — {match.group(2)}"
+        text = (text[: match.start()] + text[match.end():]).strip(" _-.")
+    text = _re.sub(r"[0-9a-f]{16,}", "", text).strip(" _-.")
+    words = [word for word in text.replace("_", " ").replace("-", " ").split() if word]
+    label = " ".join(_nice_word(word) for word in words)
+    return (label or _stem(name), period)
+
+
+def datasets_public(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Уникальные темы для интерфейса и Dify: имя, подпись и период (без дублей индексов)."""
+    seen: Dict[str, Dict[str, Any]] = {}
+    for idx, name in sorted(index_map().items(), reverse=True):
+        key = _stem(name)
+        label, period = _split_name(name)
+        item = {"index": idx, "name": key, "label": label, "period": period}
+        if key not in seen:
+            seen[key] = item
+        else:  # оставляем самый свежий индекс для этого имени
+            seen[key]["index"] = max(seen[key]["index"], idx)
+    items = sorted(seen.values(), key=lambda item: item["index"], reverse=True)
+    return items[:limit] if limit else items
+
+
+def _match_dataset(value: Any) -> Optional[int]:
+    """Ищет тему по названию, подписи или части строки — с учётом транслита (Платон → platon)."""
+    raw = _stem(value).strip().lower()
+    text = _norm_text(value)
+    if len(text) < 2:
+        return None
+    # «Платон · 13.10.2025 — 30.11.2025»: сначала подпись, при необходимости — период
+    if "·" in str(value):
+        head, _, tail = str(value).partition("·")
+        head_norm = _norm_text(head)
+        tail_norm = _norm_text(tail)
+        best: Optional[int] = None
+        for idx, name in index_map().items():
+            label, period = _split_name(name)
+            if _norm_text(label) != head_norm:
+                continue
+            if tail_norm and tail_norm not in _norm_text(period):
+                continue
+            best = idx if best is None else max(best, idx)
+        if best is not None:
+            return best
+    mapping = index_map()
+    for idx, name in mapping.items():  # 1) точное имя
+        if _stem(name).strip().lower() == raw:
+            return idx
+    candidates: List[Any] = []
+    for idx, name in mapping.items():
+        label, _period = _split_name(name)
+        if _norm_text(label) == text:
+            candidates.append((idx, 0, len(_norm_text(label))))
+    if candidates:  # 2) точная подпись темы
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][0]
+    hits = []
+    for idx, name in mapping.items():
+        label, _period = _split_name(name)
+        for source in (_stem(name), label):
+            norm = _norm_text(source)
+            if text and text in norm:
+                hits.append((idx, len(norm)))
+                break
+    if hits:  # 3) запрос — часть названия или подписи (свежий индекс при дублях)
+        hits.sort(key=lambda item: (item[1], -item[0]))
+        return hits[0][0]
+    hits = []
+    for idx, name in mapping.items():
+        label, _period = _split_name(name)
+        for source in (_stem(name), label):
+            norm = _norm_text(source)
+            if len(norm) > 3 and norm in text:
+                hits.append((idx, len(norm)))
+                break
+    if hits:  # 4) название темы — часть запроса («отчёт по Платону»)
+        hits.sort(key=lambda item: (-item[1], -item[0]))
+        return hits[0][0]
+    return None
+
+
+def available_datasets(limit: int = 12) -> str:
+    names = sorted({_stem(name) for name in index_map().values()})
+    shown = ", ".join(f"«{name}»" for name in names[:limit])
+    return shown + (" и другие" if len(names) > limit else "")
+
+
+def resolve_index(ctx: Any, index: Any = None) -> int:
+    """Принимает номер датасета или название темы («Платон», «kfc_may_01-14»)."""
     idx = index if index is not None else ctx.dataset_index
+    if isinstance(idx, str):
+        text = idx.strip()
+        if text and not text.lstrip("-").isdigit():
+            found = _match_dataset(text)
+            if found is None:
+                raise ToolError(
+                    f"Тема «{text}» не найдена. Доступные темы: {available_datasets()}"
+                )
+            return found
+        idx = text or None
     if idx is None:
-        raise ToolError("Датасет не выбран: укажите index или выберите датасет в интерфейсе")
+        raise ToolError(
+            "Тема не выбрана: укажите название датасета (например «Платон») или его номер"
+        )
     try:
         return int(idx)
     except Exception as exc:
-        raise ToolError(f"Некорректный index: {index!r}") from exc
+        raise ToolError(f"Некорректный индекс датасета: {index!r}") from exc
 
 
 def guard(ctx: Any, index: Optional[int] = None):
@@ -248,45 +390,34 @@ def _sample(hit: Dict[str, Any]) -> Dict[str, Any]:
 
 @tool(
     "list_datasets",
-    title="Список датасетов",
+    title="Список тем (датасетов)",
     description=(
-        "Возвращает датасеты (наборы данных), доступные текущему пользователю: index для остальных "
-        "инструментов, имя индекса, папки и файлы. Вызывай первым, если не знаешь index датасета."
+        "Список доступных тем соцмедиа и СМИ: подпись, период и название датасета. "
+        "Если пользователь назвал тему словами («Платон», «KFC за май») — сначала вызови этот инструмент, "
+        "чтобы подобрать нужную тему, и передавай дальше её название или индекс."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "include_shared": {"type": "boolean", "description": "включать датасеты, расшаренные пользователю"},
+            "include_shared": {"type": "boolean", "description": "включать общие датасеты"},
         },
     },
     group="analytics",
 )
-async def list_datasets(ctx, include_shared: bool = True):
-    m = _m()
-    mapping = index_map()
-    allowed = None
-    if not getattr(ctx.user, "is_superuser", False):
+async def list_datasets(ctx, include_shared: bool = False):
+    """Уникальные темы с читаемыми подписями — для выбора темы человеком и моделью."""
+    items = datasets_public()
+    visible = []
+    for item in items:
         try:
-            allowed = m._allowed_dataset_stems(getattr(ctx.user, "id", None))
+            _m()._guard_index_access(ctx.user, item["index"])
         except Exception:
-            allowed = set()
-    rows: List[Dict[str, Any]] = []
-    for idx, name in sorted(mapping.items(), reverse=True):
-        if allowed is not None and _stem(name) not in allowed:
             continue
-        rows.append({"index": idx, "name": name})
-    folders: Dict[str, Any] = {}
-    try:
-        raw = m._redis_s.hget(str(ctx.user_id), "json_files_directory")
-        if raw:
-            folders = json.loads(raw)
-    except Exception:
-        folders = {}
+        visible.append(item)
     return {
-        "datasets": rows[:80],
-        "total_datasets": len(rows),
-        "own_folders": compact(folders, max_items=20, max_str=160),
-        "current": {"index": ctx.dataset_index, "name": ctx.dataset_name},
+        "datasets": compact(visible, max_items=60),
+        "total": len(visible),
+        "hint": "index можно не указывать: инструменты принимают и название темы, и её подпись",
     }
 
 
@@ -300,7 +431,7 @@ async def list_datasets(ctx, include_shared: bool = True):
     parameters={
         "type": "object",
         "properties": {
-            "index": {"type": "integer", "description": "index датасета (по умолчанию — выбранный в интерфейсе)"},
+            "index": {"type": "string", "description": "тема: название датасета (например «Платон») или его номер; по умолчанию — выбранный в интерфейсе"},
             "top_n": {"type": "integer", "description": "сколько значений в топах, по умолчанию 10"},
         },
     },
@@ -347,7 +478,7 @@ async def dataset_overview(ctx, index: Optional[int] = None, top_n: int = 10):
         "type": "object",
         "properties": {
             "phrase": {"type": "string", "description": "тема поиска; пусто — все сообщения периода"},
-            "index": {"type": "integer", "description": "index датасета"},
+            "index": {"type": "string", "description": "тема: название датасета или его номер"},
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD или unix-секунды"},
             "tone": {"type": "string", "enum": ["any", "negative", "positive", "neutral"], "description": "фильтр тональности"},
@@ -469,7 +600,7 @@ def _guard_call(method, *args, **kwargs):
     parameters={
         "type": "object",
         "properties": {
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или её номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
         },
@@ -539,7 +670,7 @@ SMI_FILTER = {"match_phrase": {"hubtype": "Онлайн-СМИ"}}
     parameters={
         "type": "object",
         "properties": {
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или её номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "limit": {"type": "integer", "description": "сколько изданий вернуть в каждом рейтинге (по умолчанию 12)"},
@@ -621,7 +752,7 @@ async def media_rating(ctx, index: Optional[int] = None, min_date: Any = None, m
         "type": "object",
         "properties": {
             "query_str": {"type": "string", "description": "ключевая фраза/тема, например «Ростикс» или «бургер»"},
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или её номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
         },
@@ -658,7 +789,7 @@ async def voice_of_customer(ctx, query_str: Optional[str] = None, index: Optiona
         "type": "object",
         "properties": {
             "query_str": {"type": "string", "description": "что искать: тема, бренд, проблема"},
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или её номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
         },

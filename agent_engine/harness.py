@@ -380,6 +380,24 @@ async def make_chain(user: Any, text: str, index: Optional[int] = None, dataset_
 
 # ---------------------------------------------------------------- режим flow
 
+def dataset_options(limit: int = 15) -> List[str]:
+    """Понятные варианты темы для выпадающего списка в Dify (подпись · период)."""
+    from .tools_data import datasets_public
+
+    bad = ("zz", "tiny", "probe", "test", "demo", "tmp", "sample", "converted", "аукцион", ".doc", ".txt", "serv cros")
+    options: List[str] = []
+    for item in datasets_public():
+        name = str(item.get("name") or "").lower()
+        if any(marker in name for marker in bad):
+            continue
+        label = str(item.get("label") or item.get("name"))
+        period = str(item.get("period") or "")
+        options.append(f"{label} · {period}" if period else label)
+        if len(options) >= limit:
+            break
+    return options
+
+
 def _yaml_value(value: Any) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
@@ -431,9 +449,12 @@ def build_dify_dsl(spec: Dict[str, Any], index: Optional[int]) -> str:
             "      width: 244\n"
         )
 
+    theme_lines = ["        - label: 'Тема (набор данных)'", "          max_length: null", "          options:"]
+    for option in dataset_options():
+        theme_lines.append("          - " + _yaml_value(option))
+    theme_lines += ["          required: true", "          type: select", "          variable: dataset"]
     start_vars = (
-        "        - label: 'Номер датасета (index)'\n          max_length: null\n          options: []\n"
-        f"          required: true\n          type: number\n          variable: index\n"
+        "\n".join(theme_lines) + "\n"
         "        - label: 'Подтема: поисковые слова'\n          max_length: null\n          options: []\n"
         "          required: true\n          type: text-input\n          variable: subtopic\n"
         "        - label: 'Период с (YYYY-MM-DD)'\n          max_length: null\n          options: []\n"
@@ -466,14 +487,14 @@ def build_dify_dsl(spec: Dict[str, Any], index: Optional[int]) -> str:
         for key, value in args.items():
             key = str(key)
             if key == "index":
-                normalized[key] = "{{#start.index#}}"
+                normalized[key] = "{{#start.dataset#}}"
             elif key == "min_date":
                 normalized[key] = "{{#start.date_from#}}"
             elif key == "max_date":
                 normalized[key] = "{{#start.date_to#}}"
             else:
                 normalized[key] = _normalize_ref(str(value))
-        normalized.setdefault("index", "{{#start.index#}}")
+        normalized.setdefault("index", "{{#start.dataset#}}")
         normalized.setdefault("min_date", "{{#start.date_from#}}")
         normalized.setdefault("max_date", "{{#start.date_to#}}")
 

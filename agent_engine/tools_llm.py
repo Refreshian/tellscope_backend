@@ -282,7 +282,7 @@ def _merge_results(parsed_batches: List[dict], docs_by_id: Dict[str, Dict[str, A
         "properties": {
             "phrase": {"type": "string", "description": "тема для разбора: фраза, по которой ищем сообщения"},
             "focus": {"type": "string", "description": "на что смотреть в первую очередь (например «претензии к качеству», «цены», «сервис»)"},
-            "index": {"type": "integer", "description": "index датасета"},
+            "index": {"type": "string", "description": "тема: название датасета или её номер"},
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD или unix-секунды"},
             "tone": {"type": "string", "enum": ["any", "negative", "positive", "neutral"], "description": "фильтр тональности сообщений"},

@@ -49,7 +49,7 @@ def _full_period(ctx, idx: int, lo, hi):
     parameters={
         "type": "object",
         "properties": {
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или его номер"},
             "limit": {"type": "integer", "description": "сколько поводов вернуть (по умолчанию 15, максимум 40)"},
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD или unix-секунды"},
@@ -84,7 +84,7 @@ async def popular_hooks(ctx, index: Optional[int] = None, limit: int = 15, min_d
         "type": "object",
         "properties": {
             "phrase": {"type": "string", "description": "тема/фраза инфоповода, например «Курочка с душком»"},
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или его номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
         },
@@ -139,7 +139,7 @@ async def chain_graph(ctx, phrase: str, index: Optional[int] = None, min_date: A
         "type": "object",
         "properties": {
             "query_str": {"type": "string", "description": "тема запроса, например «карта», «бургер», «Ростикс»"},
-            "index": {"type": "integer"},
+            "index": {"type": "string", "description": "тема: название датасета или его номер"},
             "min_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "max_date": {"type": "string", "description": "YYYY-MM-DD или unix-секунды"},
             "post": {"type": "boolean", "description": "учитывать посты"},
