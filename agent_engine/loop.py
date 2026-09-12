@@ -157,9 +157,17 @@ def user_prompt(ctx) -> str:
     )
     if wants_report(ctx.task) and "build_report" in ctx.allowed_tools:
         lines.append(
-            "Пользователь просит отчёт. Обязательный порядок: собрать данные инструментами, построить 2–4 графика "
-            "через make_chart (динамика, тональность, площадки, сравнение периодов), затем вызвать build_report "
-            "со всеми разделами, выводами и ссылками на источники. Ответ в чате — короткое резюме, сам отчёт только файлом."
+            "Пользователь просит отчёт. Обязательный порядок: собрать данные инструментами, ПРОЧИТАТЬ ТЕКСТЫ "
+            "сообщений инструментом analyze_texts (темы, доли, цитаты) — без этого отчёт считается неполным, "
+            "затем построить 2–4 графика через make_chart (динамика, тональность, площадки, сравнение периодов) "
+            "и вызвать build_report со всеми разделами, текстовыми находками (findings из analyze_texts), "
+            "выводами и ссылками на источники. Пояснение к каждому графику опирай на темы и цитаты из текстов, "
+            "а не только на статистику. Ответ в чате — короткое резюме, сам отчёт только файлом."
+        )
+    if "analyze_texts" in ctx.allowed_tools:
+        lines.append(
+            "Если в данных есть негатив, жалобы или вопросы «почему/на что жалуются» — обязательно вызови "
+            "analyze_texts за тот же период: он читает сами тексты локальной моделью и даёт темы с цитатами."
         )
     return "\n".join(lines)
 
@@ -181,6 +189,13 @@ def _summarize(name: str, result: Any) -> str:
             return (
                 f"разобрано {result.get('messages_analyzed')} сообщений, формулировок поиска: {len(terms)}{vector}, "
                 f"претензий: {len(result.get('key_claims') or [])}"
+            )
+        if name == "analyze_texts":
+            stats = result.get("stats") or {}
+            return (
+                f"прочитано {result.get('messages_analyzed')} сообщений, тем {stats.get('topics')}, "
+                f"цитат {sum(len(item.get('quotes') or []) for item in (result.get('topics') or []))}, "
+                f"пачек {stats.get('batches')}, {stats.get('seconds')} с"
             )
         if name == "dataset_overview":
             period = result.get("period") or {}
@@ -364,20 +379,85 @@ async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return outcome
 
 
+async def _ensure_texts(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
+    """Добивается чтения текстов датасета: без него причины жалоб остаются без цитат.
+
+    Если модель отказывается, отчёт всё равно собирается, но build_report пометит его
+    неполным (ctx.text_gap) — негатив без конкретной темы и цитаты в отчёт не пропускаем.
+    """
+    if "analyze_texts" not in ctx.allowed_tools or not tools_schema:
+        return False
+    if any(call.get("name") == "analyze_texts" for call in ctx.tool_calls):
+        return True
+    if ctx.out_of_time():
+        return False
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Ты ещё не читал тексты сообщений. Вызови инструмент analyze_texts за период отчёта "
+                "(tone=all): он вернёт темы с долями и цитатами — они обязательны в отчёте, иначе причины "
+                "жалоб останутся нераскрытыми."
+            ),
+        }
+    )
+    try:
+        result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=900, force_tool="analyze_texts")
+    except Exception as exc:
+        await ctx.log(f"Не удалось принудительно прочитать тексты: {exc}", level="error")
+        return False
+    ctx.llm_calls += 1
+    _account(ctx, result)
+    content, calls = _parse_message(result)
+    if not calls:
+        parsed = _extract_json(content or "")
+        if parsed and parsed.get("tool"):
+            calls = [{"id": "forced", "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)}}]
+    if not calls:
+        return False
+    done = False
+    for call in calls:
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "")
+        if name not in ctx.allowed_tools:
+            continue
+        raw_args = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except Exception:
+            args = {}
+        outcome = await _run_tool(ctx, name, args)
+        messages.append(
+            {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
+        )
+        if name == "analyze_texts":
+            done = bool(outcome.get("ok"))
+    return done
+
+
 async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
-    """Гарантирует, что при запросе отчёта файл действительно собран."""
+    """Гарантирует, что при запросе отчёта файл действительно собран.
+
+    Перед сборкой добиваемся чтения текстов (analyze_texts), иначе причины жалоб останутся
+    без цитат и отчёт будет помечен как неполный.
+    """
     if "build_report" not in ctx.allowed_tools:
         return False
+    texts_done = any(call.get("name") == "analyze_texts" for call in ctx.tool_calls)
     if any(call.get("name") == "build_report" for call in ctx.tool_calls):
         return True
     if ctx.out_of_time():
         return False
+    if not texts_done:
+        await _ensure_texts(ctx, messages, tools_schema)
     instruction = (
         "Собери итоговый отчёт прямо сейчас: вызови инструмент build_report с заголовком, разделами "
         "(динамика, тональность, площадки, инфоповоды, выводы), графиками по их chart_id и ссылками на источники. "
         "Если графиков ещё нет, сначала вызови make_chart 2–4 раза, затем build_report. "
-        "Если ранее делал подробный разбор темы (deep_text_analysis) — включи его итоговый текст отдельным разделом "
-        "с цитатами и ссылками, а не пересказывай своими словами."
+        "Если ранее читал тексты (analyze_texts) — передай его report_section отдельным разделом: темы, "
+        "число сообщений, доли и цитаты с атрибуцией (findings), а не пересказ своими словами. "
+        "Если делал подробный разбор темы (deep_text_analysis) — включи и его текст отдельным разделом. "
+        "Пояснения к каждому графику строй на темах и цитатах из текстов, а не только на статистике."
     )
     messages.append({"role": "user", "content": instruction})
     for force in ("build_report", None):
@@ -636,4 +716,11 @@ async def run_agent(ctx) -> Dict[str, Any]:
         "notes": ctx.notes,
     }
     await ctx.event({"type": "final", "answer": answer, "artifacts": ctx.artifacts, "stats": stats})
-    return {"answer": answer, "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts, "no_data": bool(getattr(ctx, "no_data", False))}
+    return {
+        "answer": answer,
+        "stats": stats,
+        "tool_calls": ctx.tool_calls,
+        "artifacts": ctx.artifacts,
+        "no_data": bool(getattr(ctx, "no_data", False)),
+        "text_gap": str(getattr(ctx, "text_gap", "") or ""),
+    }

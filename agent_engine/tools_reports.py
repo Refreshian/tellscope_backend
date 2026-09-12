@@ -260,6 +260,86 @@ def _docx_hyperlink(paragraph, url: str, text: str) -> None:
     paragraph._p.append(hyperlink)
 
 
+def _fmt_share(value: Any) -> str:
+    """0.4634 → «46,3%»; уже готовый процент (46.3) не переводим повторно."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value or "")
+    if number <= 1.0:
+        number *= 100.0
+    return f"{number:.1f}".replace(".", ",") + "%"
+
+
+def _quote_text(quote: Any) -> str:
+    if isinstance(quote, dict):
+        return str(quote.get("text") or "").strip()
+    return str(quote or "").strip()
+
+
+def _quote_attribution(quote: Any) -> str:
+    """«otzovik.com · 2026-09-10 14:20 · Zhenyas123» — площадка, дата, автор."""
+    if not isinstance(quote, dict):
+        return ""
+    parts = [str(quote.get("hub") or "").strip(), str(quote.get("date") or "").strip(), str(quote.get("author") or "").strip()]
+    if quote.get("rating") is not None:
+        try:
+            parts.append("оценка %g" % float(quote["rating"]))
+        except (TypeError, ValueError):
+            pass
+    return " · ".join(part for part in parts if part)
+
+
+def _finding_rows(findings: Any) -> List[Dict[str, Any]]:
+    return [item for item in (findings or []) if isinstance(item, dict)]
+
+
+def _findings_blocks(section: Dict[str, Any]) -> List[str]:
+    """Текстовое представление findings для PDF: тема, число/доля, цитаты с атрибуцией."""
+    blocks: List[str] = []
+    for item in _finding_rows(section.get("findings")):
+        topic = str(item.get("topic") or "Тема")
+        head = f"{topic} — {item.get('count')} сообщ."
+        if item.get("share") is not None:
+            head += f" ({_fmt_share(item.get('share'))} среза)"
+        if item.get("tone"):
+            head += f", тональность: {item.get('tone')}"
+        if item.get("category"):
+            head += f", категория: {item.get('category')}"
+        blocks.append("• " + head)
+        if item.get("essence"):
+            blocks.append(f"   суть: {item['essence']}")
+        for quote in (item.get("quotes") or []):
+            text = _quote_text(quote)
+            if not text:
+                continue
+            attribution = _quote_attribution(quote)
+            blocks.append(f"   «{text}»" + (f" — {attribution}" if attribution else ""))
+    return blocks
+
+
+def _highlight_blocks(section: Dict[str, Any]) -> List[str]:
+    blocks: List[str] = []
+    for item in _finding_rows(section.get("highlights")):
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        attribution = " · ".join(
+            part for part in (
+                str(item.get("hub") or "").strip(),
+                str(item.get("date") or "").strip(),
+                str(item.get("author") or "").strip(),
+            ) if part
+        )
+        line = f"— {text}"
+        if attribution:
+            line += f" ({attribution})"
+        if item.get("why"):
+            line += f" — важно: {item['why']}"
+        blocks.append(line)
+    return blocks
+
+
 def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
     from docx import Document
     from docx.shared import Inches, Pt
@@ -288,6 +368,67 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
             doc.add_paragraph(para)
         for bullet in section.get("bullets") or []:
             doc.add_paragraph(str(bullet), style="List Bullet")
+        # -------- текстовые находки: темы с частотами, долями и цитатами --------
+        findings = _finding_rows(section.get("findings"))
+        if findings:
+            doc.add_heading("Темы из текстов сообщений", level=2)
+            table = doc.add_table(rows=1, cols=4)
+            table.style = "Light Grid Accent 1"
+            header = table.rows[0].cells
+            for cell, label in zip(header, ("Тема", "Сообщений", "Доля среза", "Тональность")):
+                cell.text = label
+            for item in findings[:12]:
+                row = table.add_row().cells
+                row[0].text = str(item.get("topic") or "—")
+                row[1].text = _fmt(item.get("count"))
+                row[2].text = _fmt_share(item.get("share")) if item.get("share") is not None else "—"
+                row[3].text = str(item.get("tone") or "—")
+            for item in findings[:12]:
+                topic = str(item.get("topic") or "Тема")
+                head = doc.add_paragraph()
+                head.add_run(f"{topic} — {_fmt(item.get('count'))} сообщ.").bold = True
+                if item.get("share") is not None:
+                    head.add_run(f", {_fmt_share(item.get('share'))} среза")
+                if item.get("category"):
+                    head.add_run(f", категория: {item['category']}")
+                if item.get("essence"):
+                    doc.add_paragraph(str(item["essence"]))
+                for quote in (item.get("quotes") or [])[:3]:
+                    text = _quote_text(quote)
+                    if not text:
+                        continue
+                    para = doc.add_paragraph(style="List Bullet")
+                    run = para.add_run(f"«{text}»")
+                    run.italic = True
+                    attribution = _quote_attribution(quote)
+                    if attribution:
+                        para.add_run(f" — {attribution}")
+                    if isinstance(quote, dict) and quote.get("url"):
+                        para.add_run(" ")
+                        _docx_hyperlink(para, str(quote["url"]), "ссылка")
+        highlights = _finding_rows(section.get("highlights"))
+        if highlights:
+            doc.add_heading("Ключевые сообщения", level=2)
+            for item in highlights[:8]:
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                para = doc.add_paragraph(style="List Bullet")
+                para.add_run(text)
+                attribution = " · ".join(
+                    part for part in (
+                        str(item.get("hub") or "").strip(),
+                        str(item.get("date") or "").strip(),
+                        str(item.get("author") or "").strip(),
+                    ) if part
+                )
+                if attribution:
+                    para.add_run(f" — {attribution}").italic = True
+                if item.get("why"):
+                    para.add_run(f" (важно: {item['why']})")
+                if item.get("url"):
+                    para.add_run(" ")
+                    _docx_hyperlink(para, str(item["url"]), "ссылка")
         for chart_id in section.get("chart_ids") or []:
             chart = meta.get("charts", {}).get(chart_id)
             if chart and os.path.isfile(chart.get("path") or ""):
@@ -384,6 +525,16 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
                 blocks.append(section["text"])
             for bullet in section.get("bullets") or []:
                 blocks.append(f"• {bullet}")
+            findings = _finding_rows(section.get("findings"))
+            if findings:
+                blocks.append("")
+                blocks.append("ТЕМЫ ИЗ ТЕКСТОВ СООБЩЕНИЙ")
+                blocks.extend(_findings_blocks(section))
+            highlights = _finding_rows(section.get("highlights"))
+            if highlights:
+                blocks.append("")
+                blocks.append("КЛЮЧЕВЫЕ СООБЩЕНИЯ")
+                blocks.extend(_highlight_blocks(section))
             for cite in (section.get("citations") or [])[:20]:
                 blocks.append(f"— {cite.get('title') or ''} {cite.get('url') or ''}".strip())
             _pdf_text_pages(pdf, title, blocks, meta)
@@ -397,9 +548,10 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
     "build_report",
     title="Собрать отчёт (DOCX/PDF)",
     description=(
-        "Собирает итоговый отчёт: разделы с текстом, списки выводов, графики (по chart_id из make_chart) и ссылки на источники. "
+        "Собирает итоговый отчёт: разделы с текстом, списки выводов, ТЕМЫ С ЦИТАТАМИ (findings из analyze_texts), "
+        "графики (по chart_id из make_chart) и ссылки на источники. "
         "Файлы DOCX и PDF сохраняются в папку датасета во вкладке «Отчёты» и становятся доступны пользователю для скачивания. "
-        "Вызывай последним шагом, когда данные собраны."
+        "Вызывай последним шагом, когда данные собраны и тексты прочитаны (analyze_texts)."
     ),
     parameters={
         "type": "object",
@@ -408,7 +560,7 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
             "subtitle": {"type": "string", "description": "подзаголовок/краткое описание"},
             "sections": {
                 "type": "array",
-                "description": "разделы отчёта",
+                "description": "разделы отчёта: текст, списки выводов, графики, цитаты и текстовые находки",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -416,6 +568,41 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
                         "text": {"type": "string", "description": "основной текст раздела, абзацы через перевод строки"},
                         "bullets": {"type": "array", "items": {"type": "string"}, "description": "список выводов/тезисов"},
                         "chart_ids": {"type": "array", "items": {"type": "string"}, "description": "графики из make_chart"},
+                        "findings": {
+                            "type": "array",
+                            "description": "темы из чтения текстов (analyze_texts): тема, число сообщений, доля, цитаты",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "topic": {"type": "string"},
+                                    "count": {"type": "integer"},
+                                    "share": {"type": "number", "description": "доля среза: 0.46 или 46.3"},
+                                    "tone": {"type": "string"},
+                                    "category": {"type": "string"},
+                                    "essence": {"type": "string"},
+                                    "importance": {"type": "number"},
+                                    "quotes": {
+                                        "type": "array",
+                                        "description": "цитаты с атрибуцией",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "text": {"type": "string"},
+                                                "date": {"type": "string"},
+                                                "hub": {"type": "string"},
+                                                "author": {"type": "string"},
+                                                "url": {"type": "string"},
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        "highlights": {
+                            "type": "array",
+                            "description": "ключевые сообщения по вовлечённости",
+                            "items": {"type": "object", "properties": {"text": {"type": "string"}, "why": {"type": "string"}}},
+                        },
                         "citations": {
                             "type": "array",
                             "description": "ссылки на источники (сообщения, публикации)",
@@ -475,6 +662,9 @@ async def build_report(
             rows = section.get("items") or section.get("bullets") or section.get("values") or section.get("rows")
             if rows:
                 return True
+            # Раздел с темами и цитатами из текстов — это тоже данные, а не заглушка
+            if _finding_rows(section.get("findings")) or _finding_rows(section.get("highlights")):
+                return True
             if len(text) >= 150:
                 return True
         return False
@@ -495,6 +685,12 @@ async def build_report(
         already = any("подробный разбор" in str(section.get("heading") or "").lower() for section in sections)
         if not already:
             sections.append(dict(deep))
+    # Темы и цитаты из чтения текстов (analyze_texts) тоже обязательны в документе
+    texts = getattr(ctx, "text_analysis", None)
+    if texts and (texts.get("findings") or texts.get("text")):
+        already = any(_finding_rows(section.get("findings")) for section in sections)
+        if not already:
+            sections.append(dict(texts))
     for section in sections:
         citations = section.get("citations")
         if isinstance(citations, str):
@@ -511,6 +707,65 @@ async def build_report(
             section["bullets"] = [section["bullets"]]
         if isinstance(section.get("chart_ids"), str):
             section["chart_ids"] = [section["chart_ids"]]
+        for key in ("findings", "highlights"):
+            if isinstance(section.get(key), str):
+                try:
+                    parsed = json.loads(section[key])
+                except Exception as exc:  # noqa: BLE001
+                    raise ToolError(f"{key}: ожидается список или JSON-строка со списком ({exc})") from exc
+                section[key] = parsed if isinstance(parsed, list) else [parsed]
+        for finding in _finding_rows(section.get("findings")):
+            if isinstance(finding.get("quotes"), str):
+                finding["quotes"] = [{"text": finding["quotes"]}]
+
+    # -------- правило качества: негатив без конкретной причины с цитатой недопустим --------
+    def _has_text_evidence() -> bool:
+        """Есть ли в отчёте тема с цитатой или ссылка на источник — то есть прочитанные тексты."""
+        for section in sections:
+            if section.get("citations"):
+                return True
+            for finding in _finding_rows(section.get("findings")):
+                if [q for q in (finding.get("quotes") or []) if _quote_text(q)]:
+                    return True
+        return False
+
+    def _negatives_in_slice() -> int:
+        """Сколько негативных сообщений в срезе: нужно, чтобы отчёт объяснял причины, а не только счётчики."""
+        known = int(getattr(ctx, "negative_in_slice", 0) or 0)
+        if known:
+            return known
+        try:
+            from .tools_data import _exact_count, _query, dates, guard
+
+            _idx, index_name = guard(ctx)
+            lo, hi = dates(ctx, None, None)
+            if not (lo or hi):
+                return 0
+            return int(_exact_count(index_name, _query(None, lo, hi, "negative")) or 0)
+        except Exception:
+            return 0
+
+    negative_count = _negatives_in_slice()
+    if negative_count:
+        # Запоминаем размер негатива в срезе: правило качества и статус запуска опираются на него
+        ctx.negative_in_slice = max(int(getattr(ctx, "negative_in_slice", 0) or 0), negative_count)
+    if negative_count and not _has_text_evidence():
+        ctx.text_gap = (
+            f"в срезе {negative_count} негативных сообщений, но в отчёте нет ни одной темы "
+            "с цитатой — причины жалоб не раскрыты (тексты не прочитаны)"
+        )
+        await ctx.log("Отчёт неполный: " + ctx.text_gap, level="error")
+        sections.append(
+            {
+                "heading": "Внимание: причины негатива не раскрыты",
+                "text": (
+                    f"В выборке {negative_count} негативных сообщений, однако в отчёте нет ни одной конкретной "
+                    "темы или причины с цитатой из текста. Отчёт считается неполным: пояснения к графикам должны "
+                    "опираться на темы и цитаты, полученные чтением текстов. Вызовите инструмент analyze_texts "
+                    "за этот период и передайте его раздел (темы, доли, цитаты) в build_report, затем соберите отчёт заново."
+                ),
+            }
+        )
     folder_name = _safe_name(folder or ctx.folder or "Агент", 40)
     out_dir = _reports_dir(ctx.user_id, folder_name)
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
@@ -557,4 +812,7 @@ async def build_report(
         "charts_used": sum(len(s.get("chart_ids") or []) for s in sections),
         "pdf_ok": pdf_ok,
         "pdf_error": pdf_error,
+        "text_gap": str(getattr(ctx, "text_gap", "") or ""),
+        "negative_in_slice": negative_count,
+        "findings_sections": len([s for s in sections if _finding_rows(s.get("findings"))]),
     }

@@ -327,9 +327,14 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         run["artifacts"] = result.get("artifacts") or []
         run["cost_usd"] = float((result.get("stats") or {}).get("cost_usd") or 0.0)
         run["no_data"] = bool(result.get("no_data"))
+        run["text_gap"] = str(result.get("text_gap") or "")
         if run.get("no_data"):
             run["status"] = "failed"
             run["error"] = "данные за период не найдены — отчёт не сформирован"
+        elif run.get("text_gap"):
+            # Негатив в срезе без конкретной темы и цитаты: отчёт неполный
+            run["status"] = "failed"
+            run["error"] = run["text_gap"]
         else:
             run["status"] = "completed" if run["answer"] else "failed"
         if not run["answer"]:

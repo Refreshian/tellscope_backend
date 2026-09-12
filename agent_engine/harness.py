@@ -221,6 +221,9 @@ PLANNER_SYSTEM = (
     "Ты ИИ-ассистент платформы Tellscope — аналитика соцмедиа и СМИ. "
     "Если нужной темы нет среди датасетов, её можно выгрузить из Brand Analytics инструментом fetch_dataset. "
     "Ты знаешь инструменты платформы, её конструктор цепочек и визуальный конструктор Dify. "
+    "ВАЖНО: любой план или цепочка, которая заканчивается отчётом, обязана включать шаг чтения текстов "
+    "инструментом analyze_texts ПЕРЕД сборкой отчёта: темы, доли и цитаты из текстов — основа выводов, "
+    "а статистика и графики только дополняют их. "
     "Отвечай деловым русским языком, без воды, только по делу. Если данных не хватает — прямо скажи, "
     "какой датасет или период нужен."
 )
@@ -231,6 +234,9 @@ def _plan_prompt(text: str, index: Optional[int], dataset_name: str) -> str:
         f"Задача пользователя: {text}\n\n"
         f"Датасет: {index if index is not None else 'не выбран'} ({dataset_name or 'название неизвестно'}).\n\n"
         "Инструменты Tellscope:\n" + _tools_brief() + "\n\n"
+        "Обязательное правило: если в плане есть отчёт (build_report), перед ним должен быть шаг analyze_texts — "
+        "чтение текстов сообщений локальной моделью (темы, доли, цитаты). Пояснения к графикам опираются на "
+        "темы и цитаты из текстов, а не только на статистику.\n\n"
         "Ответь СТРОГО одним JSON-объектом без пояснений вокруг:\n"
         "{\n"
         '  "summary": "в двух-трёх предложениях, что будет сделано и какой результат получит пользователь",\n'
@@ -256,13 +262,18 @@ def _chain_prompt(text: str, index: Optional[int], dataset_name: str) -> str:
         "Инструменты Tellscope:\n" + _tools_brief() + "\n\n"
         "Собери цепочку шагов. Формат шага (только эти поля и виды):\n"
         '{"kind":"tool","title":"Поиск по теме","tool":"search_messages","args":{"phrase":"..."},"save_as":"search"}\n'
+        '{"kind":"tool","title":"Чтение текстов","tool":"analyze_texts","args":{"tone":"all","limit":90},"save_as":"texts"}\n'
         '{"kind":"chart","title":"Тональность","from":"{{search.tonality}}","label_field":"tone","value_field":"count",'
         '"chart_type":"pie","save_as":"chart_tone"}\n'
-        '{"kind":"llm","title":"Выводы","prompt":"... {{search.messages_found}} ...","save_as":"synthesis"}\n'
+        '{"kind":"llm","title":"Выводы","prompt":"... {{search.messages_found}} ... темы и цитаты: {{texts.topics}} ...","save_as":"synthesis"}\n'
         '{"kind":"report","title":"Отчёт","report_title":"...","subtitle":"...","save_as":"report",'
-        '"sections":[{"heading":"Раздел","text":"{{synthesis.text}}","chart_ids":["chart1"]}]}\n\n'
+        '"sections":[{"heading":"Темы и цитаты","text":"{{texts.summary}}","findings":"{{texts.report_section.findings}}",'
+        '"highlights":"{{texts.report_section.highlights}}"},{"heading":"Раздел","text":"{{synthesis.text}}","chart_ids":["chart1"]}]}\n\n'
         "Правила: index/min_date/max_date подставляются автоматически, их указывать не нужно; "
         "ссылки вида {{save_as.поле}} работают для шагов, выполненных раньше; "
+        "если в цепочке есть отчёт, шаг analyze_texts перед ним ОБЯЗАТЕЛЕН, а раздел отчёта с текстовыми "
+        "находками передаёт findings и highlights из {{texts.report_section}} — так в DOCX/PDF попадают темы, "
+        "доли и цитаты; пояснения к графикам опирай на темы и цитаты из текстов; "
         f"не больше {MAX_CHAIN_STEPS} шагов; в конце обязательно шаг report с разделами.\n\n"
         "Ответь СТРОГО одним JSON-объектом:\n"
         '{"name": "название агента", "description": "что делает", "instruction": "короткая инструкция", '

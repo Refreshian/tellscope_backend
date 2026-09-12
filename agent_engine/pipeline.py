@@ -233,6 +233,11 @@ async def _run_report_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -
             "bullets": [render(b, ctx, results) for b in (section.get("bullets") or [])],
             "chart_ids": section.get("chart_ids") or [],
         }
+        for key in ("findings", "highlights"):
+            # Темы с цитатами и ключевые сообщения из analyze_texts попадают в DOCX/PDF отдельным блоком.
+            value = render(section.get(key), ctx, results)
+            if value:
+                item[key] = value
         if section.get("citations"):
             item["citations"] = render(section.get("citations"), ctx, results)
         sections.append(item)
@@ -330,4 +335,11 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     if answer:
         await ctx.event({"type": "answer", "text": answer})
     await ctx.event({"type": "final", "answer": answer or "Шаги выполнены, смотрите артефакты запуска.", "artifacts": ctx.artifacts, "stats": stats})
-    return {"answer": answer or "Шаги выполнены, смотрите артефакты запуска.", "stats": stats, "tool_calls": ctx.tool_calls, "artifacts": ctx.artifacts, "no_data": bool(getattr(ctx, "no_data", False))}
+    return {
+        "answer": answer or "Шаги выполнены, смотрите артефакты запуска.",
+        "stats": stats,
+        "tool_calls": ctx.tool_calls,
+        "artifacts": ctx.artifacts,
+        "no_data": bool(getattr(ctx, "no_data", False)),
+        "text_gap": str(getattr(ctx, "text_gap", "") or ""),
+    }
