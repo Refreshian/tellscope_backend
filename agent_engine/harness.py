@@ -98,7 +98,22 @@ def delete_task(user_id: Any, task_id: str) -> bool:
     return True
 
 
-def create_task(user_id: Any, text: str, mode: str, index: Optional[int], dataset_name: str = "") -> Dict[str, Any]:
+def mark_task_seen(user_id: Any, task_id: str) -> Optional[Dict[str, Any]]:
+    """Отмечает задачу просмотренной: плашку «Пока вас не было» больше не показываем."""
+    return update_task(user_id, task_id, {"unseen": False, "seen_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+def find_task_by_run(user_id: Any, run_id: str) -> Optional[Dict[str, Any]]:
+    """Задача, связанная с запуском (нужна, чтобы обновить её статус и признак «просмотрено»)."""
+    for item in list_tasks(user_id, limit=200):
+        if str(item.get("run_id") or "") == str(run_id):
+            return item
+    return None
+
+
+def create_task(user_id: Any, text: str, mode: str, index: Optional[int], dataset_name: str = "",
+                min_date: Any = None, max_date: Any = None, model: str = "") -> Dict[str, Any]:
+    """Создаёт задачу. Период и модель сохраняем, чтобы «Запустить снова» повторял постановку."""
     task = {
         "id": "ht_" + uuid.uuid4().hex[:10],
         "user_id": str(user_id),
@@ -108,10 +123,14 @@ def create_task(user_id: Any, text: str, mode: str, index: Optional[int], datase
         "status": "new",
         "dataset_index": index,
         "dataset_name": dataset_name,
+        "min_date": min_date,
+        "max_date": max_date,
+        "model": model or "",
         "run_id": None,
         "result": None,
         "answer": "",
         "error": None,
+        "unseen": False,
     }
     items = list_tasks(user_id, limit=200)
     items.insert(0, task)

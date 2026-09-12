@@ -281,6 +281,10 @@ class ProgressTracker:
             self.detail = str(detail)
         await self._emit(self.payload())
 
+    async def beat(self) -> None:
+        """Ручной сигнал «жив»: нужен, когда движок ждёт (например, на паузе)."""
+        await self._emit(self.payload("heartbeat"))
+
     async def finish_run(self, status: str, detail: str = "") -> None:
         """Финальное событие прогресса: 100% и «выполнено за …»."""
         self.in_stage = False

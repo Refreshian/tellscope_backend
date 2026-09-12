@@ -288,8 +288,9 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     await ctx.event({"type": "start", "model": (MODEL_CHOICES.get(ctx.model_choice) or {}).get("label"), "tools": ["шаги"], "token_budget": ctx.token_budget})
 
     for number, step in enumerate(plan, start=1):
-        # Остановка пользователем: проверяем перед каждым шагом цепочки.
+        # Остановка и мягкая пауза: проверяем перед каждым шагом цепочки.
         ctx.check_cancelled()
+        await ctx.wait_if_paused()
         if ctx.out_of_time():
             ctx.notes.append("истёк лимит времени запуска")
             break
@@ -351,8 +352,9 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
             detail=outcome.get("error") or f"шаг {number} готов: {title}",
             ok=bool(outcome.get("ok")),
         )
-        # Остановка могла прийти во время шага — дальше не идём.
+        # Остановка или пауза могли прийти во время шага — дальше не идём.
         ctx.check_cancelled()
+        await ctx.wait_if_paused()
         if payload is not None:
             results[save_as + "_payload"] = payload
 

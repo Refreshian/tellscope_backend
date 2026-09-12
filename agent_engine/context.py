@@ -2,6 +2,7 @@
 """Контекст одного агентного запуска: пользователь, датасет, лимиты, артефакты."""
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass, field
@@ -175,6 +176,8 @@ class AgentContext:
     # Движок спрашивает её на безопасных точках и прекращает работу, не ломая уже
     # сохранённые артефакты.
     cancel_check: Optional[Callable[[], bool]] = None
+    # Проверка «запуск на паузе»: движок ждёт продолжения на той же безопасной точке.
+    pause_check: Optional[Callable[[], bool]] = None
 
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
@@ -214,6 +217,42 @@ class AgentContext:
         """Точка остановки: вызывается в цикле агента, в шагах цепочки и между пачками чтения."""
         if self.cancelled():
             raise RunCancelled("остановлено пользователем")
+
+    def paused(self) -> bool:
+        """Пользователь поставил запуск на паузу."""
+        if self.pause_check is None:
+            return False
+        try:
+            return bool(self.pause_check())
+        except Exception:
+            return False
+
+    async def wait_if_paused(self) -> None:
+        """Мягкая пауза: ждём на границе шага или пачки, ничего не теряя.
+
+        Вызывается там же, где проверка отмены: идущий вызов модели не обрываем —
+        пауза срабатывает на ближайшей границе. Пока ждём, шлём heartbeat, чтобы
+        интерфейс видел «живость», а не зависание.
+        """
+        if self.pause_check is None or not self.paused():
+            return
+        tracker = self.progress
+        if tracker is not None:
+            await tracker.set_stage("Пауза", detail="жду кнопку «продолжить» — сделанное сохранено")
+        else:
+            await self.event({"type": "notice", "level": "warning", "message": "Пауза: жду продолжения"})
+        waited = 0
+        while self.paused():
+            self.check_cancelled()
+            await asyncio.sleep(1.0)
+            waited += 1
+            if waited % 10 == 0:
+                if tracker is not None:
+                    await tracker.beat()
+                else:
+                    await self.event({"type": "heartbeat", "stage": "Пауза", "elapsed": int(time.time())})
+        if tracker is not None:
+            await tracker.set_stage("Продолжаю", detail="иду дальше с текущего шага")
 
     async def event(self, payload: Dict[str, Any]) -> None:
         if self.emit is None:

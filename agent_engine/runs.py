@@ -31,6 +31,10 @@ STALE_AFTER_SEC = 240
 # Завершённые состояния запуска: их не отменяют, и они не занимают слот пользователя.
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
 
+# Как часто состояние запуска сбрасывается на диск (секунды): прогресс должен быть виден
+# из хранилища, а не только в памяти.
+PERSIST_INTERVAL_SEC = 2.0
+
 RUNS: Dict[str, Dict[str, Any]] = {}
 _SUBS: Dict[str, List[asyncio.Queue]] = {}
 _ACTIVE_TASKS: Dict[str, Any] = {}
@@ -66,7 +70,7 @@ def artifacts_dir(run_id: str) -> str:
 def _persist(run: Dict[str, Any]) -> None:
     try:
         os.makedirs(AGENT_RUNS_ROOT, exist_ok=True)
-        payload = {k: v for k, v in run.items() if k != "events"}
+        payload = {k: v for k, v in run.items() if k != "events" and not str(k).startswith("_")}
         payload["events"] = (run.get("events") or [])[-200:]
         with open(_run_file(run["run_id"]), "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, default=str)
@@ -100,7 +104,8 @@ def active_runs_for_user(user_id: Any) -> List[Dict[str, Any]]:
     for run in RUNS.values():
         if str(run.get("user_id")) != str(user_id):
             continue
-        if run.get("status") not in ("queued", "running"):
+        # paused тоже активный: он держит слот, пока пользователь не продолжит или не отменит
+        if run.get("status") not in ("queued", "running", "paused"):
             continue
         # Зависший запуск (нет событий и heartbeat) не должен занимать единственный слот
         # пользователя: после перезапуска сервера такие записи иначе блокируют новые задачи.
@@ -263,6 +268,13 @@ async def _emit(run_id: str, event: Dict[str, Any]) -> None:
         run["last_event_ts"] = time.time()
         if event.get("type") in ("progress", "heartbeat"):
             run["progress"] = dict(event)
+        # Долговечность хода выполнения: раз в пару секунд сбрасываем состояние на диск,
+        # чтобы прогресс был виден из хранилища (закрытая вкладка, другое устройство,
+        # перезапуск сервиса) — не только в памяти и в потоке.
+        now = time.time()
+        if now - float(run.get("_persisted_ts") or 0) >= PERSIST_INTERVAL_SEC:
+            run["_persisted_ts"] = now
+            _persist(run)
     for queue in list(_SUBS.get(run_id) or []):
         try:
             queue.put_nowait(event)
@@ -281,6 +293,29 @@ def artifact_path(run_id: str, name: str) -> Optional[str]:
     if os.path.isfile(path):
         return path
     return None
+
+
+def drop_run_artifacts(run_id: str) -> int:
+    """Удаляет файлы запуска и его запись — только по явному выбору пользователя."""
+    import shutil
+
+    removed = 0
+    folder = os.path.join(FILES_ROOT, run_id)
+    if os.path.isdir(folder):
+        try:
+            shutil.rmtree(folder)
+            removed += 1
+        except Exception:
+            pass
+    for path in (_run_file(run_id),):
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+    RUNS.pop(run_id, None)
+    return removed
 
 
 def _register_job(run: Dict[str, Any], status: str) -> None:
@@ -306,6 +341,96 @@ def _register_job(run: Dict[str, Any], status: str) -> None:
 
 def active_runs_total() -> int:
     return len([run for run in RUNS.values() if run.get("status") in ("queued", "running") and not run_is_stale(run)])
+
+
+# --------------------------------------------------------------- пауза и перезапуск
+
+def run_paused(run_id: str) -> bool:
+    """Проверка для движка: запуск поставлен на паузу пользователем."""
+    run = RUNS.get(run_id)
+    return bool(run and run.get("pause_requested"))
+
+
+def request_pause(run_id: str, user_id: Any = None) -> Dict[str, Any]:
+    """Мягкая пауза: движок доходит до границы шага или пачки и ждёт продолжения."""
+    run = get_run(run_id)
+    if run is None:
+        return {"found": False, "message": "Запуск не найден"}
+    if user_id is not None and str(run.get("user_id")) != str(user_id):
+        return {"found": False, "forbidden": True, "message": "Нет доступа к этому запуску"}
+    if is_terminal(run):
+        return {"found": True, "already": True, "status": str(run.get("status") or ""), "message": "Запуск уже завершён"}
+    run["pause_requested"] = True
+    run["paused_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if str(run.get("status")) in ("queued", "running"):
+        run["status"] = "paused"
+    run["progress_detail"] = "пауза: движок остановится на ближайшей границе шага"
+    _persist(run)
+    sync_harness_task(run)
+    return {"found": True, "status": "paused", "message": "Ставлю на паузу"}
+
+
+def request_resume(run_id: str, user_id: Any = None) -> Dict[str, Any]:
+    """Продолжение: движок идёт дальше с текущего шага, ничего не перечитывая заново."""
+    run = get_run(run_id)
+    if run is None:
+        return {"found": False, "message": "Запуск не найден"}
+    if user_id is not None and str(run.get("user_id")) != str(user_id):
+        return {"found": False, "forbidden": True, "message": "Нет доступа к этому запуску"}
+    if is_terminal(run):
+        return {"found": True, "already": True, "status": str(run.get("status") or ""), "message": "Запуск уже завершён"}
+    run["pause_requested"] = False
+    run["resumed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if str(run.get("status")) == "paused":
+        run["status"] = "running"
+    run["progress_detail"] = "продолжаю с текущего шага"
+    _persist(run)
+    sync_harness_task(run)
+    return {"found": True, "status": str(run.get("status") or ""), "message": "Продолжаю"}
+
+
+async def announce(run_id: str, message: str, level: str = "warning") -> None:
+    """Понятное пользователю сообщение в потоке запуска (тип notice — видно в журнале)."""
+    await _emit(run_id, {"ts": now_iso(), "type": "notice", "level": level, "message": message})
+
+
+def mark_interrupted_on_startup() -> int:
+    """Помечает незавершённые запуски прошлого процесса как прерванные перезапуском.
+
+    Вызывается при старте приложения: в памяти запусков ещё нет, значит все записи
+    со статусом running/paused/queued остались от предыдущего процесса и работать
+    уже не могут. Сразу приводим в порядок и задачи в хранилище.
+    """
+    changed = 0
+    if not os.path.isdir(AGENT_RUNS_ROOT):
+        return 0
+    for name in os.listdir(AGENT_RUNS_ROOT):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(AGENT_RUNS_ROOT, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        if str(data.get("status")) not in ("queued", "running", "paused"):
+            continue
+        data["status"] = "interrupted"
+        data["error"] = "прервано перезапуском сервиса"
+        data["interrupted_reason"] = "restart"
+        data["finished_at"] = data.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")
+        data["finished_ts"] = data.get("finished_ts") or time.time()
+        started_ts = data.get("started_ts")
+        if started_ts and not data.get("duration_sec"):
+            data["duration_sec"] = round(max(0.0, float(data["finished_ts"]) - float(started_ts)), 1)
+        data["progress_detail"] = "прервано перезапуском сервиса"
+        _persist(data)
+        try:
+            sync_harness_task(data)
+        except Exception:
+            pass
+        changed += 1
+    return changed
 
 
 # ------------------------------------------------------------------ остановка запуска
@@ -501,14 +626,20 @@ def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
     status = str(run.get("status") or "")
     ok = status == "completed"
     cancelled = status == "cancelled"
+    interrupted = status == "interrupted"
+    paused = status == "paused"
     answer = str(run.get("answer") or "")
     if ok:
         task_status, label = "done", "выполнено"
     elif cancelled:
         task_status, label = "cancelled", "остановлено пользователем"
+    elif interrupted:
+        task_status, label = "failed", "прервано"
+    elif paused:
+        task_status, label = "paused", "пауза"
     else:
         task_status, label = "failed", "неуспешно"
-    return {
+    patch = {
         "status": task_status,
         "status_label": label,
         "run_status": status,
@@ -517,7 +648,14 @@ def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
         "answer": answer[:2000],
         "error": run.get("error") if not ok else None,
         "run_progress": dict(run.get("progress") or {}),
+        "run_started_ts": run.get("started_ts"),
+        "run_finished_ts": run.get("finished_ts"),
     }
+    # Задача, завершившаяся без пользователя на странице, помечается непросмотренной:
+    # при следующем заходе покажем плашку «Пока вас не было».
+    if status in TERMINAL_STATUSES:
+        patch["unseen"] = True
+    return patch
 
 
 def sync_harness_task(run: Dict[str, Any]) -> int:
@@ -740,6 +878,8 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         # Остановка: движок спрашивает этот флаг в цикле агента, между шагами цепочки
         # и между пачками чтения текстов.
         cancel_check=lambda: run_cancelled(run_id),
+        # Мягкая пауза: на ближайшей границе шага/пачки движок ждёт продолжения.
+        pause_check=lambda: run_paused(run_id),
     )
     # Прогресс запуска: сколько шагов в плане (если план есть), сколько сделано и сколько осталось.
     steps_plan = run.get("steps") or []

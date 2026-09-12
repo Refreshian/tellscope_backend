@@ -1128,9 +1128,13 @@ async def analyze_texts(
         nonlocal tokens_used, read_done, batches_done
         batch_started = time.time()
         lines = [_message_line(doc["msg_id"], doc) for doc in batch]
+        # Остановка и пауза проверяются ДО семафора: на паузе пачка не занимает место
+        # в очереди vLLM, а после продолжения не перечитывает уже прочитанное.
+        ctx.check_cancelled()
+        await ctx.wait_if_paused()
         async with semaphore:
-            # Остановка: не отправляем в vLLM новые пачки, если пользователь нажал «остановить».
             ctx.check_cancelled()
+            await ctx.wait_if_paused()
             outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines)
         tokens_used += int(outcome.get("tokens") or 0)
         results.append(outcome)

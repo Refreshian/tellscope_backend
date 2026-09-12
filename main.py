@@ -181,6 +181,16 @@ async def redis_lifespan():
         if not existing_status:
             logging.info("Инициализация статуса GPU как 'idle'.")
             await redis_db.set("gpu:status", "idle")
+        # Незавершённые агентные запуски прошлого процесса работать уже не могут:
+        # помечаем их прерванными перезапуском сервиса (в списке задач — «Прервано»).
+        try:
+            from agent_engine import runs as _agent_runs_startup
+
+            marked = _agent_runs_startup.mark_interrupted_on_startup()
+            if marked:
+                logging.info(f"Агентные запуски: помечено прерванными после перезапуска: {marked}")
+        except Exception as exc:  # noqa: BLE001 — старт приложения важнее служебной чистки
+            logging.error(f"Не удалось пометить прерванные запуски: {exc}")
         yield
     finally:
         await redis_db.close()
@@ -12375,6 +12385,34 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
     }
 
 
+@app.post("/agent/run/{run_id}/pause", tags=["agent mode"])
+async def agent_run_pause(run_id: str, user: User = Depends(current_user)):
+    """Мягкая пауза: движок остановится на ближайшей границе шага или пачки чтения."""
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_pause(run_id)
+    if not info.get("already"):
+        await _agent_runs.announce(run_id, "Пауза по вашей команде: остановлюсь на ближайшей границе шага")
+    return {"ok": bool(info.get("found")), "run_id": run_id, "status": info.get("status"), "message": info.get("message")}
+
+
+@app.post("/agent/run/{run_id}/resume", tags=["agent mode"])
+async def agent_run_resume(run_id: str, user: User = Depends(current_user)):
+    """Продолжение после паузы: с текущего шага, без повторного чтения уже прочитанного."""
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_resume(run_id)
+    if not info.get("already"):
+        await _agent_runs.announce(run_id, "Продолжаю с текущего шага", level="info")
+    return {"ok": bool(info.get("found")), "run_id": run_id, "status": info.get("status"), "message": info.get("message")}
+
+
 @app.post("/agent/run/{run_id}/cancel", tags=["agent mode"])
 async def agent_run_cancel(run_id: str, user: User = Depends(current_user)):
     """Останавливает запуск: движок прекращает работу на ближайшей безопасной точке.
@@ -13046,7 +13084,11 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
     if request.index is not None:
         _guard_index_access(user, request.index)
     dataset_name = _harness_dataset_name(request.index)
-    task = _harness.create_task(str(user.id), text, mode, request.index, dataset_name)
+    # Период, датасет и модель сохраняем в задаче: по ним работает «Запустить снова».
+    task = _harness.create_task(
+        str(user.id), text, mode, request.index, dataset_name,
+        min_date=request.min_date, max_date=request.max_date, model=(request.model or _harness.DEFAULT_MODEL),
+    )
 
     try:
         if mode == "run":
@@ -13100,6 +13142,65 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
         _harness.update_task(str(user.id), task["id"], {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:600]})
         raise HTTPException(status_code=400, detail=str(exc)[:400]) from exc
     return {"task": task}
+
+
+@app.post("/harness/task/{task_id}/pause", tags=["harness"])
+async def harness_task_pause(task_id: str, user: User = Depends(current_user)):
+    """Мягкая пауза запуска задачи (кнопка «пауза» у полосы прогресса)."""
+    from agent_engine import harness as _harness
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    run_id = str(task.get("run_id") or "")
+    if not run_id:
+        raise HTTPException(status_code=409, detail="У задачи нет запуска — ставить на паузу нечего")
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_pause(run_id)
+    if not info.get("already"):
+        await _agent_runs.announce(run_id, "Пауза по вашей команде: остановлюсь на ближайшей границе шага")
+    _agent_runs.sync_harness_task(run)
+    return {"ok": bool(info.get("found")), "task": _harness.get_task(user.id, task_id), "run_id": run_id,
+            "status": info.get("status"), "message": info.get("message")}
+
+
+@app.post("/harness/task/{task_id}/resume", tags=["harness"])
+async def harness_task_resume(task_id: str, user: User = Depends(current_user)):
+    """Продолжение после паузы (кнопка «продолжить»)."""
+    from agent_engine import harness as _harness
+
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    run_id = str(task.get("run_id") or "")
+    if not run_id:
+        raise HTTPException(status_code=409, detail="У задачи нет запуска")
+    run = _agent_runs.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Запуск не найден")
+    if str(run.get("user_id")) != str(user.id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к этому запуску")
+    info = _agent_runs.request_resume(run_id)
+    if not info.get("already"):
+        await _agent_runs.announce(run_id, "Продолжаю с текущего шага", level="info")
+    _agent_runs.sync_harness_task(run)
+    return {"ok": bool(info.get("found")), "task": _harness.get_task(user.id, task_id), "run_id": run_id,
+            "status": info.get("status"), "message": info.get("message")}
+
+
+@app.post("/harness/task/{task_id}/seen", tags=["harness"])
+async def harness_task_seen(task_id: str, user: User = Depends(current_user)):
+    """Задача просмотрена: плашку «Пока вас не было» для неё больше не показываем."""
+    from agent_engine import harness as _harness
+
+    task = _harness.mark_task_seen(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return {"ok": True, "task": task}
 
 
 @app.post("/harness/task/{task_id}/cancel", tags=["harness"])
@@ -13189,14 +13290,17 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
             dataset_index=dataset_index,
             dataset_name=dataset_name,
             dataset_label=dataset_name,
+            # Постановку повторяем целиком: период, датасет и модель из записи задачи.
+            min_date=task.get("min_date"),
+            max_date=task.get("max_date"),
             tools=None,
-            model_choice=_harness.DEFAULT_MODEL,
+            model_choice=str(task.get("model") or _harness.DEFAULT_MODEL),
             folder="Центр задач",
             mode=str(task.get("mode") or "run"),
         )
         _agent_runs.start_run(run, user)
         run_id = run["run_id"]
-    task = _harness.update_task(str(user.id), task_id, {"status": "running", "run_id": run_id})
+    task = _harness.update_task(str(user.id), task_id, {"status": "running", "run_id": run_id, "unseen": False})
     return {
         "task": task,
         "run_id": run_id,
@@ -13206,13 +13310,40 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
 
 
 @app.delete("/harness/task/{task_id}", tags=["harness"])
-async def harness_task_delete(task_id: str, user: User = Depends(current_user)):
-    """Удаляет задачу пользователя."""
+async def harness_task_delete(task_id: str, user: User = Depends(current_user), with_artifacts: bool = False):
+    """Удаляет задачу: сначала останавливает её запуск, потом удаляет запись.
+
+    Артефакты (файлы отчётов и запись запуска) удаляются только по явному выбору
+    пользователя — ``?with_artifacts=true``. По умолчанию всё остаётся на диске.
+    """
+    import asyncio as _asyncio
+
     from agent_engine import harness as _harness
 
+    task = _harness.get_task(user.id, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    run_id = str(task.get("run_id") or "")
+    stopped = False
+    if run_id:
+        run = _agent_runs.get_run(run_id)
+        if run and str(run.get("user_id")) == str(user.id) and str(run.get("status")) not in _agent_runs.TERMINAL_STATUSES:
+            # Останавливаем запуск и даём движку дойти до ближайшей границы.
+            info = _agent_runs.request_cancel(run_id)
+            if not info.get("already"):
+                await _agent_runs.announce(run_id, "Задача удаляется — останавливаю запуск")
+            for _ in range(30):
+                if str(run.get("status")) in _agent_runs.TERMINAL_STATUSES:
+                    break
+                await _asyncio.sleep(0.5)
+            stopped = True
     if not _harness.delete_task(user.id, task_id):
         raise HTTPException(status_code=404, detail="Задача не найдена")
-    return {"ok": True, "deleted": task_id}
+    artifacts_removed = 0
+    if with_artifacts and run_id:
+        artifacts_removed = _agent_runs.drop_run_artifacts(run_id)
+    return {"ok": True, "deleted": task_id, "run_id": run_id or None, "run_stopped": stopped,
+            "artifacts_removed": artifacts_removed}
 
 
 @app.get("/harness/task/{task_id}/file", tags=["harness"])

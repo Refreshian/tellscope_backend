@@ -556,6 +556,7 @@ async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if spec is None or name not in ctx.allowed_tools:
         return {"ok": False, "error": f"инструмент {name} недоступен"}
     ctx.check_cancelled()
+    await ctx.wait_if_paused()
     tracker = _progress(ctx)
     if tracker is not None:
         await tracker.begin_stage(f"Инструмент: {spec.title}", detail=TOOL_HINTS.get(name, "выполняется"))
@@ -798,8 +799,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
         await tracker.start_run()
 
     for step in range(1, MAX_STEPS + 1):
-        # Остановка пользователем: проверяем перед каждым обращением к модели.
+        # Остановка и мягкая пауза: проверяем перед каждым обращением к модели.
         ctx.check_cancelled()
+        await ctx.wait_if_paused()
         if ctx.out_of_time():
             ctx.notes.append("истёк лимит времени запуска")
             break
@@ -829,9 +831,10 @@ async def run_agent(ctx) -> Dict[str, Any]:
         ctx.llm_calls += 1
         _account(ctx, result)
         content, calls = _parse_message(result)
-        # Модель ответила: если пользователь остановил запуск во время вызова,
-        # не запускаем следующие инструменты.
+        # Модель ответила: если пользователь остановил запуск или поставил паузу
+        # во время вызова, дальше не идём, пока не продолжат.
         ctx.check_cancelled()
+        await ctx.wait_if_paused()
 
         if use_tools and calls:
             messages.append({"role": "assistant", "content": content or "", "tool_calls": calls})
