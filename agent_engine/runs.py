@@ -335,15 +335,18 @@ def _mark_cancelled(run: Dict[str, Any], message: str) -> None:
 
 
 async def announce_cancel(run_id: str) -> None:
-    """Пишет отметку об остановке в поток запуска — она сразу видна в журнале шагов."""
+    """Пишет в поток запуска понятную пользователю отметку об остановке.
+
+    Тип ``notice`` (а не ``log``): служебные заметки инструментов в журнале скрыты,
+    а это сообщение пользователь должен видеть.
+    """
     await _emit(
         run_id,
         {
             "ts": now_iso(),
-            "type": "log",
-            "level": "error",
-            "message": "Пользователь остановил запуск — останавливаюсь на ближайшем шаге, "
-                       "уже собранные артефакты сохраняются",
+            "type": "notice",
+            "level": "warning",
+            "message": "Останавливаю запуск по вашей команде: уже собранные артефакты сохранятся",
         },
     )
 
@@ -785,7 +788,7 @@ async def execute_run(run_id: str, main_loop: Optional[asyncio.AbstractEventLoop
         run["status"] = "cancelled"
         run["error"] = "остановлено пользователем"
         run["cancelled_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        await emit({"type": "log", "level": "error", "message": "Запуск остановлен пользователем (статус cancelled)"})
+        await emit({"type": "notice", "level": "warning", "message": "Запуск остановлен пользователем"})
     except Exception as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"
