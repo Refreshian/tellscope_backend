@@ -727,15 +727,16 @@ app.include_router(
 current_user = fastapi_users.current_user()
 
 
-async def current_user_any(
-    request: Request,
-    user_manager: UserManager = Depends(get_user_manager),
-):
+async def current_user_any(request: Request):
     """Пользователь по Bearer-заголовку ИЛИ по cookie с токеном.
 
     Нужен для файлов, которые открываются обычной навигацией браузера
     (скачивание артефактов): там нет заголовка Authorization, но есть cookie.
     """
+    import jwt as _jwt
+    from sqlalchemy import select as _select
+    from auth.auth import SECRET as _SECRET
+
     token = ""
     auth_header = request.headers.get("authorization", "")
     if auth_header[:7].lower() == "bearer ":
@@ -747,11 +748,13 @@ async def current_user_any(
                  or "")
     if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    strategy = auth_backend.get_strategy()
     try:
-        user = await strategy.read_token(token, user_manager)
+        payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        user_id = int(payload.get("sub"))
     except Exception:
-        user = None
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    async with async_session_maker() as session:
+        user = (await session.execute(_select(AuthUser).where(AuthUser.id == user_id))).scalars().first()
     if user is None or not getattr(user, "is_active", False):
         raise HTTPException(status_code=401, detail="Unauthorized")
     return user
