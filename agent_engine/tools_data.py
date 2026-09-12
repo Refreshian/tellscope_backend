@@ -179,7 +179,8 @@ def _match_dataset(value: Any) -> Optional[int]:
 def available_datasets(limit: int = 12) -> str:
     names = sorted({_stem(name) for name in index_map().values()})
     shown = ", ".join(f"«{name}»" for name in names[:limit])
-    return shown + (" и другие" if len(names) > limit else "")
+    tail = " и другие" if len(names) > limit else ""
+    return shown + tail + ". Если нужной темы нет — загрузите её из Brand Analytics инструментом fetch_dataset"
 
 
 def resolve_index(ctx: Any, index: Any = None) -> int:

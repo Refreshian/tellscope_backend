@@ -5,6 +5,7 @@ from . import tools_data  # noqa: F401
 from . import tools_graph  # noqa: F401
 from . import tools_llm  # noqa: F401
 from . import tools_reports  # noqa: F401
+from . import tools_ba  # noqa: F401
 from . import tools_connectors  # noqa: F401
 from . import runs  # noqa: F401
 from .context import AgentContext, compact, to_unix  # noqa: F401
