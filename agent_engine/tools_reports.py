@@ -685,11 +685,13 @@ async def build_report(
         already = any("подробный разбор" in str(section.get("heading") or "").lower() for section in sections)
         if not already:
             sections.append(dict(deep))
-    # Темы и цитаты из чтения текстов (analyze_texts) тоже обязательны в документе
+    # Темы и цитаты из чтения текстов (analyze_texts) обязательны в документе целиком:
+    # если модель передала только часть тем, добавляем полный раздел инструмента.
     texts = getattr(ctx, "text_analysis", None)
     if texts and (texts.get("findings") or texts.get("text")):
-        already = any(_finding_rows(section.get("findings")) for section in sections)
-        if not already:
+        tool_findings = len(_finding_rows(texts.get("findings")))
+        report_findings = sum(len(_finding_rows(section.get("findings"))) for section in sections)
+        if tool_findings and report_findings < tool_findings:
             sections.append(dict(texts))
     for section in sections:
         citations = section.get("citations")
