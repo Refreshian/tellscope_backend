@@ -30,6 +30,38 @@ CORPUS_SOURCE_FIELDS = [
     "authorObject",
 ] + ["tag_%d" % i for i in range(1, 34)]
 TAG_FIELD_RE = re.compile(r"^tag_\d+$")
+URL_RE = re.compile(r"https?://\S+|www\.\S+|https?\S*\.[a-z]{2,}\S*", re.I)
+HANDLE_RE = re.compile(r"[@#]\w+")
+NUMBER_RE = re.compile(r"\d+")
+ENTITY_RE = re.compile(r"&[a-z]+;|\bgt+\b|\blt+\b|\bamp\b|\bquot\b|\bnbsp\b", re.I)
+MARKER_RE = re.compile(r"\b(erid|admark|ad_?mark|реклама|промокод\d*|utm\w*)\b", re.I)
+RU_STOP_WORDS = [
+    "и", "в", "во", "не", "что", "он", "на", "я", "с", "со", "как", "а", "то", "все", "она",
+    "так", "его", "но", "да", "ты", "к", "у", "же", "вы", "за", "бы", "по", "только", "ее",
+    "мне", "было", "вот", "от", "меня", "еще", "нет", "о", "из", "ему", "теперь", "когда",
+    "даже", "ну", "вдруг", "ли", "если", "уже", "или", "ни", "быть", "был", "него", "до",
+    "вас", "нибудь", "опять", "уж", "вам", "ведь", "там", "потом", "себя", "ничего", "ей",
+    "может", "они", "тут", "где", "есть", "надо", "ней", "для", "мы", "тебя", "их", "чем",
+    "была", "сам", "чтоб", "без", "будто", "чего", "раз", "тоже", "себе", "под", "будет",
+    "ж", "тогда", "кто", "этот", "того", "потому", "этого", "какой", "совсем", "ним", "здесь",
+    "этом", "один", "почти", "мой", "тем", "чтобы", "нее", "сейчас", "были", "куда", "зачем",
+    "всех", "никогда", "можно", "при", "наконец", "два", "об", "другой", "хоть", "после",
+    "над", "больше", "тот", "через", "эти", "нас", "про", "всего", "них", "какая", "много",
+    "разве", "три", "эту", "моя", "впрочем", "хорошо", "свою", "этой", "перед", "иногда",
+    "лучше", "чуть", "том", "нельзя", "такой", "им", "более", "всегда", "конечно", "всю",
+    "между",
+]
+
+
+def _clean_for_topics(text: str) -> str:
+    """Текст для c-TF-IDF: без ссылок, ников, цифр и лишних символов."""
+    value = URL_RE.sub(" ", str(text or ""))
+    value = ENTITY_RE.sub(" ", value)          # &gt;&gt; из выгрузок даёт мусорное слово «gtgt»
+    value = HANDLE_RE.sub(" ", value)
+    value = NUMBER_RE.sub(" ", value)
+    value = MARKER_RE.sub(" ", value)          # маркировка рекламы и utm-хвосты ссылок
+    value = re.sub(r"[^\w\s-]+", " ", value, flags=re.U)
+    return value.lower()
 TONE_LABELS = {-1: "негатив", 0: "нейтрал", 1: "позитив"}
 
 
@@ -133,21 +165,80 @@ def _cluster_text(doc: Dict[str, Any], cfg: Dict[str, Any]) -> str:
     return str(doc.get("text") or "")[:limit]
 
 
+_DIRECT_MODEL: Any = None
+_DIRECT_MODEL_KEY = ""
+
+
+def _direct_embedder() -> Any:
+    """Модель эмбеддингов проекта, загруженная напрямую (один раз на процесс).
+
+    Почему не через model_manager.encode_texts: он берёт глобальный лок на весь вызов и на КАЖДЫЙ
+    вызов делает clear_cuda_memory() (empty_cache + ipc_collect), а при нехватке памяти может
+    перевести модель на CPU и остаться там. Замер в проде на корпусе января 2026: 28–73 сообщения
+    в секунду, при этом GPU простаивал (загрузка 0 %), а ядро CPU было занято на 100 %.
+    Прямая загрузка той же модели (mlops.lock.embed_cfg — та же, что в семантическом поиске и
+    кластеризации датасетов) в отдельном объекте даёт ~500 сообщений в секунду: месячный корпус
+    считается за минуты. Если прямая загрузка недоступна, честно возвращаемся к model_manager.
+    """
+    global _DIRECT_MODEL, _DIRECT_MODEL_KEY
+    from mlops.lock import embed_cfg
+
+    cfg = embed_cfg() or {}
+    key = "%s|%s" % (cfg.get("model") or "", cfg.get("device") or "")
+    if _DIRECT_MODEL is not None and _DIRECT_MODEL_KEY == key:
+        return _DIRECT_MODEL
+    from sentence_transformers import SentenceTransformer
+
+    device = str(cfg.get("device") or "cuda:0")
+    model = SentenceTransformer(str(cfg.get("model") or "deepvk/USER2-base"), device=device)
+    try:
+        # 300 символов ≈ 90–110 токенов: ограничение длины ускоряет батч-проход и не мешает
+        # кластеризации коротких сообщений.
+        model.max_seq_length = 160
+    except Exception:
+        pass
+    _DIRECT_MODEL = model
+    _DIRECT_MODEL_KEY = key
+    return model
+
+
 def embed_matrix(texts: List[str], cfg: Dict[str, Any],
                  on_chunk: Optional[Callable[[int, int], None]] = None) -> Any:
-    """Эмбеддинги корпуса моделью проекта. Возвращает float32-матрицу (n, dims)."""
-    import numpy as np
+    """Эмбеддинги корпуса моделью проекта. Возвращает float32-матрицу (n, dims).
 
-    from embedding_model_manager import model_manager
+    Основной путь — прямая загрузка модели проекта на GPU крупными батчами; запасной — прежний
+    model_manager.encode_texts (если прямую загрузку получить не удалось).
+    """
+    import numpy as np
 
     batch = max(16, int(cfg.get("cluster_embed_batch") or 64))
     chunks: List[Any] = []
     done = 0
+
+    def _fallback(start: int, part: List[str]) -> Any:
+        from embedding_model_manager import model_manager
+
+        return model_manager.encode_texts(part, batch_size=len(part), normalize_embeddings=True)
+
+    model = None
+    try:
+        model = _direct_embedder()
+    except Exception:
+        model = None
+
     for start in range(0, len(texts), batch):
         part = texts[start:start + batch]
         if not part:
             continue
-        vectors = model_manager.encode_texts(part, batch_size=len(part), normalize_embeddings=True)
+        if model is not None:
+            try:
+                vectors = model.encode(part, batch_size=len(part), normalize_embeddings=True,
+                                       show_progress_bar=False, convert_to_numpy=True)
+            except Exception:
+                model = None
+                vectors = _fallback(start, part)
+        else:
+            vectors = _fallback(start, part)
         chunks.append(np.asarray(vectors, dtype="float32"))
         done += len(part)
         if on_chunk is not None:
@@ -204,12 +295,16 @@ def cluster_matrix(texts: List[str], embeddings: Any, cfg: Dict[str, Any]) -> Di
     )
     vectorizer = CountVectorizer(
         analyzer="word",
-        token_pattern=r"(?u)\b\w+\b",
+        # Ключевые слова кластера должны читаться человеком: без чистки в них попадали цифры,
+        # ники и ссылки («1 0, 0, 5», «2200 1529»). Оставляем только слова из букв, убираем
+        # служебные слова — проверено на январе 2026: названия кластеров становятся осмысленными.
+        token_pattern=r"(?u)\b[а-яёa-z]{3,}\b",
+        preprocessor=_clean_for_topics,
         lowercase=True,
         min_df=1,
         max_df=1.0,
         ngram_range=(1, 2) if n < 80 else (1, 3),
-        stop_words=None,
+        stop_words=RU_STOP_WORDS,
     )
     model = BERTopic(
         embedding_model=None,

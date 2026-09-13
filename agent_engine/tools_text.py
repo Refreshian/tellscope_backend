@@ -54,12 +54,13 @@ MAX_BATCH_SIZE = 25
 #   5 000–20 000                — тоже целиком, но предупреждаем, что это долго;
 #   больше 20 000               — кластеры по всему корпусу + чтение представителей кластеров
 #                                 и самых значимых сообщений.
-WARN_READ_LIMIT = 5000        # с этого размера срез читается целиком, но это долго
+WARN_READ_LIMIT = 500         # до этого размера читаем целиком молча
+LONG_READ_LIMIT = 5000        # с этого размера целиком, но это долго — предупреждаем явно
 FULL_READ_LIMIT = 20000       # до этого размера читаем ВЕСЬ срез целиком
-CLUSTER_MIN = 20000           # свыше — кластеры по всему корпусу и чтение представителей
-CLUSTER_READ_LIMIT = 600      # сколько сообщений всего читаем в режиме кластеризации
-CLUSTER_PER_CLUSTER = 8       # представителей каждого кластера
-CLUSTER_TOP_MESSAGES = 60     # плюс самые значимые сообщения корпуса
+CLUSTER_MIN = 20000           # свыше — кластеры по всему корпусу и чтение выборки
+CLUSTER_READ_LIMIT = 2500     # сколько сообщений читаем на большом срезе (тысячи, до 5 000)
+CLUSTER_PER_CLUSTER = 4       # представителей каждого кластера (3–5)
+CLUSTER_TOP_MESSAGES = 400    # минимум самых значимых по вовлечённости
 CLUSTER_MIN_SIZE = 30         # минимальный размер кластера HDBSCAN
 CLUSTER_MAX = 40              # сколько кластеров максимум попадает в отчёт
 CLUSTER_EMBED_BATCH = 64      # пачка эмбеддингов корпуса
@@ -421,6 +422,7 @@ def _texts_config() -> Dict[str, Any]:
     """
     defaults: Dict[str, Any] = {
         "warn_read_limit": WARN_READ_LIMIT,
+        "long_read_limit": LONG_READ_LIMIT,
         "full_read_limit": FULL_READ_LIMIT,
         "cluster_min_messages": CLUSTER_MIN,
         "cluster_read_limit": CLUSTER_READ_LIMIT,
@@ -456,8 +458,11 @@ def _texts_config() -> Dict[str, Any]:
     # Пороги не должны противоречить друг другу: читать целиком — только до порога полного
     # чтения, кластеризация — только после него.
     cfg["full_read_limit"] = max(MIN_USEFUL_LIMIT, int(cfg["full_read_limit"]))
+    cfg["long_read_limit"] = max(
+        MIN_USEFUL_LIMIT, min(int(cfg["long_read_limit"]), int(cfg["full_read_limit"]))
+    )
     cfg["warn_read_limit"] = max(
-        MIN_USEFUL_LIMIT, min(int(cfg["warn_read_limit"]), int(cfg["full_read_limit"]))
+        MIN_USEFUL_LIMIT, min(int(cfg["warn_read_limit"]), int(cfg["long_read_limit"]))
     )
     cfg["cluster_min_messages"] = max(int(cfg["cluster_min_messages"]), int(cfg["full_read_limit"]))
     return cfg
@@ -833,6 +838,8 @@ def _corpus_picks(corpus: Dict[str, Any], cfg: Dict[str, Any],
         docs[position]["corpus_role"] = role
         picks.append(docs[position])
 
+    # Сначала представители каждого кластера — на них строятся цитаты и пояснения к темам,
+    # частоты которых посчитаны по всему корпусу.
     for cluster in corpus.get("clusters") or []:
         members = [pos for pos in (cluster.get("members") or []) if 0 <= pos < len(docs)]
         members.sort(key=lambda pos: -float(docs[pos].get("importance") or 0))
@@ -845,16 +852,17 @@ def _corpus_picks(corpus: Dict[str, Any], cfg: Dict[str, Any],
             _take(pos, int(cluster.get("id", -1)), "cluster")
             taken_in_cluster += 1
 
-    if top_messages:
-        order = sorted(range(len(docs)), key=lambda pos: -float(docs[pos].get("importance") or 0))
-        for pos in order:
-            if len(picks) >= read_limit or top_messages <= 0:
-                break
-            if pos in taken:
-                continue
-            label = int(labels[pos]) if pos < len(labels) else -1
-            _take(pos, label, "top")
-            top_messages -= 1
+    # Остаток выборки — самые значимые сообщения по вовлечённости: у большого месяца это
+    # тысячи сообщений, поэтому цитаты и причины опираются на широкий слой, а не на горстку.
+    order = sorted(range(len(docs)), key=lambda pos: -float(docs[pos].get("importance") or 0))
+    for pos in order:
+        if len(picks) >= read_limit:
+            break
+        if pos in taken:
+            continue
+        label = int(labels[pos]) if pos < len(labels) else -1
+        _take(pos, label, "top" if top_messages > 0 else "rest")
+        top_messages -= 1
     return picks
 
 
@@ -1444,6 +1452,7 @@ async def analyze_texts(
     except Exception:  # noqa: BLE001 — без точного размера работаем по выборке
         slice_total = 0
     warn_read = int(texts_cfg["warn_read_limit"])
+    long_read = int(texts_cfg["long_read_limit"])
     cluster_min = int(texts_cfg["cluster_min_messages"])
 
     corpus = None
@@ -1458,23 +1467,33 @@ async def analyze_texts(
         corpus = await _cluster_slice(ctx, index_name, slice_query, texts_cfg)
         if corpus is None:
             strategy = "sample"
-    elif slice_total > warn_read:
+    elif slice_total > long_read:
+        # 5 000–20 000: читаем целиком, но это долго — предупреждаем явно.
         strategy = "full_long"
         minutes = max(1, int(round(slice_total / 450.0)))
         await ctx.log(
             f"В срезе {slice_total} сообщений: читаю ВЕСЬ срез целиком. Это долго — обычно около "
             f"{minutes} мин (пачек по {batch_size}, {parallel_batches} параллельно); прогресс виден в журнале"
         )
+    elif slice_total > warn_read:
+        # 500–5 000: тоже целиком, но предупреждаем, что чтение займёт время.
+        minutes = max(1, int(round(slice_total / 450.0)))
+        await ctx.log(
+            f"В срезе {slice_total} сообщений: читаю весь срез целиком, это займёт около {minutes} мин "
+            f"(пачек по {batch_size}, {parallel_batches} параллельно)"
+        )
 
     if strategy in ("full", "full_long"):
         limit = max(MIN_USEFUL_LIMIT, min(slice_total or requested_limit, full_read))
     elif strategy == "corpus":
+        # На большом срезе читаем тысячи сообщений: сначала представители всех кластеров,
+        # остаток — самые значимые по вовлечённости. Верхняя граница — cluster_read_limit.
         clusters_n = len(corpus.get("clusters") or [])
-        limit = max(MIN_USEFUL_LIMIT, min(
-            int(texts_cfg["cluster_read_limit"]),
-            clusters_n * max(1, int(texts_cfg["cluster_per_cluster"]))
-            + max(0, int(texts_cfg["cluster_top_messages"])),
-        ))
+        limit = max(
+            clusters_n * max(1, int(texts_cfg["cluster_per_cluster"])),
+            int(texts_cfg["cluster_top_messages"]),
+        )
+        limit = min(int(texts_cfg["cluster_read_limit"]), max(MIN_USEFUL_LIMIT, limit))
     else:
         limit = max(MIN_USEFUL_LIMIT, min(
             int(texts_cfg["cluster_read_limit"]),
@@ -1829,6 +1848,12 @@ async def analyze_texts(
     }
     if reading_note:
         section["note"] = reading_note
+    # Эти поля нужны структурному итогу запуска (<ГГГГ-ММ>_summary.json): по ним видно, каким
+    # способом получены темы, сколько сообщений прочитано и сколько кластеров в отчёте.
+    section["strategy"] = strategy
+    section["read_sample"] = int(total_read)
+    section["clusters_count"] = len(corpus.get("clusters") or []) if corpus is not None else 0
+    section["slice_total"] = int(found.get("messages_in_slice") or 0)
     # build_report подставит раздел сам, если модель про него забудет
     ctx.text_analysis = section
     ctx.negative_in_slice = int(negative)
@@ -1909,6 +1934,8 @@ async def analyze_texts(
             "importance_basis": docs[0].get("importance_basis") if docs else "",
             "reading_strategy": reading_strategy,
             "reading_strategy_key": strategy,
+            "read_sample": int(total_read),
+            "read_limit": int(limit),
             "reading_note": reading_note,
             "slice_total": int(found.get("messages_in_slice") or 0),
             "clusters": len(corpus.get("clusters") or []) if corpus else 0,

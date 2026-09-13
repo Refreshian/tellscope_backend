@@ -119,12 +119,13 @@ def texts_cfg() -> dict:
     if not isinstance(lock, dict):
         lock = {}
     defaults = {
-        "warn_read_limit": 5000,
+        "warn_read_limit": 500,
+        "long_read_limit": 5000,
         "full_read_limit": 20000,
         "cluster_min_messages": 20000,
-        "cluster_read_limit": 600,
-        "cluster_per_cluster": 8,
-        "cluster_top_messages": 60,
+        "cluster_read_limit": 2500,
+        "cluster_per_cluster": 4,
+        "cluster_top_messages": 400,
         "cluster_min_size": 30,
         "cluster_max": 40,
         "cluster_embed_batch": 64,
@@ -135,6 +136,7 @@ def texts_cfg() -> dict:
     }
     env_keys = {
         "warn_read_limit": "TELLSCOPE_TEXTS_WARN_LIMIT",
+        "long_read_limit": "TELLSCOPE_TEXTS_LONG_LIMIT",
         "full_read_limit": "TELLSCOPE_TEXTS_FULL_LIMIT",
         "cluster_min_messages": "TELLSCOPE_TEXTS_CLUSTER_MIN",
         "cluster_read_limit": "TELLSCOPE_TEXTS_CLUSTER_READ",
@@ -156,8 +158,10 @@ def texts_cfg() -> dict:
     if out["cluster_min_messages"] < out["full_read_limit"]:
         # Граница «весь срез против кластеризации» не может быть ниже границы полного чтения.
         out["cluster_min_messages"] = out["full_read_limit"]
-    if out["warn_read_limit"] > out["full_read_limit"]:
-        out["warn_read_limit"] = out["full_read_limit"]
+    if out["warn_read_limit"] > out["long_read_limit"]:
+        out["warn_read_limit"] = out["long_read_limit"]
+    if out["long_read_limit"] > out["full_read_limit"]:
+        out["long_read_limit"] = out["full_read_limit"]
     return out
 
 

@@ -1058,12 +1058,15 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
         },
         "messages": {
             "in_slice": total,
+            # Сколько сообщений инструмент прочитал моделью (для кластеризации — выборка
+            # в тысячи сообщений), и сколько из них попало в темы отчёта.
+            "read_sample": int(texts.get("read_sample") or 0),
             "read_in_topics": read_in_topics,
             "topics_total_count": sum(int(row.get("count") or 0) for row in topics),
         },
         "clusters": {
-            "count": len(topics),
-            "kind": "темы отчёта",
+            "count": int(texts.get("clusters_count") or len(topics)),
+            "kind": "темы отчёта (кластеры корпуса)" if texts.get("strategy") == "corpus" else "темы отчёта",
             "strategy": str(texts.get("strategy") or ""),
         },
         "tonality": {
