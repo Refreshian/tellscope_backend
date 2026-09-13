@@ -16,7 +16,12 @@ from .progress import ProgressTracker, human_duration
 from .registry import resolve_tools
 
 MAX_EVENTS = 800
-RUN_BUDGET_SEC = 1800
+# Бюджет запуска. Кластеризация корпуса за месяц — это десятки минут (сбор корпуса,
+# эмбеддинги, UMAP и HDBSCAN), и при старом бюджете 30 минут запуск обрывался ровно
+# после чтения текстов: модель не успевала собрать отчёт. Поэтому бюджет по умолчанию
+# 2 часа — столько же, сколько лимит самого долгого инструмента, и его можно
+# переопределить окружением.
+RUN_BUDGET_SEC = int(os.environ.get("TELLSCOPE_RUN_BUDGET_SEC") or 7200)
 MAX_ACTIVE_PER_USER = 1
 MAX_ACTIVE_TOTAL = 3
 MAX_RUNS_PER_DAY = 60
