@@ -7,7 +7,11 @@
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
+import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +20,33 @@ from .registry import execute, get_tool, json_text, openai_tools
 MAX_STEPS = 14
 MAX_TOOL_CALLS = 28
 DEFAULT_TOKEN_BUDGET = 120_000
+
+# Локальный vLLM поднят с окном 8192 токена (mlops/lock.yaml, generate.max_model_len):
+# промпт вместе с генерацией обязан укладываться в него, иначе vLLM отвечает 400 и агент
+# уходит на внешнюю модель. Лимит модели не поднимаем — это инфраструктура.
+VLLM_MAX_MODEL_LEN = int(os.environ.get("TELLSCOPE_VLLM_MAX_LEN") or 8192)
+# Запас на служебные токены шаблона чата: размер промпта считаем точно через /tokenize,
+# поэтому запаса в 256 токенов достаточно (раньше 512 не спасали из-за оценки «на глазок»).
+VLLM_SAFETY_TOKENS = int(os.environ.get("TELLSCOPE_VLLM_SAFETY_TOKENS") or 256)
+# Минимум токенов на ответ: ниже него вызов инструмента уже не помещается осмысленно.
+VLLM_MIN_OUTPUT_TOKENS = int(os.environ.get("TELLSCOPE_VLLM_MIN_OUTPUT") or 192)
+# Если /tokenize недоступен, считаем по длине текста с запасом на шаблон чата и JSON.
+VLLM_ESTIMATE_MARGIN = float(os.environ.get("TELLSCOPE_VLLM_ESTIMATE_MARGIN") or 1.2)
+VLLM_TOKENIZE_TIMEOUT = float(os.environ.get("TELLSCOPE_VLLM_TOKENIZE_TIMEOUT") or 10.0)
+# Планирующему вызову (выбор инструмента или короткий JSON) хватает 1200 токенов: раньше
+# здесь стояло 3000, и 17 схем инструментов (≈4500 токенов) + 3000 не влезали в окно.
+VLLM_PLAN_MAX_TOKENS = int(os.environ.get("TELLSCOPE_VLLM_PLAN_TOKENS") or 1200)
+# Сколько схем инструментов оставляем локальной модели, если промпт всё равно не влезает.
+VLLM_MAX_TOOL_SCHEMAS = int(os.environ.get("TELLSCOPE_VLLM_MAX_TOOLS") or 8)
+# Инструменты, которые локальной модели нужны в первую очередь (порядок = приоритет).
+ESSENTIAL_TOOLS = (
+    "dataset_overview", "search_messages", "analyze_texts", "make_chart",
+    "build_report", "deep_text_analysis", "tonality_summary", "popular_hooks",
+)
+# Оценка токенов по длине текста: русский текст и JSON в Qwen — примерно 3,2 символа на токен.
+CHARS_PER_TOKEN = 3.2
+# Обёртка, которой локальный vLLM иногда оформляет аргументы вызова инструмента.
+_TOOL_CALL_WRAPPER = re.compile(r"</?tool_call>", re.I)
 
 # Цены за 1M токенов (USD) — только для оценки расхода в интерфейсе.
 # Локальный Qwen считается бесплатным: это наши GPU, внешних платежей нет.
@@ -306,6 +337,279 @@ async def _switch_orchestrator(ctx, key: str, reason: str) -> None:
     await ctx.event({"type": "log", "level": "error", "message": note})
 
 
+# ------------------------------------------------- окно локального vLLM и аргументы вызовов
+
+def _estimate_tokens(value: Any) -> int:
+    """Оценка числа токенов по длине текста (для контроля окна локальной модели)."""
+    try:
+        raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(value)
+    return int(len(raw) / CHARS_PER_TOKEN) + 1
+
+
+def _messages_tokens(messages: List[dict]) -> int:
+    total = 0
+    for message in messages or []:
+        total += _estimate_tokens(message.get("content") or "")
+        total += _estimate_tokens(message.get("tool_calls") or "")
+        total += 8  # служебные поля сообщения
+    return total
+
+
+def _tools_tokens(tools: Optional[List[dict]]) -> int:
+    return _estimate_tokens(tools or []) if tools else 0
+
+
+def _vllm_tokenize_sync(payload: dict) -> Optional[int]:
+    """Точный размер промпта у самого vLLM: /tokenize применяет тот же chat-шаблон.
+
+    Возвращает число токенов промпта (вместе со схемами инструментов) или None, если
+       endpoint недоступен — тогда работаем по оценке длины текста.
+    """
+    try:
+        import urllib.request
+
+        from mlops.lock import generate_cfg
+
+        base_url = str(generate_cfg().get("base_url") or "").rstrip("/")
+        if not base_url:
+            return None
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        request = urllib.request.Request(
+            base_url + "/tokenize", data=body, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(request, timeout=VLLM_TOKENIZE_TIMEOUT) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if isinstance(data.get("count"), int):
+            return int(data["count"])
+        tokens = data.get("tokens")
+        return len(tokens) if isinstance(tokens, list) else None
+    except Exception:
+        return None
+
+
+async def _vllm_prompt_tokens(ctx, messages: List[dict], tools: Optional[List[dict]]) -> Optional[int]:
+    """Сколько токенов займёт промпт в окне локальной модели (точно, если vLLM отвечает)."""
+    cache = getattr(ctx, "_vllm_token_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            ctx._vllm_token_cache = cache
+        except Exception:
+            pass
+    if cache.get("off"):
+        return None
+    try:
+        from mlops.lock import generate_cfg
+
+        model = str(generate_cfg().get("model") or "")
+    except Exception:
+        model = ""
+    payload: Dict[str, Any] = {"model": model, "messages": messages}
+    if tools:
+        payload["tools"] = tools
+    key = ""
+    try:
+        key = hashlib.md5(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        key = ""
+    if key and key in cache:
+        return cache[key]
+    tokens = await asyncio.to_thread(_vllm_tokenize_sync, payload)
+    stats = getattr(ctx, "tool_arg_stats", None)
+    if tokens is None:
+        cache["off"] = True
+        if isinstance(stats, dict):
+            stats["vllm_tokenize_unavailable"] = stats.get("vllm_tokenize_unavailable", 0) + 1
+        return None
+    if key:
+        if len(cache) > 64:
+            cache.clear()
+        cache[key] = tokens
+    if isinstance(stats, dict):
+        stats["vllm_tokenize_calls"] = stats.get("vllm_tokenize_calls", 0) + 1
+        stats["vllm_prompt_tokens_max"] = max(int(stats.get("vllm_prompt_tokens_max") or 0), int(tokens))
+    return int(tokens)
+
+
+def _order_tools_for_vllm(tools: List[dict], task: str) -> List[dict]:
+    """Сначала важные инструменты, затем наиболее близкие к тексту задачи."""
+    words = {word for word in re.findall(r"[а-яёa-z0-9]{4,}", str(task or "").lower())}
+
+    def key(item: dict):
+        fn = item.get("function") or {}
+        name = str(fn.get("name") or "")
+        haystack = (name + " " + str(fn.get("description") or "")).lower()
+        essential = ESSENTIAL_TOOLS.index(name) if name in ESSENTIAL_TOOLS else len(ESSENTIAL_TOOLS)
+        overlap = -sum(1 for word in words if word in haystack)
+        return (essential, overlap, name)
+
+    return sorted(tools, key=key)
+
+
+def _trim_messages_for_vllm(messages: List[dict], budget_tokens: int) -> int:
+    """Урезает самые старые результаты инструментов, чтобы промпт влез в окно модели."""
+    trimmed = 0
+    indexes = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    indexes += [i for i, m in enumerate(messages) if m.get("role") == "user" and str(m.get("content") or "").startswith("Результат инструмента")]
+    for idx in indexes:
+        if _messages_tokens(messages) <= budget_tokens:
+            break
+        content = str(messages[idx].get("content") or "")
+        if len(content) <= 400:
+            continue
+        messages[idx]["content"] = content[:400] + " … [результат сокращён под окно локальной модели]"
+        trimmed += 1
+    return trimmed
+
+
+def _hard_trim_for_vllm(messages: List[dict], target_tokens: int) -> bool:
+    """Аварийное урезание промпта: системная инструкция + последний запрос по длине.
+
+    Нужно как последний рубеж: лучше ответить локальной моделью на коротком промпте,
+    чем получить 400 и уйти на платную модель.
+    """
+    if not messages:
+        return False
+    try:
+        chars = max(600, int(max(256, target_tokens) * CHARS_PER_TOKEN))
+    except Exception:
+        chars = 4000
+    head = messages[0] if str(messages[0].get("role") or "") == "system" else None
+    tail = None
+    for message in reversed(messages):
+        if message is head:
+            break
+        if str(message.get("role") or "") in ("user", "assistant"):
+            tail = message
+            break
+    if tail is None:
+        return False
+    content = str(tail.get("content") or "")
+    if len(content) > chars:
+        tail["content"] = content[:chars] + " … [промпт сокращён под окно локальной модели]"
+    keep = ([head] if head is not None else []) + [tail]
+    if len(keep) >= len(messages):
+        return False
+    messages[:] = keep
+    return True
+
+
+async def _prepare_vllm_request(ctx, messages: List[dict], tools: Optional[List[dict]], max_tokens: int,
+                                choice: Dict[str, Any], force_tool: Optional[str]) -> Tuple[List[dict], Optional[List[dict]], int]:
+    """Укладывает запрос локальной модели в её окно: история, схемы инструментов, генерация.
+
+    Размер промпта считаем точно (vLLM /tokenize с тем же chat-шаблоном), поэтому в окно
+    попадаем с первого раза: промпт + max_tokens ≤ max_model_len − запас. Раньше оценка
+    по длине текста занижала размер (шаблон чата, JSON), запрос выходил за 8192 токенов,
+    vLLM отвечал 400 и запуск уходил на внешнюю модель.
+
+    Возвращает (messages, tools, max_tokens). Для внешних провайдеров ничего не меняет.
+    """
+    if choice.get("provider") != "vllm":
+        return messages, tools, max_tokens
+    budget = max(1024, VLLM_MAX_MODEL_LEN - VLLM_SAFETY_TOKENS)
+    planning = tools is not None
+    limit = min(max_tokens, VLLM_PLAN_MAX_TOKENS) if planning else max_tokens
+    limit = max(VLLM_MIN_OUTPUT_TOKENS, min(limit, max(256, budget - VLLM_MIN_OUTPUT_TOKENS)))
+    if force_tool and tools:
+        # Форсированный шаг отдаём с одним инструментом: и схем меньше, и ответ короче.
+        tools = _single_tool(tools, force_tool)
+    stats = getattr(ctx, "tool_arg_stats", None)
+    notes = getattr(ctx, "notes", None)
+
+    exact = await _vllm_prompt_tokens(ctx, messages, tools)
+    if exact is None:
+        exact = int((_messages_tokens(messages) + _tools_tokens(tools)) * VLLM_ESTIMATE_MARGIN)
+        if isinstance(stats, dict):
+            stats["vllm_estimate_fallback"] = stats.get("vllm_estimate_fallback", 0) + 1
+
+    # 1) история: сокращаем старые результаты инструментов, пока промпт не влезет в окно
+    target_messages = _messages_tokens(messages)
+    for _round in range(3):
+        if exact + limit <= budget:
+            break
+        if target_messages <= 512:
+            break
+        target_messages = max(256, target_messages - (exact + limit - budget) - 64)
+        if not _trim_messages_for_vllm(messages, target_messages):
+            break
+        recount = await _vllm_prompt_tokens(ctx, messages, tools)
+        exact = recount if recount is not None else int(_messages_tokens(messages) * VLLM_ESTIMATE_MARGIN)
+
+    # 2) схемы инструментов: оставляем самые нужные, если всё ещё не влезаем
+    if tools and exact + limit > budget:
+        ordered = _order_tools_for_vllm(tools, getattr(ctx, "task", ""))
+        keep = ordered[: max(1, VLLM_MAX_TOOL_SCHEMAS)]
+        if len(keep) < len(tools):
+            dropped = [((item.get("function") or {}).get("name")) for item in ordered[len(keep):]]
+            recount = await _vllm_prompt_tokens(ctx, messages, keep)
+            if recount is not None:
+                exact = recount
+            if isinstance(notes, list) and not getattr(ctx, "_vllm_schemas_note", False):
+                ctx._vllm_schemas_note = True
+                notes.append(
+                    f"локальному vLLM отданы {len(keep)} схем инструментов из {len(tools)} "
+                    f"(не влезали в окно {VLLM_MAX_MODEL_LEN}); скрыты: {', '.join(str(name) for name in dropped[:8])}"
+                )
+            if isinstance(stats, dict):
+                stats["vllm_schemas_reduced"] = stats.get("vllm_schemas_reduced", 0) + 1
+            tools = keep
+
+    # 3) аварийный рубеж: системная инструкция + последний запрос
+    if exact + limit > budget and _hard_trim_for_vllm(messages, budget - limit):
+        recount = await _vllm_prompt_tokens(ctx, messages, tools)
+        exact = recount if recount is not None else int(_messages_tokens(messages) * VLLM_ESTIMATE_MARGIN)
+
+    # 4) генерация: сколько осталось после промпта
+    available = budget - exact
+    clamped = max(64, min(limit, available))
+    if clamped < limit:
+        if isinstance(stats, dict):
+            stats["vllm_max_tokens_clamped"] = stats.get("vllm_max_tokens_clamped", 0) + 1
+        if isinstance(notes, list) and not getattr(ctx, "_vllm_clamp_note", False):
+            ctx._vllm_clamp_note = True
+            notes.append(
+                f"локальному vLLM ограничен ответ до {clamped} токенов "
+                f"(промпт {exact} из окна {VLLM_MAX_MODEL_LEN})"
+            )
+    return messages, tools, clamped
+
+
+def _parse_tool_args(ctx, raw: Any) -> Tuple[Dict[str, Any], bool]:
+    """Разбирает аргументы вызова инструмента.
+
+    Локальный vLLM иногда возвращает сырой текст с обёрткой <tool_call> или в кодовом
+    блоке — чистим это и достаём JSON, а результат учитываем в статистике запуска,
+    чтобы «молчаливая деградация» форсированных шагов была видна.
+    """
+    text = raw if isinstance(raw, str) else json.dumps(raw or {}, ensure_ascii=False)
+    cleaned = _TOOL_CALL_WRAPPER.sub("", str(text or "")).strip()
+    cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", cleaned).strip()
+    parsed: Any = None
+    if cleaned:
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            parsed = None
+        if not isinstance(parsed, dict):
+            candidate = _extract_json(cleaned)
+            if isinstance(candidate, dict):
+                inner = candidate.get("arguments")
+                parsed = inner if isinstance(inner, dict) else candidate
+    if isinstance(parsed, dict) and "tool" in parsed and "arguments" not in parsed:
+        parsed = parsed.get("arguments") if isinstance(parsed.get("arguments"), dict) else None
+    ok = isinstance(parsed, dict) and bool(parsed)
+    stats = getattr(ctx, "tool_arg_stats", None)
+    if isinstance(stats, dict):
+        key = "args_ok" if ok else "args_broken"
+        stats[key] = stats.get(key, 0) + 1
+    return (parsed if isinstance(parsed, dict) else {}), ok
+
+
 def _tools_problem(exc: BaseException) -> bool:
     """Ошибка похожа на «профиль не умеет function calling», а не на отказ авторизации/оплаты."""
     try:
@@ -315,12 +619,31 @@ def _tools_problem(exc: BaseException) -> bool:
     return status in (400, 404, 422, 501)
 
 
+def force_method(force_tool: Optional[str], choice: Dict[str, Any]) -> str:
+    """Каким способом форсируем инструмент (для метаданных и журнала)."""
+    if not force_tool:
+        return ""
+    return "single_tool_auto" if choice.get("provider") == "vllm" else "named_tool_choice"
+
+
+def _single_tool(tools: List[dict], name: str) -> List[dict]:
+    found = [item for item in tools if ((item.get("function") or {}).get("name")) == name]
+    return found or tools
+
+
 def _request_extra(tools: Optional[List[dict]], force_tool: Optional[str],
                    choice: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     extra: Dict[str, Any] = {}
     if tools:
-        extra = {"tools": tools, "tool_choice": "auto", "parallel_tool_calls": False}
-        if force_tool:
+        use_tools = tools
+        if force_tool and choice.get("provider") == "vllm":
+            # Именованный tool_choice на локальном vLLM работает нестабильно: парсер не
+            # включается, в arguments попадает сырой текст с обёрткой <tool_call>
+            # (в логе vLLM — «Failed to advance FSM»). Вместо него отдаём ровно один
+            # нужный инструмент и tool_choice=auto — так модель отвечает корректно.
+            use_tools = _single_tool(tools, force_tool)
+        extra = {"tools": use_tools, "tool_choice": "auto", "parallel_tool_calls": False}
+        if force_tool and choice.get("provider") != "vllm":
             extra["tool_choice"] = {"type": "function", "function": {"name": force_tool}}
     if choice.get("provider") == "vllm":
         # Локальному Qwen3 этот флаг отключает длинные рассуждения: без него модель
@@ -363,13 +686,14 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         choice = _choice(key)
         ctx.last_choice_key = key
         try:
+            req_messages, req_tools, req_max = await _prepare_vllm_request(ctx, messages, tools, max_tokens, choice, force_tool)
             result = await _achat(ctx,
                 provider=choice["provider"],
-                messages=messages,
+                messages=req_messages,
                 temperature=0.2,
-                max_tokens=max_tokens,
+                max_tokens=req_max,
                 timeout=300,
-                extra=_request_extra(tools, force_tool, choice),
+                extra=_request_extra(req_tools, force_tool, choice),
                 profile=choice["profile"],
                 usage_ctx=usage_ctx,
             )
@@ -387,13 +711,14 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
             )
             await ctx.log("Модель анализа недоступна — текст собран оркестратором", level="error")
             ctx.last_choice_key = fallback_key
+            req_messages, req_tools, req_max = await _prepare_vllm_request(ctx, messages, tools, max_tokens, fallback, force_tool)
             return await _achat(ctx,
                 provider=fallback["provider"],
-                messages=messages,
+                messages=req_messages,
                 temperature=0.2,
-                max_tokens=max_tokens,
+                max_tokens=req_max,
                 timeout=300,
-                extra=_request_extra(tools, force_tool, fallback),
+                extra=_request_extra(req_tools, force_tool, fallback),
                 profile=fallback["profile"],
                 usage_ctx=usage_ctx,
             ), True
@@ -410,11 +735,12 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         await ctx.log(f"{choice['label']}: JSON-протокол вместо вызова инструментов", level="error")
         if JSON_PROTOCOL_HINT not in str(messages[0].get("content") or ""):
             messages[0]["content"] = str(messages[0].get("content") or "") + JSON_PROTOCOL_HINT
+        req_messages, _req_tools, req_max = await _prepare_vllm_request(ctx, messages, None, max_tokens, choice, None)
         result = await _achat(ctx,
             provider=choice["provider"],
-            messages=messages,
+            messages=req_messages,
             temperature=0.2,
-            max_tokens=max_tokens,
+            max_tokens=req_max,
             timeout=300,
             extra=_request_extra(None, None, choice),
             profile=choice["profile"],
@@ -426,13 +752,14 @@ async def _call_llm(ctx, messages: List[dict], tools: Optional[List[dict]], max_
         choice = _choice(key)
         ctx.last_choice_key = key
         try:
+            req_messages, req_tools, req_max = await _prepare_vllm_request(ctx, messages, tools, max_tokens, choice, force_tool)
             result = await _achat(ctx,
                 provider=choice["provider"],
-                messages=messages,
+                messages=req_messages,
                 temperature=0.2,
-                max_tokens=max_tokens,
+                max_tokens=req_max,
                 timeout=300,
-                extra=_request_extra(tools, force_tool, choice),
+                extra=_request_extra(req_tools, force_tool, choice),
                 profile=choice["profile"],
                 usage_ctx=usage_ctx,
             )
@@ -550,6 +877,89 @@ TOOL_HINTS = {
 }
 
 
+async def _forced_tool_call(ctx, messages: List[dict], tools_schema: List[dict], tool_name: str,
+                           max_tokens: int = 1200, instruction: str = "") -> Tuple[str, Dict[str, Any], str]:
+    """Гарантированно получает вызов нужного инструмента и корректные аргументы.
+
+    Способы по порядку: именованный tool_choice (внешние модели) или один инструмент с
+    tool_choice=auto (локальный vLLM) → JSON-протокол текстом, если аргументы не разобрались.
+    Возвращает (имя инструмента, аргументы, способ) — способ пишется в статистику запуска
+    и в журнал, чтобы деградация форсирования была видна.
+    """
+    stats = getattr(ctx, "tool_arg_stats", None)
+    if not isinstance(stats, dict):
+        stats = {}
+        try:
+            ctx.tool_arg_stats = stats
+        except Exception:
+            pass
+
+    def _method_name(method: str) -> str:
+        return {
+            "single_tool_auto": "forced_single_tool_auto",
+            "named_tool_choice": "forced_named_tool_choice",
+            "json_protocol": "forced_json_protocol",
+        }.get(method, "forced_failed")
+
+    # 1) обычный вызов инструмента (для vllm — одним инструментом с auto)
+    try:
+        result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=max_tokens, force_tool=tool_name)
+        ctx.llm_calls += 1
+        _account(ctx, result)
+        choice = _choice(getattr(ctx, "last_choice_key", None) or ctx.model_choice)
+        content, calls = _parse_message(result)
+        if not calls:
+            parsed = _extract_json(content or "")
+            if parsed and parsed.get("tool"):
+                calls = [{"id": "forced", "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)}}]
+        for call in calls:
+            fn = call.get("function") or {}
+            name = str(fn.get("name") or "")
+            if name != tool_name:
+                continue
+            args, ok = _parse_tool_args(ctx, fn.get("arguments"))
+            if ok:
+                method = force_method(tool_name, choice) or "named_tool_choice"
+                stats[_method_name(method)] = stats.get(_method_name(method), 0) + 1
+                await ctx.log(f"Инструмент {tool_name} форсирован способом {method}")
+                return name, args, method
+            await ctx.log(f"Аргументы {tool_name} не разобрались (способ {force_method(tool_name, choice)}), пробую JSON-протокол", level="error")
+    except Exception as exc:  # noqa: BLE001 — пробуем запасной путь
+        await ctx.log(f"Форсированный вызов {tool_name} не удался: {exc}", level="error")
+
+    # 2) JSON-протокол: модель отвечает текстом {"tool": ..., "arguments": {...}}
+    hint_added = False
+    try:
+        if messages and JSON_PROTOCOL_HINT not in str(messages[0].get("content") or ""):
+            messages[0]["content"] = str(messages[0].get("content") or "") + JSON_PROTOCOL_HINT
+            hint_added = True
+        ask = instruction or (
+            f"Ответь ТОЛЬКО JSON без пояснений: {{\"tool\": \"{tool_name}\", \"arguments\": {{...}}}}. "
+            "Никакого текста вокруг, никаких обёрток вида <tool_call>."
+        )
+        messages.append({"role": "user", "content": ask})
+        result, _ = await _call_llm(ctx, messages, None, max_tokens=max_tokens)
+        ctx.llm_calls += 1
+        _account(ctx, result)
+        content, _calls = _parse_message(result)
+        parsed = _extract_json(content or "") or {}
+        name = str(parsed.get("tool") or "")
+        args, ok = _parse_tool_args(ctx, parsed.get("arguments") if isinstance(parsed, dict) else None)
+        if name == tool_name and ok:
+            stats["forced_json_protocol"] = stats.get("forced_json_protocol", 0) + 1
+            await ctx.log(f"Инструмент {tool_name} форсирован через JSON-протокол")
+            return name, args, "json_protocol"
+    except Exception as exc:  # noqa: BLE001
+        await ctx.log(f"Форсирование через JSON-протокол не удалось: {exc}", level="error")
+    finally:
+        if hint_added:
+            pass  # подсказку оставляем: она полезна и дальше в этом запуске
+
+    stats["forced_failed"] = stats.get("forced_failed", 0) + 1
+    await ctx.log(f"Не удалось форсировать инструмент {tool_name}", level="error")
+    return "", {}, "failed"
+
+
 async def _run_tool(ctx, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Выполняет один инструмент, стримит шаги в журнал и запоминает вызов."""
     spec = get_tool(name)
@@ -605,38 +1015,20 @@ async def _ensure_texts(ctx, messages: List[dict], tools_schema: List[dict]) -> 
             ),
         }
     )
-    try:
-        result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=900, force_tool="analyze_texts")
-    except Exception as exc:
-        await ctx.log(f"Не удалось принудительно прочитать тексты: {exc}", level="error")
+    name, args, method = await _forced_tool_call(
+        ctx, messages, tools_schema, "analyze_texts", max_tokens=900,
+        instruction=(
+            "Ответь ТОЛЬКО JSON без пояснений: {\"tool\": \"analyze_texts\", \"arguments\": "
+            "{\"tone\": \"all\"}}. Никакого текста вокруг и никаких обёрток вида <tool_call>."
+        ),
+    )
+    if not name:
         return False
-    ctx.llm_calls += 1
-    _account(ctx, result)
-    content, calls = _parse_message(result)
-    if not calls:
-        parsed = _extract_json(content or "")
-        if parsed and parsed.get("tool"):
-            calls = [{"id": "forced", "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)}}]
-    if not calls:
-        return False
-    done = False
-    for call in calls:
-        fn = call.get("function") or {}
-        name = str(fn.get("name") or "")
-        if name not in ctx.allowed_tools:
-            continue
-        raw_args = fn.get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-        except Exception:
-            args = {}
-        outcome = await _run_tool(ctx, name, args)
-        messages.append(
-            {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
-        )
-        if name == "analyze_texts":
-            done = bool(outcome.get("ok"))
-    return done
+    outcome = await _run_tool(ctx, name, args)
+    messages.append(
+        {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
+    )
+    return bool(outcome.get("ok"))
 
 
 async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) -> bool:
@@ -671,7 +1063,19 @@ async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) ->
         "Пояснения к каждому графику строй на темах и цитатах из текстов, а не только на статистике."
     )
     messages.append({"role": "user", "content": instruction})
-    for force in ("build_report", None):
+    # Форсированный шаг: способ выбирается под профиль (см. _forced_tool_call), поэтому
+    # на локальном vLLM именованный tool_choice больше не ломает аргументы.
+    forced_name, forced_args, _forced_method = await _forced_tool_call(
+        ctx, messages, tools_schema, "build_report", max_tokens=3000,
+    )
+    if forced_name == "build_report":
+        outcome = await _run_tool(ctx, "build_report", forced_args)
+        if outcome.get("ok"):
+            return True
+        messages.append(
+            {"role": "user", "content": "Результат инструмента build_report: " + json_text(_tool_payload(outcome))}
+        )
+    for force in (None,):
         if ctx.out_of_time():
             break
         try:
@@ -693,11 +1097,9 @@ async def _ensure_report(ctx, messages: List[dict], tools_schema: List[dict]) ->
             name = str(fn.get("name") or "")
             if name not in ("build_report", "make_chart"):
                 continue
-            raw_args = fn.get("arguments") or "{}"
-            try:
-                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-            except Exception:
-                args = {}
+            args, args_ok = _parse_tool_args(ctx, fn.get("arguments"))
+            if not args_ok:
+                await ctx.log(f"Аргументы вызова {name} не разобрались — вызываю с пустыми", level="error")
             outcome = await _run_tool(ctx, name, args)
             if name == "build_report" and outcome.get("ok"):
                 return True
@@ -726,39 +1128,19 @@ async def _ensure_data(ctx, messages: List[dict], tools_schema: List[dict]) -> b
             "content": f"Ты ещё не обращался к данным. Вызови инструмент {tool_name} прямо сейчас и работай только с его результатами.",
         }
     )
-    try:
-        result, _ = await _call_llm(ctx, messages, tools_schema, max_tokens=1200, force_tool=tool_name)
-    except Exception as exc:
-        await ctx.log(f"Не удалось принудительно вызвать инструмент: {exc}", level="error")
+    name, args, _method = await _forced_tool_call(
+        ctx, messages, tools_schema, tool_name, max_tokens=1200,
+        instruction=(
+            f"Ответь ТОЛЬКО JSON без пояснений: {{\"tool\": \"{tool_name}\", \"arguments\": {{...}}}}. "
+            "Никакого текста вокруг и никаких обёрток вида <tool_call>."
+        ),
+    )
+    if not name:
         return False
-    ctx.llm_calls += 1
-    _account(ctx, result)
-    content, calls = _parse_message(result)
-    if not calls:
-        parsed = _extract_json(content or "")
-        if parsed and parsed.get("tool"):
-            calls = [
-                {
-                    "id": "forced",
-                    "function": {"name": parsed.get("tool"), "arguments": json.dumps(parsed.get("arguments") or {}, ensure_ascii=False)},
-                }
-            ]
-    if not calls:
-        return False
-    for call in calls:
-        fn = call.get("function") or {}
-        name = str(fn.get("name") or "")
-        if name not in ctx.allowed_tools:
-            continue
-        raw_args = fn.get("arguments") or "{}"
-        try:
-            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-        except Exception:
-            args = {}
-        outcome = await _run_tool(ctx, name, args)
-        messages.append(
-            {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
-        )
+    outcome = await _run_tool(ctx, name, args)
+    messages.append(
+        {"role": "user", "content": "Результат инструмента " + name + ": " + json_text(_tool_payload(outcome))}
+    )
     return bool(ctx.tool_calls)
 
 
@@ -779,6 +1161,8 @@ async def run_agent(ctx) -> Dict[str, Any]:
         messages[0]["content"] += JSON_PROTOCOL_HINT
     tool_call_count = 0
     answer = ""
+    # Статистика разбора аргументов и способов форсирования — попадает в stats запуска.
+    ctx.tool_arg_stats = dict(getattr(ctx, "tool_arg_stats", None) or {})
     tracker = _progress(ctx)
     orchestrator_key = getattr(ctx, "orchestrator_choice", None) or ctx.model_choice
     await ctx.event(
@@ -842,11 +1226,9 @@ async def run_agent(ctx) -> Dict[str, Any]:
             for call in calls:
                 fn = call.get("function") or {}
                 name = str(fn.get("name") or "")
-                args_raw = fn.get("arguments") or "{}"
-                try:
-                    args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-                except Exception:
-                    args = {}
+                args, args_ok = _parse_tool_args(ctx, fn.get("arguments"))
+                if not args_ok:
+                    await ctx.log(f"Аргументы вызова {name} не разобрались — вызываю с пустыми", level="error")
                 spec = get_tool(name)
                 if spec is None or name not in ctx.allowed_tools:
                     payload = {"ok": False, "error": f"инструмент {name} недоступен"}
@@ -986,6 +1368,7 @@ async def run_agent(ctx) -> Dict[str, Any]:
         "models_used": getattr(ctx, "models_used", {}) or {},
         "artifacts": len(ctx.artifacts),
         "tools_used": sorted({c["name"] for c in ctx.tool_calls}),
+        "tool_stats": dict(getattr(ctx, "tool_arg_stats", None) or {}),
         "notes": ctx.notes,
     }
     await ctx.event({"type": "final", "answer": answer, "artifacts": ctx.artifacts, "stats": stats})
