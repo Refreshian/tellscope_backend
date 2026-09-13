@@ -294,9 +294,21 @@ def _finding_rows(findings: Any) -> List[Dict[str, Any]]:
     return [item for item in (findings or []) if isinstance(item, dict)]
 
 
+def _section_note(section: Dict[str, Any]) -> str:
+    """Мягкая пометка раздела: что именно построено по выборке, а что — по всему срезу.
+
+    Текст готовит инструмент (analyze_texts), без конкретных чисел: он объясняет смысл,
+    чтобы читатель отчёта не решил, будто прочитаны все сообщения периода.
+    """
+    note = section.get("note")
+    return str(note).strip() if isinstance(note, str) else ""
+
+
 def _findings_blocks(section: Dict[str, Any]) -> List[str]:
     """Текстовое представление findings для PDF: тема, число/доля, цитаты с атрибуцией."""
     blocks: List[str] = []
+    if _section_note(section):
+        blocks.append("(" + _section_note(section) + ")")
     for item in _finding_rows(section.get("findings")):
         topic = str(item.get("topic") or "Тема")
         head = f"{topic} — {item.get('count')} сообщ."
@@ -406,6 +418,10 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
                     if isinstance(quote, dict) and quote.get("url"):
                         para.add_run(" ")
                         _docx_hyperlink(para, str(quote["url"]), "ссылка")
+            if _section_note(section):
+                # Пометка о способе чтения: темы/цитаты — по выборке, счётчики — по всему срезу.
+                note_para = doc.add_paragraph()
+                note_para.add_run(_section_note(section)).italic = True
         highlights = _finding_rows(section.get("highlights"))
         if highlights:
             doc.add_heading("Ключевые сообщения", level=2)
