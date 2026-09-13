@@ -823,6 +823,25 @@ async def build_report(
                 meta={"folder": folder_name},
             )
             files.append({"name": os.path.basename(path), "size": os.path.getsize(path), "url": art["url"]})
+    # Компактный итог запуска рядом с отчётом: <ГГГГ-ММ>_summary.json одинакового формата.
+    # Он нужен для последующей агрегации (годовые и межгодовые сводки) и для инструмента
+    # read_reports, который читает готовые итоги вместо повторного разбора сырых данных.
+    # Итог никогда не должен ломать сборку отчёта, поэтому все ошибки здесь глушим.
+    summary_file = ""
+    try:
+        summary_file = _write_summary(
+            ctx, str(title), folder_name, sections, files, negative_count,
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary_file = ""
+        await ctx.log(f"Итог запуска сохранить не удалось: {type(exc).__name__}: {exc}", level="error")
+    if summary_file:
+        files.append({
+            "name": os.path.basename(summary_file),
+            "size": os.path.getsize(summary_file),
+            "url": f"/api/reports/download/{ctx.user_id}/{folder_name}/{os.path.basename(summary_file)}",
+        })
+        await ctx.log(f"Итог запуска сохранён: {os.path.basename(summary_file)}")
     await ctx.log(f"Отчёт сохранён в папку «{folder_name}»: " + ", ".join(f["name"] for f in files))
     return {
         "folder": folder_name,
@@ -834,4 +853,345 @@ async def build_report(
         "text_gap": str(getattr(ctx, "text_gap", "") or ""),
         "negative_in_slice": negative_count,
         "findings_sections": len([s for s in sections if _finding_rows(s.get("findings"))]),
+        "summary_file": os.path.basename(summary_file) if summary_file else "",
+    }
+
+
+# ------------------------------------------------- итог запуска и чтение готовых отчётов
+# Одинаковый формат итога для каждого запуска: по нему строятся сводные (годовые, межгодовые,
+# «по всем месяцам») отчёты без повторного разбора сырых данных. Имя предсказуемое —
+# <ГГГГ-ММ>_summary.json в папке отчётов пользователя, поэтому агрегация не требует поиска.
+
+SUMMARY_VERSION = 1
+TONE_KEYS = (("негатив", "negative"), ("нейтрал", "neutral"), ("позитив", "positive"))
+
+
+def _period_key(lo: Any, hi: Any, fallback: str = "") -> str:
+    """Ключ периода для имени итога: ГГГГ-ММ (месяц), ГГГГ (год), ГГГГ-ММ-ДД (один день)."""
+    def parts(value: Any) -> List[int]:
+        out: List[int] = []
+        for chunk in re.split(r"[^0-9]+", str(value or ""))[:3]:
+            if chunk.isdigit():
+                out.append(int(chunk))
+        return out
+
+    start, end = parts(lo), parts(hi)
+    if start and end and start[0] == end[0]:
+        if start[1] == end[1]:
+            if start[2] == end[2]:
+                return "%04d-%02d-%02d" % (start[0], start[1], start[2])
+            return "%04d-%02d" % (start[0], start[1])
+        return "%04d" % start[0]
+    if start:
+        return "%04d-%02d" % (start[0], start[1])
+    return fallback or datetime.now().strftime("%Y-%m")
+
+
+def _slice_stats(ctx) -> Dict[str, Any]:
+    """Число сообщений в срезе и распределение тональности — по ВСЕМУ срезу, а не по выборке."""
+    out: Dict[str, Any] = {"total": 0, "negative": 0, "neutral": 0, "positive": 0}
+    try:
+        from .tools_data import _exact_count, _query, _terms, TONE_VALUES, dates, guard
+
+        _idx, index_name = guard(ctx)
+        lo, hi = dates(ctx, None, None)
+        if not (lo or hi):
+            return out
+        query = _query(None, lo, hi, None)
+        out["total"] = int(_exact_count(index_name, query) or 0)
+        for row in _terms(index_name, "toneMark", size=5, query=query):
+            label = TONE_VALUES.get(row.get("key"), row.get("key"))
+            for ru, en in TONE_KEYS:
+                if label == ru:
+                    out[en] = int(row.get("count") or 0)
+    except Exception:  # noqa: BLE001 — итог не должен зависеть от доступности агрегаций
+        pass
+    return out
+
+
+def _share(value: Any, total: Any) -> float:
+    try:
+        total = float(total or 0)
+        if total <= 0:
+            return 0.0
+        return round(float(value or 0) / total, 4)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _quote_row(quote: Any) -> Optional[Dict[str, str]]:
+    """Цитата для итога: текст, ссылка, дата, площадка, автор — без служебных полей."""
+    text = _quote_text(quote)
+    if not text:
+        return None
+    row = quote if isinstance(quote, dict) else {}
+    return {
+        "text": text[:400],
+        "url": str(row.get("url") or ""),
+        "date": str(row.get("date") or ""),
+        "hub": str(row.get("hub") or ""),
+        "author": str(row.get("author") or ""),
+    }
+
+
+def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str, Any]],
+                     files: List[Dict[str, Any]], negative_count: int) -> Dict[str, Any]:
+    """Компактный итог одного запуска в одинаковом формате.
+
+    Темы и цитаты берутся из раздела чтения текстов (ctx.text_analysis — его положил analyze_texts),
+    число сообщений и тональность — по всему срезу периода. Если инструмент чтения не вызывался,
+    соответствующие поля остаются пустыми: итог не выдумывает данные.
+    """
+    try:
+        from .tools_data import _iso, dates
+
+        lo, hi = dates(ctx, None, None)
+        period_from, period_to = (_iso(lo) if lo else ""), (_iso(hi) if hi else "")
+    except Exception:  # noqa: BLE001
+        period_from = period_to = ""
+
+    texts = getattr(ctx, "text_analysis", None)
+    texts = texts if isinstance(texts, dict) else {}
+    findings = _finding_rows(texts.get("findings"))
+
+    topics: List[Dict[str, Any]] = []
+    category_counts: Dict[str, int] = {}
+    authors: Dict[str, int] = {}
+    for row in findings:
+        quotes = [q for q in (_quote_row(item) for item in (row.get("quotes") or [])) if q]
+        for quote in quotes:
+            if quote.get("author"):
+                authors[quote["author"]] = authors.get(quote["author"], 0) + 1
+        category = str(row.get("category") or "").strip()
+        if category:
+            category_counts[category] = category_counts.get(category, 0) + int(row.get("count") or 0)
+        topics.append({
+            "name": row.get("topic") or row.get("name") or "",
+            "count": int(row.get("count") or 0),
+            "share": float(row.get("share") or 0.0),
+            "share_pct": float(row.get("share_pct") or 0.0),
+            "tone": row.get("tone") or "",
+            "category": category,
+            "essence": row.get("essence") or "",
+            "quotes": quotes[:3],
+        })
+
+    highlights: List[Dict[str, Any]] = []
+    for item in (texts.get("highlights") or []):
+        if not isinstance(item, dict):
+            continue
+        highlights.append({
+            "text": str(item.get("text") or "")[:300],
+            "url": str(item.get("url") or ""),
+            "date": str(item.get("date") or ""),
+            "hub": str(item.get("hub") or ""),
+            "author": str(item.get("author") or ""),
+            "tone": item.get("tone"),
+        })
+        if item.get("author"):
+            authors[str(item["author"])] = authors.get(str(item["author"]), 0) + 1
+
+    links: List[str] = []
+    for section in sections:
+        for item in (section.get("citations") or []):
+            url = item.get("url") if isinstance(item, dict) else str(item)
+            if url and url not in links:
+                links.append(str(url))
+    for topic in topics:
+        for quote in topic["quotes"]:
+            if quote["url"] and quote["url"] not in links:
+                links.append(quote["url"])
+
+    # Инфоповоды: разделы отчёта, которые агент назвал поводами/событиями, плюс темы с датой.
+    events: List[Dict[str, Any]] = []
+    for section in sections:
+        heading = str(section.get("heading") or "")
+        if any(marker in heading.lower() for marker in ("инфоповод", "повод", "событи")):
+            for bullet in (section.get("bullets") or [])[:10]:
+                events.append({"name": str(bullet)[:200], "date": "", "source": heading})
+            text = str(section.get("text") or "").strip()
+            if text and not events:
+                events.append({"name": text[:200], "date": "", "source": heading})
+
+    stats = _slice_stats(ctx)
+    total = int(stats.get("total") or 0)
+    tone_abs = {key: int(stats.get(key) or 0) for _, key in TONE_KEYS}
+    if negative_count and not tone_abs["negative"]:
+        tone_abs["negative"] = int(negative_count)
+    if not total:
+        total = sum(tone_abs.values())
+    # Сколько сообщений модель отнесла к темам: это честная нижняя оценка прочитанного
+    # (в самом analyze_texts «прочитано» может быть больше — часть сообщений не попала ни в одну тему).
+    read_in_topics = len({mid for row in findings for mid in (row.get("msg_ids") or [])})
+
+    return {
+        "version": SUMMARY_VERSION,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "report": {"title": title, "folder": folder_name, "files": [f.get("name") for f in files]},
+        "dataset": {
+            "index": getattr(ctx, "dataset_index", None),
+            "name": getattr(ctx, "dataset_name", "") or "",
+            "label": getattr(ctx, "dataset_label", "") or getattr(ctx, "dataset_name", "") or "",
+        },
+        "period": {
+            "from": period_from,
+            "to": period_to,
+            "from_ts": getattr(ctx, "min_date", None),
+            "to_ts": getattr(ctx, "max_date", None),
+            "key": _period_key(period_from, period_to),
+        },
+        "messages": {
+            "in_slice": total,
+            "read_in_topics": read_in_topics,
+            "topics_total_count": sum(int(row.get("count") or 0) for row in topics),
+        },
+        "clusters": {
+            "count": len(topics),
+            "kind": "темы отчёта",
+            "strategy": str(texts.get("strategy") or ""),
+        },
+        "tonality": {
+            **tone_abs,
+            "total": total,
+            "shares": {key: _share(value, total) for key, value in tone_abs.items()},
+        },
+        "topics": topics,
+        "categories": [
+            {"category": name, "count": count, "share": _share(count, total)}
+            for name, count in sorted(category_counts.items(), key=lambda item: -item[1])
+        ],
+        "authors": [
+            {"name": name, "count": count}
+            for name, count in sorted(authors.items(), key=lambda item: -item[1])[:15]
+        ],
+        "events": events,
+        "highlights": highlights[:10],
+        "sources": {"links": links[:20], "reports": [f.get("name") for f in files]},
+        "sections": [str(section.get("heading") or "") for section in sections if section.get("heading")],
+        "sample_note": str(texts.get("note") or "")[:500],
+        "notes": [
+            "topics и quotes — из раздела чтения текстов (analyze_texts), их охват указан в sample_note",
+            "tonality и messages.in_slice — по всему срезу периода",
+            "authors — по процитированным и ключевым сообщениям отчёта",
+        ],
+    }
+
+
+def _write_summary(ctx, title: str, folder_name: str, sections: List[Dict[str, Any]],
+                   files: List[Dict[str, Any]], negative_count: int) -> str:
+    """Пишет <ГГГГ-ММ>_summary.json в папку отчётов пользователя. Возвращает путь или ''."""
+    payload = _summary_payload(ctx, title, folder_name, sections, files, negative_count)
+    out_dir = _reports_dir(ctx.user_id, folder_name)
+    path = os.path.join(out_dir, "%s_summary.json" % payload["period"]["key"])
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+    return path
+
+
+def _docx_text(path: str, limit: int = 6000) -> str:
+    """Текст документа DOCX: абзацы и таблицы. Нужен, чтобы читать отчёты, собранные до появления
+    итоговых JSON."""
+    try:
+        from docx import Document
+
+        doc = Document(path)
+        parts = [str(p.text).strip() for p in doc.paragraphs if str(p.text).strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [str(cell.text).strip() for cell in row.cells if str(cell.text).strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        text = "\n".join(parts)
+    except Exception:  # noqa: BLE001
+        return ""
+    return text[: max(500, int(limit))]
+
+
+def _report_folders(root: str, folder: str = "") -> List[str]:
+    wanted = _safe_name(folder, 40) if folder else ""
+    if wanted:
+        path = os.path.join(root, wanted)
+        return [wanted] if os.path.isdir(path) else []
+    try:
+        return sorted(name for name in os.listdir(root) if os.path.isdir(os.path.join(root, name)))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@tool(
+    "read_reports",
+    title="Прочитать готовые отчёты",
+    description=(
+        "Возвращает содержимое ранее построенных отчётов пользователя: компактные итоги запусков "
+        "(<ГГГГ-ММ>_summary.json — период, число сообщений, тональность в абсолюте и долях, темы с частотами, "
+        "цитаты и ссылки, ключевые сообщения) и, при include_text=true, текст самих документов DOCX. "
+        "Нужен для сводных, годовых и межгодовых отчётов: сначала читай готовые итоги и строй сводку по ним, "
+        "и только если итогов нет — иди в сырые данные (в этом случае скажи об этом в отчёте)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "folder": {"type": "string", "description": "папка отчётов (обычно датасет); пусто — все папки"},
+            "limit": {"type": "integer", "description": "сколько последних отчётов вернуть, по умолчанию 10"},
+            "include_text": {"type": "boolean", "description": "добавить текст документов DOCX (нужно для отчётов, собранных без итогового JSON)"},
+            "max_chars": {"type": "integer", "description": "предел длины текста одного документа, по умолчанию 6000"},
+        },
+    },
+    group="reports",
+)
+async def read_reports(ctx, folder: str = "", limit: int = 10, include_text: bool = False,
+                       max_chars: int = 6000):
+    root = os.path.join(BACKEND_ROOT, "data", str(ctx.user_id), REPORTS_DIR_NAME)
+    limit = max(1, min(int(limit or 10), 50))
+    summaries: List[Dict[str, Any]] = []
+    texts: List[Dict[str, Any]] = []
+    for name in _report_folders(root, folder):
+        fdir = os.path.join(root, name)
+        try:
+            names = sorted(os.listdir(fdir))
+        except Exception:  # noqa: BLE001
+            continue
+        summary_files = [n for n in names if n.endswith("_summary.json")]
+        for file_name in summary_files[-limit:]:
+            path = os.path.join(fdir, file_name)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except Exception:  # noqa: BLE001
+                continue
+            summaries.append({"folder": name, "file": file_name, "size": os.path.getsize(path),
+                              "summary": payload})
+        if include_text:
+            covered = {item["file"].replace("_summary.json", "") for item in summaries
+                       if item["folder"] == name}
+            docs = [n for n in names if n.lower().endswith(".docx")]
+            for file_name in docs[-limit:]:
+                path = os.path.join(fdir, file_name)
+                text = _docx_text(path, max_chars)
+                if not text:
+                    continue
+                texts.append({
+                    "folder": name,
+                    "file": file_name,
+                    "size": os.path.getsize(path),
+                    "chars": len(text),
+                    "has_summary": os.path.splitext(file_name)[0] in covered,
+                    "text": text,
+                })
+    summaries.sort(key=lambda item: (str(item["summary"].get("period", {}).get("key") or ""), item["file"]))
+    summaries = summaries[-limit:]
+    texts = texts[-limit:]
+    return {
+        "root": root,
+        "folders": _report_folders(root, folder),
+        "summaries": summaries,
+        "texts": texts,
+        "summary_count": len(summaries),
+        "report_count": len(texts),
+        "note": (
+            "Сводку строй по summaries (это итоги прошлых запусков в одинаковом формате: период, "
+            "сообщения, тональность, темы с частотами, цитаты). Если у отчёта нет итогового JSON, "
+            "вызови инструмент с include_text=true и прочитай текст DOCX. Если готовых отчётов нет — "
+            "иди в сырые данные и напиши в отчёте, что сводка собрана по ним."
+        ),
     }
