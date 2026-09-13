@@ -13006,6 +13006,27 @@ def _harness_dataset_name(index: Optional[int]) -> str:
     return _agent_dataset_name(index) if index is not None else ""
 
 
+def _pretty_topic_label(value: Any, fallback: Any = "") -> str:
+    """Человекочитаемая подпись темы для фильтра «Мои задачи».
+
+    Внутренние имена выгрузок выглядят как ba_озон_отзывы_20260912_150434: в подписи нужен
+    смысл («Озон отзывы»), а не служебная дата выгрузки и префикс источника. Если после чистки
+    ничего не осталось, возвращаем исходное имя — фильтр не должен терять пункт.
+    """
+    raw = str(value or "").strip()
+    source = raw or str(fallback or "").strip()
+    if not source:
+        return ""
+    clean = re.sub(r"(?i)\b(?:ba|brand[ _]?analytics)\b", " ", source)
+    clean = re.sub(r"\b20\d{6}(?:[ _]?\d{4,6})?\b", " ", clean)
+    clean = clean.replace("_", " ")
+    clean = re.sub(r"(?i)^(?:ба|ba)\s+", "", clean).strip()  # префикс источника выгрузки
+    clean = re.sub(r"\s{2,}", " ", clean).strip(" -–—·,")
+    if not clean:
+        return raw or str(fallback or "").strip()
+    return clean[:1].upper() + clean[1:]
+
+
 def _harness_dataset_labels() -> Dict[Any, Dict[str, Any]]:
     """Индекс датасета → {index, name, label, period}: человекочитаемые подписи тем.
 
@@ -13018,7 +13039,10 @@ def _harness_dataset_labels() -> Dict[Any, Dict[str, Any]]:
 
         for item in datasets_public():
             try:
-                out[int(item["index"])] = item
+                out[int(item["index"])] = {
+                    **item,
+                    "label": _pretty_topic_label(item.get("label"), item.get("name")),
+                }
             except (TypeError, ValueError, KeyError):
                 continue
     except Exception:  # справочник недоступен — фильтр всё равно должен работать
@@ -13034,7 +13058,8 @@ def _harness_dataset_labels() -> Dict[Any, Dict[str, Any]]:
             if key in out:
                 continue
             label, period = _split_name(name)
-            out[key] = {"index": key, "name": _stem(name), "label": label, "period": period}
+            out[key] = {"index": key, "name": _stem(name),
+                        "label": _pretty_topic_label(label, name), "period": period}
     except Exception:
         pass
     return out
@@ -13050,8 +13075,8 @@ def _harness_task_label(task: Dict[str, Any], labels: Dict[Any, Dict[str, Any]])
         except (TypeError, ValueError):
             row = None
     if row:
-        return str(row.get("label") or row.get("name") or "")
-    return str(task.get("dataset_name") or "")
+        return _pretty_topic_label(row.get("label") or row.get("name"), task.get("dataset_name"))
+    return _pretty_topic_label(task.get("dataset_name"), "")
 
 
 @app.get("/harness/info", tags=["harness"])

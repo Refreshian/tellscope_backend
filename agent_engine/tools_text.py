@@ -1577,10 +1577,9 @@ async def analyze_texts(
     neutral = sum(1 for doc in docs_by_id.values() if doc.get("tone_mark") == 0)
     model_label = _gateway_model_label(bulk)
     if bulk:
-        await ctx.log(
-            f"Быстрое чтение включено: {bulk.get('model')} ({bulk.get('base_url')}), "
-            f"пачка {batch_size}, параллельно {parallel_batches}, лимит генерации {bulk.get('max_tokens')}"
-        )
+        # Человеческая строка без технических деталей (адрес, порт, лимиты): пользователю важно
+        # понимать, что чтение идёт быстрой моделью, а не читать параметры инстанса.
+        await ctx.log("Читаю тексты быстрой моделью — это в несколько раз быстрее обычного")
     await ctx.log(
         f"Чтение текстов: {selected} сообщений, {len(batches)} пачек, модель {model_label}. "
         f"Тональность среза: негатив {negative}, нейтрал {neutral}, позитив {positive}"
