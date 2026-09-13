@@ -13006,6 +13006,54 @@ def _harness_dataset_name(index: Optional[int]) -> str:
     return _agent_dataset_name(index) if index is not None else ""
 
 
+def _harness_dataset_labels() -> Dict[Any, Dict[str, Any]]:
+    """Индекс датасета → {index, name, label, period}: человекочитаемые подписи тем.
+
+    Справочник датасетов уже умеет превращать внутреннее имя индекса
+    (kfc_13.05.2024-22.09.2026) в подпись с периодом, поэтому не дублируем разбор имени здесь.
+    """
+    out: Dict[Any, Dict[str, Any]] = {}
+    try:
+        from agent_engine.tools_data import datasets_public
+
+        for item in datasets_public():
+            try:
+                out[int(item["index"])] = item
+            except (TypeError, ValueError, KeyError):
+                continue
+    except Exception:  # справочник недоступен — фильтр всё равно должен работать
+        pass
+    try:
+        # datasets_public() схлопывает одинаковые темы в самый свежий индекс, а у задачи может
+        # быть сохранён более старый индекс той же темы. Вторым проходом добавляем подписи для
+        # таких индексов, иначе фильтр показывал бы сырое имя выгрузки.
+        from agent_engine.tools_data import _split_name, _stem, index_map
+
+        for idx, name in index_map().items():
+            key = int(idx)
+            if key in out:
+                continue
+            label, period = _split_name(name)
+            out[key] = {"index": key, "name": _stem(name), "label": label, "period": period}
+    except Exception:
+        pass
+    return out
+
+
+def _harness_task_label(task: Dict[str, Any], labels: Dict[Any, Dict[str, Any]]) -> str:
+    """Подпись темы задачи: из справочника, иначе сохранённое имя датасета."""
+    index = task.get("dataset_index")
+    row = None
+    if index not in (None, ""):
+        try:
+            row = labels.get(int(index))
+        except (TypeError, ValueError):
+            row = None
+    if row:
+        return str(row.get("label") or row.get("name") or "")
+    return str(task.get("dataset_name") or "")
+
+
 @app.get("/harness/info", tags=["harness"])
 async def harness_info(user: User = Depends(current_user)):
     """Что умеет DeepSeek Harness: режимы, модели, инструменты, ссылка на Dify.
@@ -13040,7 +13088,7 @@ async def harness_info(user: User = Depends(current_user)):
 
 
 @app.get("/harness/tasks", tags=["harness"])
-async def harness_tasks(user: User = Depends(current_user)):
+async def harness_tasks(user: User = Depends(current_user), dataset: str = ""):
     """Список задач пользователя (только свои).
 
     Перед отдачей список чинится: статус задачи приводится к состоянию запуска (done/failed),
@@ -13053,7 +13101,16 @@ async def harness_tasks(user: User = Depends(current_user)):
         _agent_runs.reconcile_harness_tasks(user.id)
     except Exception as exc:  # noqa: BLE001 — список задач важнее служебной чистки
         print(f"harness tasks reconcile error: {exc}")
-    tasks = _harness.list_tasks(user.id)
+    # Фильтр по базе/теме: что за тексты использовались. dataset — индекс датасета,
+    # "none" — задачи без темы, пусто или "all" — все задачи. Отфильтровываем ДО limit,
+    # поэтому «показано N из M» считается по всему хранилищу, а не по урезанному списку.
+    requested = str(dataset or "").strip()
+    filtered = bool(requested) and requested.lower() not in ("all", "все")
+    labels = _harness_dataset_labels()
+    tasks = _harness.list_tasks(user.id, dataset=requested if filtered else "")
+    total = _harness.count_tasks(user.id)
+    for task in tasks:
+        task["dataset_label"] = _harness_task_label(task, labels)
     for task in tasks:  # подтягиваем актуальный статус запусков
         run_id = task.get("run_id")
         if run_id:
@@ -13068,7 +13125,34 @@ async def harness_tasks(user: User = Depends(current_user)):
                 if _agent_runs.run_is_stale(run):
                     task["run_status"] = "interrupted"
                     task["stale"] = True
-    return {"tasks": tasks, "modes": _harness.MODES}
+    return {
+        "tasks": tasks,
+        "modes": _harness.MODES,
+        "total": total,
+        "shown": len(tasks),
+        "filter": requested,
+        "filtered": filtered,
+        "topic_counts": _harness.topic_counts(user.id, labels),
+    }
+
+
+@app.get("/harness/tasks/filters", tags=["harness"])
+async def harness_task_filters(user: User = Depends(current_user)):
+    """Лёгкий список тем для фильтра «Мои задачи»: сколько задач по каждой базе текстов.
+
+    Читается только файл задач пользователя (плюс справочник датасетов для подписей), поэтому
+    эндпоинт дешёвый и его можно звать при каждом открытии списка. Отдельным пунктом идут
+    задачи без темы: у них фильтр по теме не должен их терять.
+    """
+    from agent_engine import harness as _harness
+
+    labels = _harness_dataset_labels()
+    counts = _harness.topic_counts(user.id, labels)
+    return {
+        "topics": counts["topics"],
+        "without_topic": counts["without_topic"],
+        "total": counts["total"],
+    }
 
 
 @app.post("/harness/task", tags=["harness"])

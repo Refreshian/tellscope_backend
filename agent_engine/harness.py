@@ -47,7 +47,13 @@ def _store_path(user_id: Any) -> str:
     return os.path.join(BACKEND_ROOT, "data", str(user_id), "harness_tasks.json")
 
 
-def list_tasks(user_id: Any, limit: int = 60) -> List[Dict[str, Any]]:
+def list_tasks(user_id: Any, limit: int = 60, dataset: Any = "") -> List[Dict[str, Any]]:
+    """Задачи пользователя, свежие сверху.
+
+    dataset сужает список по базе текстов (что за тексты использовались): индекс датасета,
+    "none" — задачи без темы, пусто — без фильтра. Фильтр применяется ДО limit, поэтому
+    «показано N из M» в интерфейсе честное.
+    """
     path = _store_path(user_id)
     if not os.path.isfile(path):
         return []
@@ -58,8 +64,62 @@ def list_tasks(user_id: Any, limit: int = 60) -> List[Dict[str, Any]]:
         return []
     items = data.get("tasks") if isinstance(data, dict) else data
     items = [item for item in (items or []) if isinstance(item, dict)]
+    wanted = str(dataset or "").strip().lower()
+    if wanted:
+        if wanted in ("none", "no", "без", "без темы", "нет"):
+            items = [item for item in items if item.get("dataset_index") in (None, "")]
+        else:
+            items = [item for item in items if str(item.get("dataset_index")) == wanted]
     items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
     return items[:limit]
+
+
+TASKS_STORE_LIMIT = 200
+
+
+def count_tasks(user_id: Any) -> int:
+    """Всего задач пользователя в хранилище (файл держит не больше TASKS_STORE_LIMIT)."""
+    return len(list_tasks(user_id, limit=TASKS_STORE_LIMIT))
+
+
+def topic_counts(user_id: Any, labels: Optional[Dict[Any, Any]] = None) -> Dict[str, Any]:
+    """Сколько задач по каждой теме (базе текстов) и сколько задач без темы.
+
+    Считаем по задачам самого пользователя, а не по справочнику датасетов: в фильтре «Мои задачи»
+    нужны только те темы, которые он действительно использовал. Подписи берём из справочника
+    (labels: индекс → {label, name, period}).
+    """
+    labels = labels or {}
+    buckets: Dict[str, Dict[str, Any]] = {}
+    without_topic = 0
+    items = list_tasks(user_id, limit=TASKS_STORE_LIMIT)
+    for task in items:
+        index = task.get("dataset_index")
+        if index in (None, ""):
+            without_topic += 1
+            continue
+        key = str(index)
+        slot = buckets.setdefault(key, {
+            "index": index,
+            "count": 0,
+            "name": str(task.get("dataset_name") or ""),
+        })
+        slot["count"] += 1
+        try:
+            row = labels.get(int(index))
+        except (TypeError, ValueError):
+            row = None
+        if row:
+            slot["label"] = str(row.get("label") or "")
+            slot["period"] = str(row.get("period") or "")
+            if row.get("name"):
+                slot["name"] = str(row["name"])
+    rows = sorted(buckets.values(), key=lambda item: (-int(item["count"]), str(item.get("label") or "")))
+    for slot in rows:
+        if not slot.get("label"):
+            # Подписи нет в справочнике — показываем имя датасета, пункт фильтра остаётся понятным.
+            slot["label"] = slot.get("name") or ("Датасет %s" % slot.get("index"))
+    return {"topics": rows, "without_topic": without_topic, "total": len(items)}
 
 
 def save_tasks(user_id: Any, items: List[Dict[str, Any]]) -> None:
