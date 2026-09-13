@@ -106,10 +106,14 @@ def texts_bulk_cfg() -> dict:
 def texts_cfg() -> dict:
     """Пороги адаптивного чтения текстов (секция texts в lock.yaml); окружение приоритетнее.
 
-    warn_read_limit      — с этого размера срез читается целиком, но об этом предупреждаем;
-    full_read_limit      — до этого размера читаем весь срез целиком (быстрой моделью);
-    cluster_min_messages — свыше этого размера читать весь корпус бессмысленно: считаем кластеры
-                           по всему корпусу и читаем представителей и самые значимые сообщения.
+    Единственный источник настроек чтения: и порог полного чтения, и порог кластеризации, и лимиты
+    чтения представителей кластеров. Файл читается на каждый вызов (read_lock_fresh), поэтому
+    пороги меняются без рестарта приложения.
+
+    warn_read_limit      — с этого размера срез читается целиком, но это долго;
+    full_read_limit      — до этого размера читаем ВЕСЬ срез целиком;
+    cluster_min_messages — свыше этого размера кластеры считаются по всему корпусу, а модель
+                           читает представителей кластеров и самые значимые сообщения.
     """
     lock = read_lock_fresh().get("texts") or {}
     if not isinstance(lock, dict):
@@ -120,9 +124,14 @@ def texts_cfg() -> dict:
         "cluster_min_messages": 20000,
         "cluster_read_limit": 600,
         "cluster_per_cluster": 8,
+        "cluster_top_messages": 60,
         "cluster_min_size": 30,
         "cluster_max": 40,
         "cluster_embed_batch": 64,
+        "cluster_svd_dims": 50,
+        "cluster_umap_neighbors": 30,
+        "cluster_corpus_limit": 200000,
+        "cluster_text_chars": 300,
     }
     env_keys = {
         "warn_read_limit": "TELLSCOPE_TEXTS_WARN_LIMIT",
@@ -130,15 +139,25 @@ def texts_cfg() -> dict:
         "cluster_min_messages": "TELLSCOPE_TEXTS_CLUSTER_MIN",
         "cluster_read_limit": "TELLSCOPE_TEXTS_CLUSTER_READ",
         "cluster_per_cluster": "TELLSCOPE_TEXTS_CLUSTER_PER",
+        "cluster_top_messages": "TELLSCOPE_TEXTS_CLUSTER_TOP",
         "cluster_min_size": "TELLSCOPE_TEXTS_CLUSTER_MIN_SIZE",
         "cluster_max": "TELLSCOPE_TEXTS_CLUSTER_MAX",
         "cluster_embed_batch": "TELLSCOPE_TEXTS_CLUSTER_EMBED_BATCH",
+        "cluster_svd_dims": "TELLSCOPE_TEXTS_CLUSTER_SVD_DIMS",
+        "cluster_umap_neighbors": "TELLSCOPE_TEXTS_CLUSTER_NEIGHBORS",
+        "cluster_corpus_limit": "TELLSCOPE_TEXTS_CLUSTER_CORPUS",
+        "cluster_text_chars": "TELLSCOPE_TEXTS_CLUSTER_TEXT_CHARS",
     }
     out = {key: _as_int(os.environ.get(env_keys[key]) or lock.get(key), default)
            for key, default in defaults.items()}
+    out["theme_field_prefix"] = str(
+        os.environ.get("TELLSCOPE_TEXTS_THEME_FIELD_PREFIX") or lock.get("theme_field_prefix") or "tag_"
+    ).strip() or "tag_"
     if out["cluster_min_messages"] < out["full_read_limit"]:
-        # Граница «весь корпус против кластеризации» не может быть ниже границы полного чтения.
+        # Граница «весь срез против кластеризации» не может быть ниже границы полного чтения.
         out["cluster_min_messages"] = out["full_read_limit"]
+    if out["warn_read_limit"] > out["full_read_limit"]:
+        out["warn_read_limit"] = out["full_read_limit"]
     return out
 
 

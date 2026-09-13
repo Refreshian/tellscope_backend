@@ -46,8 +46,29 @@ from .tools_llm import _extract_json, _qwen
 BATCH_SIZE = int(os.environ.get("TELLSCOPE_TEXTS_BATCH_SIZE") or 20)   # сообщений в пачке (15–25)
 MIN_BATCH_SIZE = 15
 MAX_BATCH_SIZE = 25
-MAX_BATCHES = 8          # покрывает MAX_MESSAGES при минимальной пачке (120 / 15 = 8)
-MAX_MESSAGES = 120
+# Пределы чтения и пороги стратегий — дефолты; рабочая настройка берётся из _texts_config()
+# (mlops/lock.yaml, секция texts, и переменные окружения TELLSCOPE_TEXTS_*).
+# Пороги и лимиты чтения — дефолты; единственный источник настройки — mlops/lock.yaml
+# (секция texts) и переменные окружения TELLSCOPE_TEXTS_*. Значения совпадают с заданием:
+#   до 5 000 сообщений          — читаем весь срез целиком;
+#   5 000–20 000                — тоже целиком, но предупреждаем, что это долго;
+#   больше 20 000               — кластеры по всему корпусу + чтение представителей кластеров
+#                                 и самых значимых сообщений.
+WARN_READ_LIMIT = 5000        # с этого размера срез читается целиком, но это долго
+FULL_READ_LIMIT = 20000       # до этого размера читаем ВЕСЬ срез целиком
+CLUSTER_MIN = 20000           # свыше — кластеры по всему корпусу и чтение представителей
+CLUSTER_READ_LIMIT = 600      # сколько сообщений всего читаем в режиме кластеризации
+CLUSTER_PER_CLUSTER = 8       # представителей каждого кластера
+CLUSTER_TOP_MESSAGES = 60     # плюс самые значимые сообщения корпуса
+CLUSTER_MIN_SIZE = 30         # минимальный размер кластера HDBSCAN
+CLUSTER_MAX = 40              # сколько кластеров максимум попадает в отчёт
+CLUSTER_EMBED_BATCH = 64      # пачка эмбеддингов корпуса
+CLUSTER_SVD_DIMS = 50         # SVD перед UMAP (быстрее и без потери структуры)
+CLUSTER_UMAP_NEIGHBORS = 30   # соседей UMAP — как в кластеризации датасетов проекта
+CLUSTER_CORPUS_LIMIT = 200000  # страховочный предел корпуса для эмбеддингов
+CLUSTER_TEXT_CHARS = 300      # сколько символов текста уходит в эмбеддинги кластеризации
+MAX_PARALLEL_BATCHES = 16     # сколько пачек читать одновременно (страховка от перегрузки vLLM)
+# Сколько сообщений читать по умолчанию, если предел не задан явно.
 DEFAULT_LIMIT = 60
 # Меньше одной пачки просить бессмысленно: модель не увидит срез целиком, а пользователь —
 # «прочитано 15 из 41». Такой предел инструмент поднимает до DEFAULT_LIMIT сам.
@@ -390,6 +411,58 @@ def _engagement_config() -> Tuple[Dict[str, float], str, bool]:
     return weights, scale, enabled
 
 
+def _texts_config() -> Dict[str, Any]:
+    """Настройка адаптивного чтения: дефолты из кода + mlops/lock.yaml (секция texts) + окружение.
+
+    Единственное место, где живут пороги чтения: и порог полного чтения, и порог кластеризации,
+    и лимиты чтения представителей кластеров. Настройка читается на каждом запуске инструмента,
+    поэтому подкручивается без правки кода и без рестарта. Битая настройка не ломает инструмент —
+    остаётся дефолт.
+    """
+    defaults: Dict[str, Any] = {
+        "warn_read_limit": WARN_READ_LIMIT,
+        "full_read_limit": FULL_READ_LIMIT,
+        "cluster_min_messages": CLUSTER_MIN,
+        "cluster_read_limit": CLUSTER_READ_LIMIT,
+        "cluster_per_cluster": CLUSTER_PER_CLUSTER,
+        "cluster_top_messages": CLUSTER_TOP_MESSAGES,
+        "cluster_min_size": CLUSTER_MIN_SIZE,
+        "cluster_max": CLUSTER_MAX,
+        "cluster_embed_batch": CLUSTER_EMBED_BATCH,
+        "cluster_svd_dims": CLUSTER_SVD_DIMS,
+        "cluster_umap_neighbors": CLUSTER_UMAP_NEIGHBORS,
+        "cluster_corpus_limit": CLUSTER_CORPUS_LIMIT,
+        "cluster_text_chars": CLUSTER_TEXT_CHARS,
+        "theme_field_prefix": "tag_",
+    }
+    raw: Dict[str, Any] = {}
+    try:
+        from mlops.lock import texts_cfg
+
+        value = texts_cfg() or {}
+        if isinstance(value, dict):
+            raw = value
+    except Exception:
+        raw = {}
+    cfg: Dict[str, Any] = dict(defaults)
+    for key, default in defaults.items():
+        if key == "theme_field_prefix":
+            # Префикс полей готовых тем датасета (подсказка для названий кластеров).
+            cfg[key] = str(raw.get(key) or default).strip() or str(default)
+            continue
+        number = _num(raw.get(key))
+        if number is not None and number > 0:
+            cfg[key] = int(number)
+    # Пороги не должны противоречить друг другу: читать целиком — только до порога полного
+    # чтения, кластеризация — только после него.
+    cfg["full_read_limit"] = max(MIN_USEFUL_LIMIT, int(cfg["full_read_limit"]))
+    cfg["warn_read_limit"] = max(
+        MIN_USEFUL_LIMIT, min(int(cfg["warn_read_limit"]), int(cfg["full_read_limit"]))
+    )
+    cfg["cluster_min_messages"] = max(int(cfg["cluster_min_messages"]), int(cfg["full_read_limit"]))
+    return cfg
+
+
 def _scale_value(value: Any, scale: str) -> float:
     """Сжимающее преобразование одной метрики: sum(weight * f(value)) вместо weight * value."""
     number = _num(value)
@@ -660,6 +733,202 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
         "engagement_numeric_fields": numeric,
         "engagement_enabled": engagement_enabled,
     }
+
+
+# ------------------------------------------------------------------ кластеризация корпуса
+
+async def _cluster_slice(ctx, index_name: str, query: Dict[str, Any],
+                         cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Кластеры по всему корпусу среза с прогрессом. None — не получилось (откат на выборку).
+
+    Эмбеддинги, UMAP и HDBSCAN считаются в отдельном потоке, поэтому прогресс оттуда отправляем
+    в цикл событий через run_coroutine_threadsafe: запуск не должен выглядеть зависшим, пока
+    считаются эмбеддинги корпуса.
+    """
+    from . import text_cluster
+
+    tracker = getattr(ctx, "progress", None)
+    loop = asyncio.get_running_loop()
+
+    def _sub(done: int, total: int, detail: str) -> None:
+        if tracker is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                tracker.sub(max(0, int(done)), max(1, int(total)),
+                            stage="кластеризация корпуса", detail=detail),
+                loop,
+            )
+        except Exception:  # noqa: BLE001 — прогресс не должен ломать расчёт
+            pass
+
+    def _progress(stage: str, info: Dict[str, Any]) -> None:
+        tail = ", ".join("%s: %s" % (key, value) for key, value in (info or {}).items())
+        _sub(0, 1, stage + ((" (" + tail + ")") if tail else ""))
+
+    def _run():
+        return text_cluster.cluster_corpus(
+            index_name, query, cfg,
+            progress=_progress,
+            on_page=lambda done, total: _sub(done, min(total, max(done, 1)),
+                                             "собираю корпус: %d сообщений" % done),
+            on_chunk=lambda done, total: _sub(done, total,
+                                              "эмбеддинги корпуса: %d из %d" % (done, total)),
+        )
+
+    try:
+        if tracker is not None:
+            async with tracker.heartbeat("кластеризация корпуса"):
+                return await loop.run_in_executor(None, _run)
+        return await loop.run_in_executor(None, _run)
+    except Exception as exc:  # noqa: BLE001 — честный откат на выборку лучше падения запуска
+        await ctx.log(
+            "Кластеризация корпуса не удалась (%s: %s) — читаю выборку значимых сообщений, "
+            "в отчёте это помечено" % (type(exc).__name__, exc),
+            level="error",
+        )
+        return None
+
+
+def _corpus_docs(corpus: Dict[str, Any], engagement_available: bool) -> List[Dict[str, Any]]:
+    """Нормализует документы корпуса тем же _doc_from_hit, что и выборку среза.
+
+    Важность считается теми же весами вовлечённости, поэтому «ключевые сообщения» в обоих
+    режимах сопоставимы, а настройка весов действует одинаково.
+    """
+    from .tools_data import _iso
+
+    out: List[Dict[str, Any]] = []
+    for item in corpus.get("docs") or []:
+        doc = _doc_from_hit({"es_id": item.get("es_id"), "_source": item.get("source") or {}})
+        doc["date"] = _iso(doc.get("time"))
+        doc["tone"] = TONE_LABELS.get(doc.get("tone_mark"), doc.get("tone_mark"))
+        score, basis = _importance(doc, engagement_available)
+        doc["importance"] = score
+        doc["importance_basis"] = basis
+        out.append(doc)
+    return out
+
+
+def _corpus_picks(corpus: Dict[str, Any], cfg: Dict[str, Any],
+                  engagement_available: bool) -> List[Dict[str, Any]]:
+    """Кого читать в режиме кластеризации: представители кластеров + самые значимые сообщения.
+
+    Частоты тем берутся из размеров кластеров по всему корпусу (их считает text_cluster),
+    а модель читает нескольких значимых представителей каждого кластера — на них строятся
+    цитаты и пояснения — и дополнительно самые значимые сообщения корпуса целиком.
+    """
+    docs = _corpus_docs(corpus, engagement_available)
+    labels = corpus.get("labels") or []
+    per_cluster = max(1, int(cfg["cluster_per_cluster"]))
+    top_messages = max(0, int(cfg["cluster_top_messages"]))
+    read_limit = max(MIN_USEFUL_LIMIT, int(cfg["cluster_read_limit"]))
+
+    picks: List[Dict[str, Any]] = []
+    taken: set = set()
+
+    def _take(position: int, cluster_id: int, role: str) -> None:
+        taken.add(position)
+        docs[position]["cluster_id"] = int(cluster_id)
+        docs[position]["corpus_role"] = role
+        picks.append(docs[position])
+
+    for cluster in corpus.get("clusters") or []:
+        members = [pos for pos in (cluster.get("members") or []) if 0 <= pos < len(docs)]
+        members.sort(key=lambda pos: -float(docs[pos].get("importance") or 0))
+        taken_in_cluster = 0
+        for pos in members:
+            if taken_in_cluster >= per_cluster or len(picks) >= read_limit:
+                break
+            if pos in taken:
+                continue
+            _take(pos, int(cluster.get("id", -1)), "cluster")
+            taken_in_cluster += 1
+
+    if top_messages:
+        order = sorted(range(len(docs)), key=lambda pos: -float(docs[pos].get("importance") or 0))
+        for pos in order:
+            if len(picks) >= read_limit or top_messages <= 0:
+                break
+            if pos in taken:
+                continue
+            label = int(labels[pos]) if pos < len(labels) else -1
+            _take(pos, label, "top")
+            top_messages -= 1
+    return picks
+
+
+def _cluster_rows(corpus: Dict[str, Any], merged_topics: List[Dict[str, Any]],
+                  docs_by_id: Dict[str, Dict[str, Any]], corpus_total: int) -> List[Dict[str, Any]]:
+    """Темы отчёта при кластеризации: частоты по всему корпусу + цитаты из прочитанных представителей.
+
+    Название кластера берём у модели (её тема пересекается по msg_id с прочитанными
+    представителями), иначе — подсказка из готовых тем датасета (Brand Analytics), иначе —
+    ключевые слова кластера. Тональность кластера посчитана по всем его сообщениям в корпусе.
+    """
+    by_cluster: Dict[int, List[Dict[str, Any]]] = {}
+    for doc in docs_by_id.values():
+        cluster_id = doc.get("cluster_id")
+        if cluster_id is None:
+            continue
+        by_cluster.setdefault(int(cluster_id), []).append(doc)
+
+    rows: List[Dict[str, Any]] = []
+    for cluster in corpus.get("clusters") or []:
+        cluster_id = int(cluster.get("id", -1))
+        members = sorted(by_cluster.get(cluster_id) or [],
+                         key=lambda item: -float(item.get("importance") or 0))
+        quotes = [entry for entry in (_quote_entry(doc, "") for doc in members[:3]) if entry]
+        msg_ids = [str(doc.get("msg_id")) for doc in members if doc.get("msg_id")]
+        name, essence = "", ""
+        for row in merged_topics:
+            if msg_ids and set(msg_ids) & set(row.get("msg_ids") or []):
+                if not name:
+                    name = _flat(row.get("topic")) or _flat(row.get("name"))
+                if not essence:
+                    essence = _flat(row.get("essence"))
+                if name and essence:
+                    break
+        if not name:
+            name = (str(cluster.get("tag_hint") or "").strip()
+                    or ", ".join(str(word) for word in (cluster.get("keywords") or [])[:4])
+                    or "Кластер %d" % cluster_id)
+        count = int(cluster.get("size") or 0)
+        rows.append({
+            "topic": name,
+            "count": count,
+            "share": round(count / float(corpus_total or 1), 4),
+            "share_pct": round(100.0 * count / float(corpus_total or 1), 1),
+            "tone": str(cluster.get("tone_label") or "—"),
+            "tone_avg": cluster.get("tone_avg"),
+            "model_tone": "",
+            "essence": essence,
+            "category": _match_category("", name, [entry["text"] for entry in quotes]),
+            "msg_ids": msg_ids,
+            "quotes": quotes,
+            "importance": round(
+                sum(float(doc.get("importance") or 0) for doc in members) / len(members), 2
+            ) if members else 0.0,
+            "corpus": True,
+            "cluster_id": cluster_id,
+            "tag_hint": str(cluster.get("tag_hint") or ""),
+            "keywords": list(cluster.get("keywords") or []),
+        })
+    rows.sort(key=lambda item: (-item["count"], -item["importance"]))
+    return rows
+
+
+def _categories_from_rows(rows: List[Dict[str, Any]], total: int) -> List[Dict[str, Any]]:
+    """Категории каркаса по готовым темам: те же правила, что и в _merge."""
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        bucket = buckets.setdefault(row["category"], {"category": row["category"], "count": 0, "topics": [], "share": 0.0})
+        bucket["count"] += int(row.get("count") or 0)
+        bucket["topics"].append(row["topic"])
+    for bucket in buckets.values():
+        bucket["share"] = round(bucket["count"] / float(total or 1), 4)
+        bucket["share_pct"] = round(100.0 * bucket["count"] / float(total or 1), 1)
+    return sorted(buckets.values(), key=lambda item: -item["count"])
 
 
 def _message_line(msg_id: str, doc: Dict[str, Any]) -> str:
@@ -1094,8 +1363,12 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
         "упаковка, сроки, другое), ключевые сообщения по вовлечённости и аналитический текст. "
         "Вызывай этот инструмент ПЕРЕД build_report, чтобы выводы и пояснения к графикам опирались на темы "
         "и цитаты из текстов, а не только на статистику. Обязателен, когда в срезе есть негатив: "
-        "причины жалоб нужно подтверждать цитатами. По умолчанию читается ВЕСЬ срез периода (несколько "
-        "пачек параллельно, обычно 1,5–2,5 минуты), limit и batch_size указывать не нужно."
+        "причины жалоб нужно подтверждать цитатами. Срез до 20 000 сообщений читается ЦЕЛИКОМ "
+        "(5 000–20 000 — дольше, но тоже целиком), и тогда темы и цитаты построены по всем сообщениям "
+        "среза; в срезе больше 20 000 сообщений кластеры считаются по всему корпусу, а модель читает "
+        "представителей кластеров и самые значимые сообщения: частоты тем берутся по всему корпусу, "
+        "цитаты — из прочитанного, и это прямо помечается в отчёте. Пачки читаются параллельно, "
+        "limit и batch_size указывать не нужно."
     ),
     parameters={
         "type": "object",
@@ -1104,13 +1377,13 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
             "min_date": {"type": "string", "description": "начало периода: YYYY-MM-DD, ISO или unix-секунды"},
             "max_date": {"type": "string", "description": "конец периода: YYYY-MM-DD, ISO или unix-секунды"},
             "tone": {"type": "string", "enum": ["all", "negative", "positive", "neutral"], "description": "какие сообщения читать: all — весь срез периода (по умолчанию), negative только сужает срез до негатива"},
-            "limit": {"type": "integer", "description": "сколько сообщений прочитать: по умолчанию весь срез, не больше 60 (максимум 120). Занижать не нужно — меньше 20 инструмент поднимает до 60 сам"},
+            "limit": {"type": "integer", "description": "сколько сообщений прочитать: по умолчанию весь срез (до 20 000) или выборка представителей кластеров при кластеризации. Занижать не нужно — меньше 20 инструмент поднимает сам"},
             "batch_size": {"type": "integer", "description": "сообщений в одной пачке для модели, 15–25 (по умолчанию 20); указывать не обязательно"},
             "focus": {"type": "string", "description": "на что смотреть в первую очередь (например «причины возвратов»)"},
         },
     },
     group="analytics",
-    timeout=600.0,
+    timeout=7200.0,
 )
 async def analyze_texts(
     ctx,
@@ -1134,13 +1407,16 @@ async def analyze_texts(
     # Нужен для замеров и тонкой настройки под нагрузку vLLM.
     # Профиль быстрого чтения: своя модель, своя пачка и свой параллелизм (по умолчанию 8).
     bulk = _bulk_profile()
-    parallel_batches = max(1, min(int(parallel or bulk.get("parallel") or PARALLEL_BATCHES), MAX_BATCHES))
+    parallel_batches = max(1, min(int(parallel or bulk.get("parallel") or PARALLEL_BATCHES),
+                                  MAX_PARALLEL_BATCHES))
 
     if bulk.get("batch_size") and int(batch_size or 0) == BATCH_SIZE:
         # Профиль может задать свой размер пачки; явно переданный аргумент важнее профиля.
         batch_size = int(bulk["batch_size"])
     batch_size = max(MIN_BATCH_SIZE, min(int(batch_size or BATCH_SIZE), MAX_BATCH_SIZE))
-    requested_limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_MESSAGES))
+    texts_cfg = _texts_config()
+    full_read = max(MIN_USEFUL_LIMIT, int(texts_cfg["full_read_limit"]))
+    requested_limit = max(1, min(int(limit or DEFAULT_LIMIT), full_read))
     limit = requested_limit
     if limit < MIN_USEFUL_LIMIT:
         # Планировщик (или внешний вызов) мог поставить предел «на одну пачку» — например 15,
@@ -1153,6 +1429,58 @@ async def analyze_texts(
         )
     focus_text = f" Особое внимание: {_flat(focus)}." if _flat(focus) else ""
     scope = f" за период {_iso(lo)} — {_iso(hi)}" + (f" (тональность: {tone})" if str(tone).lower() not in ("all", "any", "") else "")
+
+    # ------------------------------------------------------- стратегия чтения среза
+    # Пороги (mlops/lock.yaml, секция texts): до 5 000 сообщений читаем срез ЦЕЛИКОМ; 5 000–20 000 —
+    # тоже целиком, но предупреждаем, что это долго; больше 20 000 — локальной моделью весь корпус
+    # не прочитать, поэтому кластеры считаются по всему корпусу (эмбеддинги проекта + UMAP/HDBSCAN),
+    # а модель читает представителей кластеров и самые значимые сообщения. Частоты тем в отчёте —
+    # по всему корпусу, цитаты и пояснения — из прочитанных представителей.
+    from .tools_data import _exact_count, _query
+
+    slice_query = _query(None, lo, hi, tone)
+    try:
+        slice_total = int(_exact_count(index_name, slice_query))
+    except Exception:  # noqa: BLE001 — без точного размера работаем по выборке
+        slice_total = 0
+    warn_read = int(texts_cfg["warn_read_limit"])
+    cluster_min = int(texts_cfg["cluster_min_messages"])
+
+    corpus = None
+    strategy = "full"
+    if slice_total > cluster_min:
+        strategy = "corpus"
+        await ctx.log(
+            f"В срезе {slice_total} сообщений — больше {cluster_min}: считаю кластеры по всему "
+            "корпусу, а модель прочитает представителей кластеров и самые значимые сообщения. "
+            "Частоты тем в отчёте будут посчитаны по всему корпусу"
+        )
+        corpus = await _cluster_slice(ctx, index_name, slice_query, texts_cfg)
+        if corpus is None:
+            strategy = "sample"
+    elif slice_total > warn_read:
+        strategy = "full_long"
+        minutes = max(1, int(round(slice_total / 450.0)))
+        await ctx.log(
+            f"В срезе {slice_total} сообщений: читаю ВЕСЬ срез целиком. Это долго — обычно около "
+            f"{minutes} мин (пачек по {batch_size}, {parallel_batches} параллельно); прогресс виден в журнале"
+        )
+
+    if strategy in ("full", "full_long"):
+        limit = max(MIN_USEFUL_LIMIT, min(slice_total or requested_limit, full_read))
+    elif strategy == "corpus":
+        clusters_n = len(corpus.get("clusters") or [])
+        limit = max(MIN_USEFUL_LIMIT, min(
+            int(texts_cfg["cluster_read_limit"]),
+            clusters_n * max(1, int(texts_cfg["cluster_per_cluster"]))
+            + max(0, int(texts_cfg["cluster_top_messages"])),
+        ))
+    else:
+        limit = max(MIN_USEFUL_LIMIT, min(
+            int(texts_cfg["cluster_read_limit"]),
+            max(requested_limit, int(texts_cfg["cluster_top_messages"])),
+        ))
+        await ctx.log("Срез большой: читаю выборку значимых сообщений, в отчёте это помечено")
 
     found = _fetch_slice(index_name, lo, hi, tone, limit)
     if not found["docs"] and (ctx.min_date or ctx.max_date) and (lo, hi) != (ctx.min_date, ctx.max_date):
@@ -1187,7 +1515,28 @@ async def analyze_texts(
             "note": "За указанный период сообщений нет — читать нечего. Проверьте период и тональность.",
         }
 
-    batches = _chunks(docs, batch_size)[:MAX_BATCHES]
+    if corpus is not None:
+        # В режиме кластеризации читаем не срез, а представителей кластеров и самые значимые
+        # сообщения корпуса: по ним модель даёт цитаты и пояснения к темам, частоты которых
+        # посчитаны по всему корпусу.
+        picks = _corpus_picks(corpus, texts_cfg, bool(found.get("engagement_available")))[:limit]
+        docs_by_id = {}
+        lines = []
+        for position, doc in enumerate(picks, start=1):
+            msg_id = "m%d" % position
+            doc["msg_id"] = msg_id
+            docs_by_id[msg_id] = doc
+            lines.append(_message_line(msg_id, doc))
+        found["docs"], found["docs_by_id"], found["lines"] = picks, docs_by_id, lines
+        await ctx.log(
+            f"Читаю представителей кластеров и самые значимые сообщения: кластеров "
+            f"{len(corpus.get('clusters') or [])}, сообщений к прочтению {len(picks)}"
+        )
+
+    # Предел числа пачек — по фактическому размеру чтения: в режиме «целиком» это сотни пачек,
+    # и обрезать их нельзя, иначе срез останется недочитанным.
+    max_batches = max(1, (int(limit) // max(1, MIN_BATCH_SIZE)) + 2)
+    batches = _chunks(docs, batch_size)[:max_batches]
     # Дальше работают только те сообщения, которые реально ушли в модель.
     batches = [batch for batch in batches if batch]
     read_ids = {doc["msg_id"] for batch in batches for doc in batch}
@@ -1197,14 +1546,29 @@ async def analyze_texts(
     if selected < len(docs):
         await ctx.log(
             f"Читаю {selected} сообщений из {len(docs)} отобранных "
-            f"(пачек не больше {MAX_BATCHES} по {batch_size} сообщений)"
+            f"(пачек не больше {max_batches} по {batch_size} сообщений)"
         )
     if selected < slice_total:
-        # Не скрываем это от пользователя: в срезе больше сообщений, чем читаем.
-        await ctx.log(
-            f"В срезе {slice_total} сообщений, читаю {selected}: предел чтения {limit}. "
-            f"Для полного среза вызывайте инструмент без limit (по умолчанию {DEFAULT_LIMIT}, максимум {MAX_MESSAGES})"
-        )
+        # Не скрываем от пользователя, что срез прочитан не целиком, и объясняем, как это
+        # отражено в отчёте: при большом срезе темы считаются по всему корпусу, а модель
+        # читает значимую выборку — это помечено в разделе и в scope_note.
+        if strategy == "corpus":
+            await ctx.log(
+                f"Срез {slice_total} сообщений: частоты тем считаю по всему корпусу (кластеров "
+                f"{len(corpus.get('clusters') or [])}), читаю {selected} представителей и значимых сообщений"
+            )
+        elif strategy != "full":
+            await ctx.log(
+                f"Срез {slice_total} сообщений: читаю выборку значимых сообщений ({selected}), "
+                "в отчёте это помечено"
+            )
+        else:
+            await ctx.log(
+                f"В срезе {slice_total} сообщений, читаю {selected}: предел чтения {limit}. "
+                f"Для полного среза вызывайте инструмент без limit (по умолчанию {DEFAULT_LIMIT}, "
+                f"максимум {full_read})"
+            )
+
     if not docs_by_id:
         raise ToolError("Не удалось подготовить сообщения для чтения — повторите запуск")
 
@@ -1240,8 +1604,10 @@ async def analyze_texts(
             selected,
             stage="чтение текстов",
             detail=(
-                f"читаю {selected} сообщений среза: пачек {len(batches)} по {batch_size}, "
-                f"{min(parallel_batches, len(batches))} параллельно (обычно ~{waves * 2} мин)"
+                (f"читаю выборку значимых сообщений: пачек {len(batches)} по {batch_size}, "
+                 if strategy != "full" else
+                 f"читаю {selected} сообщений среза: пачек {len(batches)} по {batch_size}, ")
+                + f"{min(parallel_batches, len(batches))} параллельно (обычно ~{waves * 2} мин)"
             ),
             units_done=0,
             units_total=len(batches),
@@ -1336,6 +1702,16 @@ async def analyze_texts(
     total_read = min(selected, read_done) or selected
     merged = _merge(parsed_batches, docs_by_id, total_read)
     topics, categories, highlights = merged["topics"], merged["categories"], merged["highlights"]
+    corpus_total = int(found.get("messages_in_slice") or 0) or total_read
+    if corpus is not None:
+        # Частоты тем — по всему корпусу (размеры кластеров), цитаты и пояснения — из прочитанных
+        # представителей. Иначе доли считались бы от прочитанной выборки, и по отчёту нельзя было
+        # бы понять, что тема частая во всём корпусе.
+        cluster_rows = _cluster_rows(corpus, merged["topics"], docs_by_id, corpus_total)
+        if cluster_rows:
+            topics = cluster_rows
+            categories = _categories_from_rows(topics, corpus_total)
+
     if total_read and not topics:
         # Непустое «прочитано N» при пустых темах — провал шага, а не успешный разбор: раньше
         # такой запуск закрывался отчётом без тем и цитат (JSON обрезался по лимиту генерации,
@@ -1413,7 +1789,32 @@ async def analyze_texts(
         }
         for row in topics
     ]
-    heading = f"Темы и цитаты из текстов ({total_read} сообщений)"
+    # Пометка о способе чтения — без конкретных чисел: она объясняет смысл, а не размеры.
+    # У среза, прочитанного целиком, пометки нет: там темы и цитаты построены по всем сообщениям.
+    if strategy in ("full", "full_long"):
+        reading_strategy = "прочитано целиком"
+        reading_note = ""
+    elif strategy == "corpus":
+        reading_strategy = "кластеризация по всему корпусу + чтение представителей"
+        reading_note = (
+            "Темы, цитаты и ключевые сообщения построены по выборке наиболее значимых сообщений периода; "
+            "тональность, площадки и динамика — по всей совокупности сообщений среза. "
+            "Частоты тем посчитаны по всему корпусу среза."
+        )
+    else:
+        reading_strategy = "выборка значимых сообщений"
+        reading_note = (
+            "Темы, цитаты и ключевые сообщения построены по выборке наиболее значимых сообщений периода; "
+            "тональность, площадки и динамика — по всей совокупности сообщений среза."
+        )
+    if slice_total and total_read >= slice_total:
+        heading = f"Темы и цитаты из текстов ({total_read} сообщений)"
+    elif strategy in ("full", "full_long"):
+        heading = f"Темы и цитаты из текстов ({total_read} сообщений)"
+    else:
+        # Прочитана выборка представителей: число прочитанного в заголовке только запутало бы —
+        # размер выборки не равен размеру среза, а сам срез с пометкой объяснён в тексте раздела.
+        heading = "Темы и цитаты из текстов"
     citations = [
         {"title": f"{quote['hub']} · {quote['date']} · {quote['author']}".strip(" ·"), "url": quote["url"]}
         for row in topics
@@ -1427,6 +1828,8 @@ async def analyze_texts(
         "citations": citations,
         "chart_ids": [],
     }
+    if reading_note:
+        section["note"] = reading_note
     # build_report подставит раздел сам, если модель про него забудет
     ctx.text_analysis = section
     ctx.negative_in_slice = int(negative)
@@ -1437,6 +1840,8 @@ async def analyze_texts(
         f"Тональность среза: {tone_note}. Отбор важных сообщений: "
         f"{docs[0].get('importance_basis') if docs else '—'}."
     )
+    if reading_note:
+        scope_note += " " + reading_note
     if failed:
         scope_note += f" Не разобрано пачек: {failed}."
     if fallback_batches:
@@ -1503,6 +1908,18 @@ async def analyze_texts(
             "local_model_tokens": tokens_used,
             "cost_usd": 0.0,
             "importance_basis": docs[0].get("importance_basis") if docs else "",
+            "reading_strategy": reading_strategy,
+            "reading_strategy_key": strategy,
+            "reading_note": reading_note,
+            "slice_total": int(found.get("messages_in_slice") or 0),
+            "clusters": len(corpus.get("clusters") or []) if corpus else 0,
+            "clusters_total": int(corpus.get("clusters_total") or 0) if corpus else 0,
+            "cluster_noise": int(corpus.get("noise") or 0) if corpus else 0,
+            "cluster_tagged_docs": int(corpus.get("tagged") or 0) if corpus else 0,
+            "cluster_stages": dict(corpus.get("stages") or {}) if corpus else {},
+            "cluster_truncated": bool(corpus.get("truncated")) if corpus else False,
+            "cluster_skipped_no_text": int(corpus.get("skipped_no_text") or 0) if corpus else 0,
+            "corpus_tagged_docs": int(corpus.get("tagged_docs") or 0) if corpus else 0,
             "engagement_available": engagement_available,
             "engagement_fields": engagement_fields,
             "engagement_max": found.get("engagement_max") or {},
@@ -1514,6 +1931,7 @@ async def analyze_texts(
             "Раздел report_section обязательно передай в build_report (findings с темами, долями и цитатами "
             "попадут в DOCX/PDF отдельным блоком). Пояснения к каждому графику строй на этих темах и цитатах, "
             "а не только на статистике. Цитаты уже сверены с текстами сообщений. "
+            + (reading_note + " " if reading_note else "")
             + engagement_note
         ),
     }

@@ -31,18 +31,11 @@ external:
     smart_agent_planner: claude-sonnet-4.5
     harness: deepseek-chat
 
-# Модель-оркестратор: та, что планирует шаги и вызывает инструменты Tellscope
-# (агентный режим и планировщик центра задач). Значения — ключи MODEL_CHOICES
-# из agent_engine/loop.py: gpt | deepseek | qwen | claude.
-# Настройка читается на каждый запуск, поэтому меняется без правки кода и без рестарта;
-# переопределения окружением (приоритет выше файла):
-#   TELLSCOPE_ORCHESTRATOR=gpt|deepseek|qwen|claude
-#   TELLSCOPE_ORCHESTRATOR_FALLBACKS=deepseek,qwen
-#   TELLSCOPE_ORCHESTRATOR_PROBE=tools|reachability
-# tools — от кандидата требуется поддержка вызова инструментов; при недоступности
-# (нет ключа, 401/403/429, недостаточно средств, проба не прошла) берётся следующий
-# из orchestrator_fallbacks. reachability — достаточно, чтобы модель отвечала
-# (тогда работает резервный JSON-протокол вызова инструментов).
+# Модель-оркестратор: планирует шаги и вызывает инструменты Tellscope.
+# Значения — ключи MODEL_CHOICES из agent_engine/loop.py (gpt | deepseek | qwen | claude).
+# Настройка читается на каждый запуск, поэтому переключается без правки кода и рестарта.
+# Переопределения окружением: TELLSCOPE_ORCHESTRATOR, TELLSCOPE_ORCHESTRATOR_FALLBACKS,
+# TELLSCOPE_ORCHESTRATOR_PROBE (tools | reachability). Приоритет у окружения.
 agent:
   orchestrator: gpt
   orchestrator_fallbacks: [deepseek, qwen]
@@ -141,27 +134,44 @@ texts_bulk:
   container: vllm-fast-reader
   compose: /home/docker/vllm/docker-compose-fast-reader-gpu0.yml
 
-# Пороги адаптивного чтения текстов (agent_engine/tools_text.py):
-#   warn_read_limit      — с этого размера срез читается целиком, но в прогрессе видно,
-#                          что это долго (замер: ~2 250 сообщений за 5 минут на 12 параллельно);
+# Пороги адаптивного чтения текстов (agent_engine/tools_text.py). Единственное место, где они
+# заданы; код читает их на каждом запуске (read_lock_fresh), поэтому правка применяется без
+# рестарта приложения. Порогов ровно два, как в задании:
+#   warn_read_limit      — с этого размера срез читается целиком, но это долго, и в прогрессе
+#                          видно предупреждение (замер: ~450 сообщений в минуту на 12 параллельно);
 #   full_read_limit      — до этого размера читаем ВЕСЬ срез целиком быстрой моделью;
-#   cluster_min_messages — свыше этого размера весь корпус читать бессмысленно: считаем кластеры
-#                          по всему корпусу (эмбеддинги проекта + BERTopic-подход) и читаем
-#                          представителей кластеров и самые значимые сообщения, а частоты тем
-#                          в отчёте берём по всему корпусу;
-#   cluster_read_limit   — сколько представителей всего отправляем модели;
+#   cluster_min_messages — свыше этого размера локальной моделью весь корпус не прочитать:
+#                          кластеры считаются по всему корпусу (эмбеддинги проекта + UMAP/HDBSCAN),
+#                          а модель читает представителей кластеров и самые значимые сообщения.
+#                          Частоты тем в отчёте — по всему корпусу, цитаты — из прочитанного.
+# Параметры кластеризации:
+#   cluster_read_limit   — сколько сообщений всего читаем (представители + значимые);
 #   cluster_per_cluster  — сколько представителей берём из одного кластера;
+#   cluster_top_messages — плюс самые значимые сообщения корпуса;
 #   cluster_min_size     — минимальный размер кластера HDBSCAN;
 #   cluster_max          — сколько кластеров максимум попадает в отчёт;
-#   cluster_embed_batch  — размер пачки при расчёте эмбеддингов корпуса.
-# Переопределение окружением: TELLSCOPE_TEXTS_FULL_LIMIT, TELLSCOPE_TEXTS_WARN_LIMIT,
-# TELLSCOPE_TEXTS_CLUSTER_MIN, TELLSCOPE_TEXTS_CLUSTER_READ.
+#   cluster_embed_batch  — размер пачки при расчёте эмбеддингов корпуса;
+#   cluster_text_chars   — сколько символов текста уходит в эмбеддинги (замер: 300 символов дают
+#                          ~500 сообщений/с против ~180 на 600 символах при той же структуре);
+#   cluster_svd_dims     — сколько измерений оставляем после SVD перед UMAP;
+#   cluster_umap_neighbors — соседей UMAP (как в кластеризации датасетов проекта);
+#   cluster_corpus_limit — страховочный предел размера корпуса для эмбеддингов;
+#   theme_field_prefix   — префикс готовых тем датасета (Brand Analytics): подсказка для названий
+#                          кластеров, а не источник частот.
+# Переопределение окружением: TELLSCOPE_TEXTS_WARN_LIMIT, TELLSCOPE_TEXTS_FULL_LIMIT,
+# TELLSCOPE_TEXTS_CLUSTER_MIN, TELLSCOPE_TEXTS_CLUSTER_READ, TELLSCOPE_TEXTS_CLUSTER_PER и др.
 texts:
   warn_read_limit: 5000
   full_read_limit: 20000
   cluster_min_messages: 20000
   cluster_read_limit: 600
   cluster_per_cluster: 8
+  cluster_top_messages: 60
   cluster_min_size: 30
   cluster_max: 40
   cluster_embed_batch: 64
+  cluster_text_chars: 300
+  cluster_svd_dims: 50
+  cluster_umap_neighbors: 30
+  cluster_corpus_limit: 200000
+  theme_field_prefix: "tag_"
