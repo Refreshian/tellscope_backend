@@ -1409,6 +1409,16 @@ async def analyze_texts(
     started = time.time()
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
+    if min_date is None and max_date is None and (ctx.min_date or ctx.max_date):
+        # Даты не передали, но период задачи известен — читаем период задачи, а не весь датасет.
+        # Иначе _require_period подставлял период датасета (13.05.2024–08.09.2026), «срез»
+        # незаметно превращался в 2,9 млн сообщений, а кластеризация молча упиралась в
+        # страховочный предел корпуса и считала темы не по тому периоду, о котором задача.
+        lo = ctx.min_date or lo
+        hi = ctx.max_date or hi
+        await ctx.log(
+            f"Даты в вызове не указаны — читаю период задачи {_iso(lo)} — {_iso(hi)}"
+        )
     lo, hi = _require_period(index_name, lo, hi)
 
     # Служебный параметр (нет в схеме инструмента): сколько пачек читать одновременно.
