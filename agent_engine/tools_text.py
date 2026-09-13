@@ -55,10 +55,15 @@ MIN_USEFUL_LIMIT = 20
 
 MESSAGE_CHARS = 480      # обрезка текста сообщения в промпте (max_model_len vLLM = 8192)
 BATCH_CHAR_BUDGET = 9000  # страховка по длине промпта пачки
-BATCH_MAX_TOKENS = 1500
+# Лимит генерации одной пачки. 1500 токенов пачке из 20 сообщений не хватало: ответ обрывался
+# на finish_reason="length", JSON оставался незакрытым, а _extract_json находил первый ВЛОЖЕННЫЙ
+# объект — и инструмент отдавал пустые темы и цитаты при непустом «прочитано N». 3000 — запас
+# и для Qwen3-32B, и для быстрой Qwen3-4B-Instruct-2507; при обрыве пачка делится пополам
+# (см. _run_batch) и шаг честно сообщает об ошибке, а не отдаёт пустой разбор.
+BATCH_MAX_TOKENS = 3000
 SUMMARY_MAX_TOKENS = 1100
-# Пачки читаются параллельно: 4 запроса × (≈3 000 токенов промпта + 1 500 генерации) далеко
-# от max_model_len 8192 и от max-num-seqs 32, память vLLM не упирается.
+# Пачки читаются параллельно: с профилем быстрого чтения это 8 запросов к 4B, без него — 4 к 32B;
+# и то и другое далеко от max_model_len и max-num-seqs, память vLLM не упирается.
 PARALLEL_BATCHES = int(os.environ.get("TELLSCOPE_TEXTS_PARALLEL") or 4)
 
 MODEL_LABEL = "Qwen3-32B-FP8 (vLLM, локально, без оплаты)"
@@ -280,8 +285,45 @@ def _norm_key(text: Any) -> str:
     return re.sub(r"[^0-9a-zа-яё]+", "", _flat(text).lower())
 
 
-def _gateway_model_label() -> str:
+def _bulk_profile() -> Dict[str, Any]:
+    """Профиль быстрого чтения пачек (mlops/lock.yaml, секция texts_bulk). Пусто — читаем на 32B.
+
+    Отдельный профиль нужен потому, что VLLM_BASE_URL/VLLM_MODEL переопределять нельзя: их
+    используют оркестрация, harness и остальные инструменты. Профиль включается правкой
+    lock.yaml (enabled: true) или TELLSCOPE_TEXTS_BULK=true; mlops.lock читает секцию через
+    read_lock_fresh, поэтому переключатель работает без перезапуска приложения.
+    """
     try:
+        from mlops.lock import texts_bulk_cfg
+
+        cfg = texts_bulk_cfg() or {}
+    except Exception:
+        return {}
+    if not cfg.get("enabled"):
+        return {}
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(cfg.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "vllm_cfg": cfg,
+        "model": str(cfg.get("model") or ""),
+        "base_url": str(cfg.get("base_url") or ""),
+        "max_tokens": _int("max_tokens", BATCH_MAX_TOKENS),
+        "batch_size": _int("batch_size", BATCH_SIZE),
+        "parallel": _int("parallel_batches", PARALLEL_BATCHES),
+        "fallback": bool(cfg.get("fallback_to_generate", True)),
+    }
+
+
+def _gateway_model_label(bulk: Optional[Dict[str, Any]] = None) -> str:
+    """Честная подпись модели чтения: быстрая 4B, когда её профиль включён, иначе общий 32B."""
+    try:
+        if bulk and bulk.get("model"):
+            return f"{bulk['model']} (vLLM, локально, без оплаты)"
         from mlops.lock import generate_cfg
 
         model = str((generate_cfg() or {}).get("model") or "").strip()
@@ -672,30 +714,102 @@ async def _cancel_watcher(ctx, tasks: List[Any]) -> None:
 
 # ------------------------------------------------------------- разбор пачек моделью
 
-async def _run_batch(ctx, number: int, total: int, scope: str, focus: str, batch: List[str]) -> Dict[str, Any]:
-    """Один вызов локальной модели по пачке сообщений. Две попытки, ответ — строго JSON."""
-    prompt = BATCH_INSTRUCTION.format(
-        scope=scope,
-        focus=focus,
-        categories=", ".join(CATEGORY_FRAMEWORK),
-        messages="\n".join(batch),
-    )
+async def _run_batch(ctx, number: int, total: int, scope: str, focus: str, batch: List[str],
+                     bulk: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Один вызов локальной модели по пачке сообщений; ответ — строго JSON.
+
+    Обрыв по лимиту генерации раньше проходил незамеченным: JSON оставался незакрытым,
+    _extract_json возвращал первый вложенный объект, и пачка «читалась успешно» без единой темы.
+    Теперь finish_reason виден (finish_reason="length"), обрезанная пачка делится пополам и
+    повторяется, а если не разобралась и после дробления — шаг честно сообщает об ошибке.
+    """
+    cfg = (bulk or {}).get("vllm_cfg")
+    max_tokens = int((bulk or {}).get("max_tokens") or BATCH_MAX_TOKENS)
+    max_depth = 2 if len(batch) > 4 else 1
     tokens = 0
-    last_error = ""
-    for attempt in (1, 2):
+    errors: List[str] = []
+    splits: List[str] = []
+    state: Dict[str, Any] = {"model": "", "fallback": 0}
+
+    async def _read(lines: List[str], depth: int) -> List[Dict[str, Any]]:
+        nonlocal tokens
+        prompt = BATCH_INSTRUCTION.format(
+            scope=scope,
+            focus=focus,
+            categories=", ".join(CATEGORY_FRAMEWORK),
+            messages="\n".join(lines),
+        )
+        # Сначала профиль быстрого чтения (если включён), затем общий vLLM: недоступный
+        # порт 8001 не должен останавливать разбор — откат на 32B обязателен.
+        candidates: List[Any] = [cfg, None] if cfg else [None]
+        last_error = ""
+        for attempt in range(2 if depth else 1):
+            for vllm_cfg in candidates:
+                meta: Dict[str, Any] = {}
+                try:
+                    text, used = await _qwen(
+                        ctx, prompt, system=BATCH_SYSTEM, max_tokens=max_tokens,
+                        vllm_cfg=vllm_cfg, meta=meta,
+                    )
+                    tokens += used
+                except Exception as exc:  # noqa: BLE001 — пачка не должна ломать весь разбор
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    if vllm_cfg is not None:
+                        state["fallback"] += 1
+                        await ctx.log(
+                            f"Быстрая модель чтения не ответила ({last_error[:140]}) — "
+                            f"читаю пачку {number} на общей модели",
+                            level="error",
+                        )
+                    continue
+                if vllm_cfg is not None and meta.get("model"):
+                    state["model"] = str(meta["model"])
+                finish = str(meta.get("finish_reason") or "")
+                parsed = _extract_json(text)
+                if parsed and isinstance(parsed.get("topics"), list) and finish != "length":
+                    return [parsed]
+                if finish == "length":
+                    last_error = (
+                        f"ответ обрезан по лимиту {max_tokens} токенов (finish_reason=length)"
+                    )
+                    break
+                last_error = "в ответе нет списка topics — повторили с напоминанием про JSON"
+                prompt = prompt + "\n\nНапоминаю: ответ — только JSON, без текста вокруг."
+        raise ToolError(last_error or "нет ответа модели")
+
+    async def _read_split(lines: List[str], depth: int) -> "Tuple[List[Dict[str, Any]], int]":
+        """Читает пачку; при обрыве делит её пополам. Возвращает (разборы, сколько прочитано)."""
         try:
-            text, used = await _qwen(ctx, prompt, system=BATCH_SYSTEM, max_tokens=BATCH_MAX_TOKENS)
-            tokens += used
-            parsed = _extract_json(text)
-            if parsed:
-                await ctx.log(f"Пачка {number}/{total}: разобрано тем {len(parsed.get('topics') or [])}")
-                return {"ok": True, "parsed": parsed, "tokens": tokens}
-            last_error = "модель вернула ответ без JSON"
-            prompt = prompt + "\n\nНапоминаю: ответ — только JSON, без текста вокруг."
-        except Exception as exc:  # noqa: BLE001 — пачка не должна ломать весь разбор
-            last_error = f"{type(exc).__name__}: {exc}"
-    await ctx.log(f"Пачка {number}/{total} не разобрана: {last_error}", level="error")
-    return {"ok": False, "error": last_error, "tokens": tokens}
+            return await _read(lines, depth), len(lines)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{len(lines)} сообщений: {exc}")
+            if len(lines) <= 2 or depth >= max_depth:
+                return [], 0
+            half = len(lines) // 2
+            splits.append(f"{len(lines)}\u2192{half}+{len(lines) - half}")
+            parsed: List[Dict[str, Any]] = []
+            read = 0
+            for part in (lines[:half], lines[half:]):
+                got, done = await _read_split(part, depth + 1)
+                parsed.extend(got)
+                read += done
+            return parsed, read
+
+    parsed_list, read = await _read_split(batch, 0)
+    if not parsed_list:
+        message = "; ".join(errors[:2]) or "нет ответа модели"
+        await ctx.log(f"Пачка {number}/{total} не разобрана: {message}", level="error")
+        return {"ok": False, "error": message, "tokens": tokens, "read": 0,
+                "model": state["model"], "fallback": state["fallback"]}
+    topics_count = sum(len(item.get("topics") or []) for item in parsed_list)
+    detail = f"Пачка {number}/{total}: разобрано тем {topics_count}"
+    if splits:
+        detail += f" (пачка делилась: {', '.join(splits)})"
+    if errors:
+        detail += f"; не разобрано: {'; '.join(errors[:2])}"
+    await ctx.log(detail)
+    return {"ok": True, "parsed": parsed_list, "tokens": tokens, "read": read,
+            "partial": bool(errors), "model": state["model"], "fallback": state["fallback"]}
 
 
 # ------------------------------------------------------------------ склейка результата
@@ -1018,8 +1132,13 @@ async def analyze_texts(
 
     # Служебный параметр (нет в схеме инструмента): сколько пачек читать одновременно.
     # Нужен для замеров и тонкой настройки под нагрузку vLLM.
-    parallel_batches = max(1, min(int(parallel or PARALLEL_BATCHES), MAX_BATCHES))
+    # Профиль быстрого чтения: своя модель, своя пачка и свой параллелизм (по умолчанию 8).
+    bulk = _bulk_profile()
+    parallel_batches = max(1, min(int(parallel or bulk.get("parallel") or PARALLEL_BATCHES), MAX_BATCHES))
 
+    if bulk.get("batch_size") and int(batch_size or 0) == BATCH_SIZE:
+        # Профиль может задать свой размер пачки; явно переданный аргумент важнее профиля.
+        batch_size = int(bulk["batch_size"])
     batch_size = max(MIN_BATCH_SIZE, min(int(batch_size or BATCH_SIZE), MAX_BATCH_SIZE))
     requested_limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_MESSAGES))
     limit = requested_limit
@@ -1092,7 +1211,12 @@ async def analyze_texts(
     negative = sum(1 for doc in docs_by_id.values() if doc.get("tone_mark") == -1)
     positive = sum(1 for doc in docs_by_id.values() if doc.get("tone_mark") == 1)
     neutral = sum(1 for doc in docs_by_id.values() if doc.get("tone_mark") == 0)
-    model_label = _gateway_model_label()
+    model_label = _gateway_model_label(bulk)
+    if bulk:
+        await ctx.log(
+            f"Быстрое чтение включено: {bulk.get('model')} ({bulk.get('base_url')}), "
+            f"пачка {batch_size}, параллельно {parallel_batches}, лимит генерации {bulk.get('max_tokens')}"
+        )
     await ctx.log(
         f"Чтение текстов: {selected} сообщений, {len(batches)} пачек, модель {model_label}. "
         f"Тональность среза: негатив {negative}, нейтрал {neutral}, позитив {positive}"
@@ -1135,14 +1259,15 @@ async def analyze_texts(
         async with semaphore:
             ctx.check_cancelled()
             await ctx.wait_if_paused()
-            outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines)
+            outcome = await _run_batch(ctx, number, len(batches), scope, focus_text, lines, bulk)
         tokens_used += int(outcome.get("tokens") or 0)
         results.append(outcome)
         done_ok = bool(outcome.get("ok"))
         batches_done += 1
         if done_ok:
-            # Считаем прочитанным только то, что модель действительно разобрала.
-            read_done = min(selected, read_done + len(batch))
+            # Считаем прочитанным только то, что модель действительно разобрала: у обрезанной
+            # пачки после дробления это меньше её исходного размера.
+            read_done = min(selected, read_done + int(outcome.get("read") or len(batch)))
         if tracker is not None:
             batches_ok = len([item for item in results if item.get("ok")])
             detail = (
@@ -1196,17 +1321,35 @@ async def analyze_texts(
             units_total=len(batches),
             units_parallel=parallel_batches,
         )
-    parsed_batches = [item["parsed"] for item in results if item.get("ok")]
+    parsed_batches = [parsed for item in results if item.get("ok") for parsed in (item.get("parsed") or [])]
     failed = len([item for item in results if not item.get("ok")])
+    reading_models = sorted({str(item.get("model") or "").strip() for item in results
+                             if str(item.get("model") or "").strip()})
+    fallback_batches = sum(int(item.get("fallback") or 0) for item in results)
     if not parsed_batches:
         raise ToolError(
             "Локальная модель не разобрала ни одну пачку сообщений — повторите запуск позже "
             "или уменьшите limit"
         )
 
-    total_read = selected
+    # «Прочитано» — ровно то, что модель разобрала, а не размер выборки.
+    total_read = min(selected, read_done) or selected
     merged = _merge(parsed_batches, docs_by_id, total_read)
     topics, categories, highlights = merged["topics"], merged["categories"], merged["highlights"]
+    if total_read and not topics:
+        # Непустое «прочитано N» при пустых темах — провал шага, а не успешный разбор: раньше
+        # такой запуск закрывался отчётом без тем и цитат (JSON обрезался по лимиту генерации,
+        # разборщик возвращал вложенный объект вместо корня).
+        raise ToolError(
+            f"Прочитано {total_read} сообщений, но модель не выделила ни одной темы с цитатами — "
+            "разбор недействителен. Повторите запуск; если повторяется, уменьшите batch_size "
+            f"(сейчас {batch_size}) или поднимите лимит генерации (сейчас {BATCH_MAX_TOKENS})."
+        )
+    if total_read and not any(row.get("quotes") for row in topics):
+        raise ToolError(
+            f"Прочитано {total_read} сообщений и выделено тем: {len(topics)}, но ни одной цитаты — "
+            "разбор недействителен, повторите запуск."
+        )
 
     tone_note = f"негатив {negative}, нейтрал {neutral}, позитив {positive}"
     digest_topics = "\n".join(
@@ -1296,6 +1439,11 @@ async def analyze_texts(
     )
     if failed:
         scope_note += f" Не разобрано пачек: {failed}."
+    if fallback_batches:
+        scope_note += (
+            f" Часть пачек ({fallback_batches}) прочитана на общей модели: быстрая модель чтения "
+            "не отвечала."
+        )
 
     engagement_available = bool(found.get("engagement_available"))
     engagement_fields = found.get("engagement_fields") or []
@@ -1350,6 +1498,8 @@ async def analyze_texts(
             "highlights": len(highlights),
             "seconds": seconds,
             "model": model_label,
+            "models": reading_models,
+            "fallback_batches": fallback_batches,
             "local_model_tokens": tokens_used,
             "cost_usd": 0.0,
             "importance_basis": docs[0].get("importance_basis") if docs else "",

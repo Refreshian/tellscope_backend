@@ -89,8 +89,16 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
-async def _qwen(ctx, prompt: str, *, system: str = "", max_tokens: int = BATCH_MAX_TOKENS, temperature: float = 0.15) -> Tuple[str, int]:
-    """Один вызов локальной модели. Возвращает (текст, потраченные токены)."""
+async def _qwen(ctx, prompt: str, *, system: str = "", max_tokens: int = BATCH_MAX_TOKENS,
+                temperature: float = 0.15, vllm_cfg: Optional[dict] = None,
+                meta: Optional[Dict[str, Any]] = None) -> Tuple[str, int]:
+    """Один вызов локальной модели. Возвращает (текст, потраченные токены).
+
+    vllm_cfg — явный профиль vLLM (быстрое чтение пачек на 127.0.0.1:8001); None — общий
+    generate_cfg (Qwen3-32B, 8000), то есть поведение прежних вызовов не меняется.
+    meta — необязательный словарь, куда кладём finish_reason и модель ответа: по
+    finish_reason="length" вызывающий видит, что ответ обрезан лимитом генерации.
+    """
     gateway = _gateway()
     messages = []
     if system:
@@ -104,7 +112,11 @@ async def _qwen(ctx, prompt: str, *, system: str = "", max_tokens: int = BATCH_M
         timeout=420,
         extra=dict(THINK_OFF),
         profile="agent",
+        vllm_cfg=vllm_cfg,
     )
+    if meta is not None:
+        meta["finish_reason"] = str(getattr(result, "finish_reason", "") or "")
+        meta["model"] = str(getattr(result, "model", "") or "")
     raw = getattr(result, "raw", None) or {}
     usage = raw.get("usage") or {}
     try:

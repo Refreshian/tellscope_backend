@@ -116,3 +116,52 @@ pricing:
     deepseek-chat-v3.1:
       in: 0.27
       out: 1.1
+
+# Быстрое чтение текстов пачками: отдельный профиль vLLM для инструмента analyze_texts
+# (agent_engine/tools_text.py через agent_engine/tools_llm.py::_qwen).
+# Оркестрация, harness, dashboard_qa и остальные инструменты остаются на generate
+# (Qwen3-32B-FP8, порт 8000) — VLLM_BASE_URL переопределять нельзя, он общий.
+# Инстанс: /home/docker/vllm/fast-reader.sh {start|stop|restart|status},
+# контейнер vllm-fast-reader, GPU 0, слушает только 127.0.0.1:8001.
+# Секция читается на каждый запуск (read_lock_fresh), рестарт приложения не нужен:
+#   enabled: false          — чтение как раньше, пачками на 32B;
+#   fallback_to_generate    — 8001 не отвечает: пачка честно читается на 32B,
+#                             запуск не падает и в отчёте видно, что был откат.
+texts_bulk:
+  provider: vllm
+  model: qwen3-4b-fast
+  base_url: http://127.0.0.1:8001
+  enabled: true
+  fallback_to_generate: true
+  max_tokens: 3000
+  batch_size: 20
+  parallel_batches: 8
+  max_model_len: 16384
+  gpu: "0"
+  container: vllm-fast-reader
+  compose: /home/docker/vllm/docker-compose-fast-reader-gpu0.yml
+
+# Пороги адаптивного чтения текстов (agent_engine/tools_text.py):
+#   warn_read_limit      — с этого размера срез читается целиком, но в прогрессе видно,
+#                          что это долго (замер: ~2 250 сообщений за 5 минут на 12 параллельно);
+#   full_read_limit      — до этого размера читаем ВЕСЬ срез целиком быстрой моделью;
+#   cluster_min_messages — свыше этого размера весь корпус читать бессмысленно: считаем кластеры
+#                          по всему корпусу (эмбеддинги проекта + BERTopic-подход) и читаем
+#                          представителей кластеров и самые значимые сообщения, а частоты тем
+#                          в отчёте берём по всему корпусу;
+#   cluster_read_limit   — сколько представителей всего отправляем модели;
+#   cluster_per_cluster  — сколько представителей берём из одного кластера;
+#   cluster_min_size     — минимальный размер кластера HDBSCAN;
+#   cluster_max          — сколько кластеров максимум попадает в отчёт;
+#   cluster_embed_batch  — размер пачки при расчёте эмбеддингов корпуса.
+# Переопределение окружением: TELLSCOPE_TEXTS_FULL_LIMIT, TELLSCOPE_TEXTS_WARN_LIMIT,
+# TELLSCOPE_TEXTS_CLUSTER_MIN, TELLSCOPE_TEXTS_CLUSTER_READ.
+texts:
+  warn_read_limit: 5000
+  full_read_limit: 20000
+  cluster_min_messages: 20000
+  cluster_read_limit: 600
+  cluster_per_cluster: 8
+  cluster_min_size: 30
+  cluster_max: 40
+  cluster_embed_batch: 64

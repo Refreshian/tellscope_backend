@@ -98,10 +98,13 @@ def _build_request(
     max_tokens: int | None,
     extra: dict | None,
     profile: str,
+    vllm_cfg: dict | None = None,
 ) -> tuple[str, dict, dict, str]:
     extra = dict(extra or {})
     if provider == "vllm":
-        cfg = generate_cfg()
+        # vllm_cfg — явный профиль vLLM (например, быстрое чтение на 127.0.0.1:8001).
+        # По умолчанию None: поведение всех существующих вызовов не меняется.
+        cfg = vllm_cfg or generate_cfg()
         url = f"{cfg['base_url']}/v1/chat/completions"
         model_id = model or cfg["model"]
         headers: dict = {}
@@ -188,10 +191,14 @@ def chat(
     timeout: float = 180,
     extra: dict | None = None,
     profile: str = "dashboard_qa",
+    vllm_cfg: dict | None = None,
 
     usage_ctx: dict | None = None,
 ) -> ChatResult:
-    """OpenAI-compatible chat.completions. `provider` is vllm | aitunnel."""
+    """OpenAI-compatible chat.completions. `provider` is vllm | aitunnel.
+
+    vllm_cfg — необязательный явный профиль vLLM (адрес/модель); None — общий generate_cfg.
+    """
     started = time.perf_counter()
     ok = False
     try:
@@ -203,6 +210,7 @@ def chat(
             max_tokens=max_tokens,
             extra=extra,
             profile=profile,
+            vllm_cfg=vllm_cfg,
         )
         try:
             with httpx.Client(timeout=_timeout(timeout)) as client:
@@ -249,10 +257,14 @@ async def achat(
     timeout: float = 180,
     extra: dict | None = None,
     profile: str = "dashboard_qa",
+    vllm_cfg: dict | None = None,
 
     usage_ctx: dict | None = None,
 ) -> ChatResult:
-    """Async variant of chat() for FastAPI llm-run / smart-agent."""
+    """Async variant of chat() for FastAPI llm-run / smart-agent.
+
+    vllm_cfg — необязательный явный профиль vLLM (адрес/модель); None — общий generate_cfg.
+    """
     started = time.perf_counter()
     ok = False
     try:
@@ -264,6 +276,7 @@ async def achat(
             max_tokens=max_tokens,
             extra=extra,
             profile=profile,
+            vllm_cfg=vllm_cfg,
         )
         client = await _get_async_client()
         try:

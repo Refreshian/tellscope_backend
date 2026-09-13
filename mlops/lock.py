@@ -50,6 +50,98 @@ def embed_cfg() -> dict:
     }
 
 
+# --- Быстрое чтение текстов пачками: отдельный профиль vLLM (agent_engine/tools_text.py).
+# VLLM_BASE_URL/VLLM_MODEL трогать нельзя: этот профиль используют оркестрация (loop, harness,
+# pipeline, mlops/orchestrator), dashboard_qa, ai_bot_rag и author_graph — они обязаны остаться
+# на Qwen3-32B (порт 8000). Массовому чтению пачек нужен свой адрес и своя модель.
+_TRUTHY = ("1", "true", "yes", "on", "да")
+
+
+def _as_flag(value: Any) -> Optional[bool]:
+    """True/False для переключателя, None — «не задано» (тогда решает lock.yaml)."""
+    if value in (None, ""):
+        return None
+    return str(value).strip().lower() in _TRUTHY
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def texts_bulk_cfg() -> dict:
+    """Профиль быстрого чтения текстов пачками (секция texts_bulk в lock.yaml).
+
+    Окружение приоритетнее файла, а файл читается на каждый вызов (read_lock_fresh), поэтому
+    переключатель enabled меняется на ходу — без рестарта приложения. Пустые base_url/model или
+    enabled=false означают, что профиль выключен и чтение идёт на общем 32B.
+    """
+    lock = read_lock_fresh().get("texts_bulk") or {}
+    if not isinstance(lock, dict):
+        lock = {}
+    enabled = _as_flag(os.environ.get("TELLSCOPE_TEXTS_BULK"))
+    if enabled is None:
+        enabled = bool(lock.get("enabled", False))
+    fallback = _as_flag(os.environ.get("TELLSCOPE_TEXTS_FALLBACK"))
+    if fallback is None:
+        fallback = bool(lock.get("fallback_to_generate", True))
+    base_url = (os.environ.get("TELLSCOPE_TEXTS_BASE_URL") or lock.get("base_url") or "").rstrip("/")
+    model = os.environ.get("TELLSCOPE_TEXTS_MODEL") or str(lock.get("model") or "")
+    return {
+        **lock,
+        "provider": str(lock.get("provider") or "vllm"),
+        "model": model,
+        "base_url": base_url,
+        "enabled": bool(enabled and base_url and model),
+        "fallback_to_generate": fallback,
+        "max_tokens": _as_int(os.environ.get("TELLSCOPE_TEXTS_MAX_TOKENS") or lock.get("max_tokens"), 3000),
+        "batch_size": _as_int(os.environ.get("TELLSCOPE_TEXTS_BATCH_SIZE") or lock.get("batch_size"), 20),
+        "parallel_batches": _as_int(os.environ.get("TELLSCOPE_TEXTS_PARALLEL") or lock.get("parallel_batches"), 8),
+        "lock_path": str(lock_file_path() or ""),
+    }
+
+
+def texts_cfg() -> dict:
+    """Пороги адаптивного чтения текстов (секция texts в lock.yaml); окружение приоритетнее.
+
+    warn_read_limit      — с этого размера срез читается целиком, но об этом предупреждаем;
+    full_read_limit      — до этого размера читаем весь срез целиком (быстрой моделью);
+    cluster_min_messages — свыше этого размера читать весь корпус бессмысленно: считаем кластеры
+                           по всему корпусу и читаем представителей и самые значимые сообщения.
+    """
+    lock = read_lock_fresh().get("texts") or {}
+    if not isinstance(lock, dict):
+        lock = {}
+    defaults = {
+        "warn_read_limit": 5000,
+        "full_read_limit": 20000,
+        "cluster_min_messages": 20000,
+        "cluster_read_limit": 600,
+        "cluster_per_cluster": 8,
+        "cluster_min_size": 30,
+        "cluster_max": 40,
+        "cluster_embed_batch": 64,
+    }
+    env_keys = {
+        "warn_read_limit": "TELLSCOPE_TEXTS_WARN_LIMIT",
+        "full_read_limit": "TELLSCOPE_TEXTS_FULL_LIMIT",
+        "cluster_min_messages": "TELLSCOPE_TEXTS_CLUSTER_MIN",
+        "cluster_read_limit": "TELLSCOPE_TEXTS_CLUSTER_READ",
+        "cluster_per_cluster": "TELLSCOPE_TEXTS_CLUSTER_PER",
+        "cluster_min_size": "TELLSCOPE_TEXTS_CLUSTER_MIN_SIZE",
+        "cluster_max": "TELLSCOPE_TEXTS_CLUSTER_MAX",
+        "cluster_embed_batch": "TELLSCOPE_TEXTS_CLUSTER_EMBED_BATCH",
+    }
+    out = {key: _as_int(os.environ.get(env_keys[key]) or lock.get(key), default)
+           for key, default in defaults.items()}
+    if out["cluster_min_messages"] < out["full_read_limit"]:
+        # Граница «весь корпус против кластеризации» не может быть ниже границы полного чтения.
+        out["cluster_min_messages"] = out["full_read_limit"]
+    return out
+
+
 def external_cfg(profile: str = "dashboard_qa") -> dict:
     lock = load_lock().get("external") or {}
     profiles = lock.get("profiles") or {}
