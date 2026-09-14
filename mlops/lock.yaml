@@ -163,8 +163,8 @@ texts_bulk:
 # Переопределение окружением: TELLSCOPE_TEXTS_WARN_LIMIT, TELLSCOPE_TEXTS_FULL_LIMIT,
 # TELLSCOPE_TEXTS_CLUSTER_MIN, TELLSCOPE_TEXTS_CLUSTER_READ, TELLSCOPE_TEXTS_CLUSTER_PER и др.
 texts:
-  warn_read_limit: 500        # до 500 — читаем целиком молча
-  long_read_limit: 5000       # 500–5 000 — целиком, с предупреждением о длительности
+  warn_read_limit: 5000       # с этого размера срез читается целиком, но это долго
+  long_read_limit: 5000       # равен warn_read_limit: отдельной ступени 500 нет
   full_read_limit: 20000      # 5 000–20 000 — целиком, с явным предупреждением, что это долго
   cluster_min_messages: 20000 # больше 20 000 — кластеры по всему корпусу + чтение выборки
   # Размер читаемой выборки на большом срезе: тысячи сообщений, а не десятки.
