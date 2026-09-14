@@ -106,6 +106,43 @@ def _pretty_topic_name(value: Any) -> str:
     return name
 
 
+RU_MONTH_WORDS = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6, "июл": 7,
+    "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+}
+EN_MONTH_WORDS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _period_key_from_text(*values: Any) -> str:
+    """Ключ периода ГГГГ-ММ из текста отчёта, когда в контексте периода нет.
+
+    Цепочки и часть прогонов не передают период, и итог назывался по текущей дате
+    (февральский отчёт сохранялся как 2026-09_summary.json). Поэтому ищем месяц и год в
+    названии отчёта, папке и заголовках разделов: «за февраль 2026», «feb 2026», «02.2026».
+    """
+    haystack = " ".join(str(value or "") for value in values).lower().replace("ё", "е")
+    if not haystack.strip():
+        return ""
+    for word, month in RU_MONTH_WORDS.items():
+        match = re.search(word + r"[а-я]*\s*[._-]?\s*(20\d{2})", haystack)
+        if match:
+            return "%s-%02d" % (match.group(1), month)
+    for word, month in EN_MONTH_WORDS.items():
+        match = re.search(r"\b" + word + r"[a-z]*[._\s-]*(20\d{2})", haystack)
+        if match:
+            return "%s-%02d" % (match.group(1), month)
+    match = re.search(r"\b(20\d{2})[._-](\d{2})\b", haystack)
+    if match and 1 <= int(match.group(2)) <= 12:
+        return "%s-%s" % (match.group(1), match.group(2))
+    match = re.search(r"\b(\d{2})[.\-/](20\d{2})\b", haystack)
+    if match and 1 <= int(match.group(1)) <= 12:
+        return "%s-%s" % (match.group(2), match.group(1))
+    return ""
+
+
 def _topic_period(name: Any) -> str:
     """Период из имени датасета по-русски: '13 мая 2024 — 22 сентября 2026'. Нет периода — пусто."""
     match = PERIOD_RE.search(str(name or ""))
@@ -1185,7 +1222,11 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "to": period_to,
             "from_ts": getattr(ctx, "min_date", None),
             "to_ts": getattr(ctx, "max_date", None),
-            "key": _period_key(period_from, period_to),
+            "key": _period_key(
+                period_from, period_to,
+                _period_key_from_text(title, folder_name,
+                                      *(str(s.get("heading") or "") for s in sections)),
+            ),
         },
         "messages": {
             "in_slice": total,

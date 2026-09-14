@@ -130,6 +130,26 @@ async def _run_tool_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> 
     if spec is None:
         return {"ok": False, "error": f"инструмент {name} не найден"}
     args = render(step.get("args") or {}, ctx, results)
+    # Модель, собирая цепочку, иногда кладёт в аргументы литерал вместо значения (например
+    # "index": "search.index") — тогда каждый инструмент падает с «Тема не найдена», и месяц
+    # закрывался за 20 секунд без анализа. Если index не номер и не известное имя темы, убираем
+    # его и подставляем датасет из контекста.
+    if isinstance(args, dict) and args.get("index") not in (None, ""):
+        raw_index = str(args.get("index")).strip()
+        keep = raw_index.lstrip("-").isdigit()
+        if not keep:
+            try:
+                from .tools_data import _match_dataset
+
+                keep = _match_dataset(raw_index) is not None
+            except Exception:
+                keep = False
+        if not keep:
+            await ctx.log(
+                f"Шаг «{step.get('tool')}»: аргумент index={raw_index!r} не является темой — "
+                "беру датасет из задачи"
+            )
+            args.pop("index", None)
     if ctx.dataset_index is not None and "index" not in (args or {}):
         args["index"] = ctx.dataset_index
     if ctx.min_date and "min_date" not in (args or {}):
