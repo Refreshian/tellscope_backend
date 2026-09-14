@@ -740,6 +740,124 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
     }
 
 
+# ------------------------------------------------- слияние одинаковых тем и названия по содержимому
+# Названия тем приходят из двух источников (модель и готовые метки датасета) и почти всегда
+# расходятся в мелочах: «качество еды» и «Качество еды», «закрытие ресторанов» и «закрытие
+# ресторанов ростикс». Без слияния в отчёте получаются темы-близнецы с половинными частотами,
+# поэтому все строки тем проходят нормализацию и объединение.
+
+TOPIC_STOP = {"и", "в", "во", "на", "с", "со", "по", "за", "из", "от", "для", "о", "об", "про",
+              "не", "но", "а", "же", "ли", "бы", "что", "как", "это", "все", "весь", "тема",
+              "темы", "другое", "прочее", "сообщения", "сообщение", "обсуждение", "отзывы"}
+TOPIC_SYNONYMS = {
+    "ростикс": "rostics", "ростик": "rostics", "ростикса": "rostics", "rostics": "rostics",
+    "rostic": "rostics", "ростиксу": "rostics",
+    "кфс": "kfc", "kfc": "kfc", "кфц": "kfc",
+    "бургер": "burger", "бургеры": "burger", "бургеров": "burger",
+    "закрытие": "close", "закрытия": "close", "закрыли": "close", "закрылся": "close",
+    "закрылась": "close", "закрываются": "close", "закрытий": "close",
+    "ресторан": "restaurant", "рестораны": "restaurant", "ресторанов": "restaurant",
+    "ресторана": "restaurant", "ресторане": "restaurant", "точка": "restaurant",
+    "качество": "quality", "качества": "quality", "качестве": "quality",
+    "еда": "food", "еды": "food", "еде": "food", "еду": "food", "продукт": "food",
+    "продукты": "food", "продуктов": "food", "продукции": "food",
+    "доставка": "delivery", "доставки": "delivery", "доставку": "delivery",
+    "цены": "price", "цена": "price", "цен": "price", "стоимость": "price",
+    "сервис": "service", "обслуживание": "service", "поддержка": "service",
+}
+
+
+def _topic_stem(word: str) -> str:
+    """Грубая основа слова: срезаем падежные окончания, чтобы «еды» и «еда» сходились."""
+    value = str(word or "").lower().replace("ё", "е").strip()
+    if value in TOPIC_SYNONYMS:
+        return TOPIC_SYNONYMS[value]
+    for suffix in ("иями", "ями", "ами", "ов", "ев", "ий", "ый", "ой", "ые", "ая", "ое", "ие",
+                   "ах", "ях", "ам", "ям", "ом", "ем", "ей", "ии", "ия", "ю", "я", "ы", "и",
+                   "а", "о", "е", "у", "ь"):
+        if len(value) - len(suffix) >= 4 and value.endswith(suffix):
+            value = value[: -len(suffix)]
+            break
+    return TOPIC_SYNONYMS.get(value, value)
+
+
+def _topic_key(name: Any) -> frozenset:
+    """Ключ темы: набор основ значимых слов, независимо от регистра и порядка слов."""
+    text = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ\s-]+", " ", str(name or "").lower().replace("ё", "е"))
+    stems = {_topic_stem(word) for word in text.split()}
+    stems = {stem for stem in stems if stem and stem not in TOPIC_STOP and len(stem) >= 3}
+    return frozenset(stems)
+
+
+def _merge_similar_rows(rows: List[Dict[str, Any]], total: int) -> List[Dict[str, Any]]:
+    """Объединяет темы-близнецы и близкие кластеры, суммируя частоты и пересчитывая доли.
+
+    Объединяем, если наборы основ совпадают, один вложен в другой («закрытие ресторанов» внутри
+    «закрытие ресторанов ростикс») или пересечение наборов значимо (Jaccard >= 0.6). Для кластеров
+    дополнительно смотрим пересечение состава сообщений: если у двух кластеров больше 40% общих
+    сообщений, это одна тема, как бы она ни называлась.
+    """
+    merged: List[Dict[str, Any]] = []
+    for row in rows:
+        key = _topic_key(row.get("topic"))
+        members = row.get("_members")
+        target = None
+        for candidate in merged:
+            other = candidate["_key"]
+            if key and other:
+                union = len(key | other)
+                inter = len(key & other)
+                if key == other or (key <= other) or (other <= key) or (union and inter / union >= 0.6):
+                    target = candidate
+                    break
+            if members and candidate.get("_members"):
+                other_members = candidate["_members"]
+                smaller = min(len(members), len(other_members)) or 1
+                if len(members & other_members) / float(smaller) >= 0.4:
+                    target = candidate
+                    break
+        if target is None:
+            row = dict(row)
+            row["_key"] = key
+            row["_members"] = set(members or ())
+            merged.append(row)
+            continue
+        count_before, count_new = int(target.get("count") or 0), int(row.get("count") or 0)
+        total_count = count_before + count_new
+        target["count"] = total_count
+        if len(str(row.get("topic") or "")) > len(str(target.get("topic") or "")):
+            # Оставляем более полное название: «закрытие ресторанов ростикс» понятнее, чем «закрытие».
+            target["topic"] = row.get("topic")
+        target["_key"] = target["_key"] | key
+        target["_members"] = set(target.get("_members") or set()) | set(members or ())
+        for quote in row.get("quotes") or []:
+            if quote not in (target.get("quotes") or []):
+                (target.setdefault("quotes", [])).append(quote)
+        target["msg_ids"] = list(dict.fromkeys(list(target.get("msg_ids") or []) + list(row.get("msg_ids") or [])))
+        if not target.get("essence") and row.get("essence"):
+            target["essence"] = row["essence"]
+        if count_before and count_new:
+            target["importance"] = round(
+                (float(target.get("importance") or 0) * count_before
+                 + float(row.get("importance") or 0) * count_new) / total_count, 2)
+        for source in (row,):
+            if source.get("tone") and source.get("tone") not in ("—", ""):
+                tones = [target.get("tone"), source.get("tone")]
+                target["tone"] = target.get("tone") if target.get("tone") == source.get("tone") else "смешанная"
+        target["corpus"] = bool(target.get("corpus") or row.get("corpus"))
+        target["tag_hint"] = target.get("tag_hint") or row.get("tag_hint") or ""
+        target["content_terms"] = list(dict.fromkeys(
+            list(target.get("content_terms") or []) + list(row.get("content_terms") or [])))[:8]
+    for row in merged:
+        row.pop("_key", None)
+        row.pop("_members", None)
+        count = int(row.get("count") or 0)
+        row["share"] = round(count / float(total or 1), 4)
+        row["share_pct"] = round(100.0 * count / float(total or 1), 1)
+    merged.sort(key=lambda item: (-int(item.get("count") or 0), -float(item.get("importance") or 0)))
+    return merged
+
+
 # ------------------------------------------------------------------ кластеризация корпуса
 
 async def _cluster_slice(ctx, index_name: str, query: Dict[str, Any],
@@ -883,6 +1001,10 @@ def _cluster_rows(corpus: Dict[str, Any], merged_topics: List[Dict[str, Any]],
 
     rows: List[Dict[str, Any]] = []
     for cluster in corpus.get("clusters") or []:
+        if cluster.get("noise"):
+            # Шумные кластеры (спам по меткам BA, обрывки текста) в основные темы отчёта не идут —
+            # иначе выводы опирались бы на рекламный мусор.
+            continue
         cluster_id = int(cluster.get("id", -1))
         members = sorted(by_cluster.get(cluster_id) or [],
                          key=lambda item: -float(item.get("importance") or 0))
@@ -897,10 +1019,27 @@ def _cluster_rows(corpus: Dict[str, Any], merged_topics: List[Dict[str, Any]],
                     essence = _flat(row.get("essence"))
                 if name and essence:
                     break
+        content_terms = [str(word) for word in (cluster.get("content_terms") or [])]
+        content_set = {_topic_stem(word) for word in content_terms}
+        if name:
+            # Название, придуманное моделью, принимаем только если оно подтверждается содержимым
+            # кластера: иначе в отчёте появлялись темы вроде «микрофон в распаковке», названные
+            # по одному случайному сообщению из представителей.
+            name_key = {stem for stem in _topic_key(name) if stem}
+            keyword_set = {_topic_stem(word) for word in (cluster.get("keywords") or [])}
+            # Название модели принимаем, если его слова подтверждаются содержимым кластера:
+            # либо его топ-терминами, либо ключевыми словами кластера (тоже по содержимому).
+            if name_key and not (name_key & (content_set | keyword_set)):
+                name = ""
         if not name:
-            name = (str(cluster.get("tag_hint") or "").strip()
-                    or ", ".join(str(word) for word in (cluster.get("keywords") or [])[:4])
-                    or "Кластер %d" % cluster_id)
+            hint = str(cluster.get("tag_hint") or "").strip()
+            hint_key = {stem for stem in _topic_key(hint) if stem}
+            # Метка BA — только подсказка и только когда её слова реально есть в содержимом.
+            if hint and hint_key and (hint_key & content_set):
+                name = hint
+        if not name:
+            name = ", ".join(content_terms[:3]) or "Кластер %d" % cluster_id
+        name = name[:1].upper() + name[1:] if name else name
         count = int(cluster.get("size") or 0)
         rows.append({
             "topic": name,
@@ -921,6 +1060,9 @@ def _cluster_rows(corpus: Dict[str, Any], merged_topics: List[Dict[str, Any]],
             "cluster_id": cluster_id,
             "tag_hint": str(cluster.get("tag_hint") or ""),
             "keywords": list(cluster.get("keywords") or []),
+            "content_terms": list(cluster.get("content_terms") or []),
+            # Состав кластера нужен, чтобы слить кластеры с высокой пересечённостью сообщений.
+            "_members": set(cluster.get("members") or []),
         })
     rows.sort(key=lambda item: (-item["count"], -item["importance"]))
     return rows
@@ -1744,7 +1886,8 @@ async def analyze_texts(
         # бы понять, что тема частая во всём корпусе.
         cluster_rows = _cluster_rows(corpus, merged["topics"], docs_by_id, corpus_total)
         if cluster_rows:
-            topics = cluster_rows
+            # Сливаем кластеры-близнецы (по названию и по составу сообщений), затем строки-дубли.
+            topics = _merge_similar_rows(cluster_rows, corpus_total)
             categories = _categories_from_rows(topics, corpus_total)
 
     if total_read and not topics:
@@ -1958,6 +2101,8 @@ async def analyze_texts(
             "clusters": len(corpus.get("clusters") or []) if corpus else 0,
             "clusters_total": int(corpus.get("clusters_total") or 0) if corpus else 0,
             "cluster_noise": int(corpus.get("noise") or 0) if corpus else 0,
+            "clusters_noise_filtered": len([c for c in (corpus.get("clusters") or []) if c.get("noise")]) if corpus else 0,
+            "topics_merged": len(topics),
             "cluster_tagged_docs": int(corpus.get("tagged") or 0) if corpus else 0,
             "cluster_stages": dict(corpus.get("stages") or {}) if corpus else {},
             "cluster_truncated": bool(corpus.get("truncated")) if corpus else False,

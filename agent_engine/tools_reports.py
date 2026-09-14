@@ -53,6 +53,125 @@ def _reports_dir(user_id: str, folder: str) -> str:
     return path
 
 
+RU_MONTHS = ("января", "февраля", "марта", "апреля", "мая", "июня",
+             "июля", "августа", "сентября", "октября", "ноября", "декабря")
+BRAND_CASE = {
+    "kfc": "KFC", "кфс": "KFC", "rostics": "Rostic's", "rostic": "Rostic's", "ростикс": "Rostic's",
+    "platon": "Platon", "ozon": "Ozon", "ba": "", "brand": "", "analytics": "",
+}
+PERIOD_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})\s*[-—–]\s*(\d{2})\.(\d{2})\.(\d{4})")
+STAMP_RE = re.compile(r"\b20\d{6}(?:[_ ]?\d{4,6})?\b")
+# Технические подробности, которым не место в отчёте: их видит только журнал запуска.
+TECHNICAL_RE = re.compile(
+    r"(\b404\b|\b40[0-9]\b|\b50[0-9]\b|Unexpected Response|doesn'?t exist|\bCollection\b|"
+    r"\bQdrant\b|Traceback|\bHTTP\b|\bTimeout\b|\bException\b|\bError\b|Connection|"
+    r"недоступ\w*|Причина:|коллекц\w*|векторн\w*|traceback)",
+    re.IGNORECASE,
+)
+
+
+def _ru_date(day: str, month: str, year: str) -> str:
+    try:
+        return "%d %s %s" % (int(day), RU_MONTHS[int(month) - 1], year)
+    except Exception:  # noqa: BLE001
+        return "%s.%s.%s" % (day, month, year)
+
+
+def _pretty_topic_name(value: Any) -> str:
+    """Название темы человеческим языком: 'kfc_13.05.2024-22.09.2026' → 'KFC',
+    'ba_озон_отзывы_20260912_150434' → 'Озон отзывы', 'platon_13.10.2025-30.11.2025' → 'Platon'."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    text = PERIOD_RE.sub(" ", raw)
+    text = STAMP_RE.sub(" ", text)
+    text = re.sub(r"[_]+", " ", text)
+    words: List[str] = []
+    for word in re.split(r"\s+", text):
+        cleaned = word.strip(" -–—·,")
+        if not cleaned:
+            continue
+        low = cleaned.lower()
+        if low in BRAND_CASE:
+            prefix = BRAND_CASE[low]
+            if prefix:
+                words.append(prefix)
+            continue
+        if cleaned[:1].isdigit():
+            continue
+        words.append(cleaned[:1].upper() + cleaned[1:])
+    name = " ".join(words).strip()
+    if not name:
+        name = re.sub(r"[_]+", " ", raw).strip()
+    return name
+
+
+def _topic_period(name: Any) -> str:
+    """Период из имени датасета по-русски: '13 мая 2024 — 22 сентября 2026'. Нет периода — пусто."""
+    match = PERIOD_RE.search(str(name or ""))
+    if not match:
+        stamp = re.search(r"\b(20\d{2})(\d{2})(\d{2})\b", str(name or ""))
+        if stamp:
+            return "%d %s %s" % (int(stamp.group(3)), RU_MONTHS[int(stamp.group(2)) - 1], stamp.group(1))
+        return ""
+    day1, mon1, year1, day2, mon2, year2 = match.groups()
+    return "%s — %s" % (_ru_date(day1, mon1, year1), _ru_date(day2, mon2, year2))
+
+
+def topic_header(*values: Any) -> str:
+    """Шапка отчёта: тема + период, если он читается из имени датасета."""
+    name, period = "", ""
+    for value in values:
+        if not name:
+            name = _pretty_topic_name(value)
+        if not period:
+            period = _topic_period(value)
+        if name and period:
+            break
+    if name and period:
+        return "%s %s" % (name, period)
+    return name or period or "—"
+
+
+def _sanitize_report_text(value: Any) -> str:
+    """Убирает из текста отчёта технические сообщения (404, Qdrant, «коллекция не существует»).
+
+    Это служебные подробности: пользователю они не нужны, а в документе выглядят как ошибка.
+    Цитаты сообщений не трогаем — они должны оставаться дословными.
+    """
+    text = str(value or "")
+    if not text:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    kept = [part for part in parts if part.strip() and not TECHNICAL_RE.search(part)]
+    cleaned = " ".join(kept).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
+def _clean_sections(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Чистит пояснительный текст разделов; пустые после чистки разделы без данных убираем."""
+    out: List[Dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section = dict(section)
+        section["text"] = _sanitize_report_text(section.get("text"))
+        if section.get("note"):
+            section["note"] = _sanitize_report_text(section["note"])
+        for key in ("bullets", "items"):
+            if isinstance(section.get(key), list):
+                section[key] = [item for item in (_sanitize_report_text(x) for x in section[key]) if item]
+        for finding in section.get("findings") or []:
+            if isinstance(finding, dict) and finding.get("essence"):
+                finding["essence"] = _sanitize_report_text(finding["essence"])
+        has_data = bool(section.get("findings") or section.get("highlights") or section.get("chart_ids")
+                        or section.get("citations") or section.get("text") or section.get("bullets"))
+        if has_data:
+            out.append(section)
+    return out or sections
+
+
 def _fmt(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:,.2f}".replace(",", " ").replace(".", ",")
@@ -365,7 +484,7 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
         doc.add_paragraph(subtitle)
     info = doc.add_paragraph()
     info.add_run(
-        "Датасет: {dataset}\nПериод: {period}\nПодготовлено: {author}, {date}".format(
+        "Тема: {dataset}\nПериод: {period}\nПодготовлено: {author}, {date}".format(
             dataset=meta.get("dataset_label") or "—",
             period=meta.get("period") or "весь период",
             author=meta.get("author") or "агент Tellscope",
@@ -483,7 +602,7 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any]) ->
             fig.text(
                 0.08,
                 0.90,
-                "Датасет: {d}   |   Период: {p}   |   {a}, {dt}".format(
+                "Тема: {d}   |   Период: {p}   |   {a}, {dt}".format(
                     d=meta.get("dataset_label") or "—",
                     p=meta.get("period") or "весь период",
                     a=meta.get("author") or "агент Tellscope",
@@ -812,13 +931,19 @@ async def build_report(
         from .tools_data import _iso
 
         period = f"{_iso(ctx.min_date) if ctx.min_date else '…'} — {_iso(ctx.max_date) if ctx.max_date else '…'}"
+    # В шапке — тема человеческим языком и её период, а не внутреннее имя выгрузки.
     meta = {
-        "dataset_label": ctx.dataset_label or ctx.dataset_name or "",
+        "dataset_label": topic_header(
+            getattr(ctx, "dataset_label", "") or getattr(ctx, "dataset_name", ""),
+            getattr(ctx, "dataset_name", ""),
+        ),
         "period": period,
         "author": author,
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "charts": ctx.charts,
     }
+    # Из разделов убираем служебные технические сообщения перед сборкой документов.
+    sections = _clean_sections(sections)
     _build_docx(docx_path, str(title), subtitle, sections, meta)
     pdf_ok = True
     pdf_error = ""

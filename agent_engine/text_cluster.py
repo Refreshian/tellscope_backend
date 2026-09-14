@@ -339,6 +339,63 @@ def cluster_matrix(texts: List[str], embeddings: Any, cfg: Dict[str, Any]) -> Di
     }
 
 
+SPAM_TAGS = ("спам", "рекламные посты", "реклама", "промокод")
+WORD_RE = re.compile(r"(?u)\b[а-яёa-z]{4,}\b")
+# Мат и мусорные слова в названии темы недопустимы: отчёт читают люди.
+BANNED = {
+    "блять", "блядь", "бля", "нахуй", "нахуя", "хуй", "хуя", "хую", "хуем", "хуё", "хуе",
+    "пизда", "пиздец", "пизд", "ебать", "ебал", "ебет", "ебут", "ебаный", "ебаная", "еблан",
+    "ахуе", "охуе", "охуенный", "сука", "суки", "мразь", "мудак", "мудила", "гандон", "дерьмо",
+    "жопа", "жопу", "срать", "срал", "говно", "говна", "нахрен", "нахер",
+}
+STOP = set(RU_STOP_WORDS) | BANNED | {
+    "это", "этот", "эта", "эти", "также", "только", "очень", "просто", "вообще", "когда",
+    "чтобы", "который", "которая", "которые", "такой", "такая", "меня", "тебя", "него", "нее",
+    "себе", "себя", "если", "есть", "будет", "было", "были", "надо", "можно", "нельзя", "всё",
+    "тут", "там", "здесь", "сейчас", "потом", "почему", "зачем", "сколько", "даже", "ведь",
+}
+
+
+def content_terms_for_members(docs: List[Dict[str, Any]], members: List[int],
+                              limit: int = 8) -> List[str]:
+    """Топ-термины кластера по СОДЕРЖИМОМУ: считаем слова по всем его сообщениям, а не по
+    прочитанным представителям.
+
+    Нужно, чтобы название темы отражало содержимое кластера: метка BA и название, придуманное
+    моделью по паре сообщений, могут не иметь к кластеру отношения (пример: «микрофон в
+    распаковке» — так назывался кластер, куда попали мемы про микрофон).
+    """
+    counts: Dict[str, int] = {}
+    for pos in members:
+        if pos < 0 or pos >= len(docs):
+            continue
+        text = str(docs[pos].get("text") or "").lower().replace("ё", "е")
+        for word in WORD_RE.findall(text):
+            if word in STOP:
+                continue
+            counts[word] = counts.get(word, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [word for word, _count in ordered[:limit]]
+
+
+def spam_share_for_members(docs: List[Dict[str, Any]], members: List[int]) -> float:
+    """Доля сообщений кластера, которые выглядят как шум: помечены спамом в BA или почти без текста."""
+    if not members:
+        return 0.0
+    noise = 0
+    for pos in members:
+        if pos < 0 or pos >= len(docs):
+            continue
+        doc = docs[pos]
+        tags = [str(tag).strip().lower() for tag in (doc.get("tags") or [])]
+        text = str(doc.get("text") or "")
+        if any(any(bad in tag for bad in SPAM_TAGS) for tag in tags):
+            noise += 1
+        elif len(text) < 25:
+            noise += 1
+    return round(noise / float(len(members)), 3)
+
+
 def tag_hint_for_members(docs: List[Dict[str, Any]], members: List[int], limit: int = 6) -> str:
     """Подсказка для названия кластера: самые частые готовые темы его сообщений."""
     counts: Dict[str, int] = {}
@@ -430,12 +487,19 @@ def cluster_corpus(index_name: str, query: Dict[str, Any], cfg: Dict[str, Any],
             tone_label = TONE_LABELS.get(int(round(tone_avg)), "смешанная")
         else:
             tone_label = "—"
+        content_terms = content_terms_for_members(docs, positions)
+        spam_share = spam_share_for_members(docs, positions)
         clusters.append({
             "id": int(topic_id),
             "size": count,
             "share": round(count / float(total or 1), 4),
             "share_pct": round(100.0 * count / float(total or 1), 1),
             "keywords": result["keywords"].get(int(topic_id)) or [],
+            "content_terms": content_terms,
+            "spam_share": spam_share,
+            # Шумным считаем кластер, где больше половины сообщений — спам по меткам BA или
+            # обрывки без текста: такие темы не должны попадать в основные выводы отчёта.
+            "noise": bool(spam_share >= 0.5 or not content_terms),
             "tag_hint": tag_hint_for_members(docs, positions),
             "tone_avg": tone_avg,
             "tone_label": tone_label,
