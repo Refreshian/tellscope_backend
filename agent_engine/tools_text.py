@@ -1496,14 +1496,18 @@ async def analyze_texts(
     if strategy in ("full", "full_long"):
         limit = max(MIN_USEFUL_LIMIT, min(slice_total or requested_limit, full_read))
     elif strategy == "corpus":
-        # На большом срезе читаем тысячи сообщений: сначала представители всех кластеров,
-        # остаток — самые значимые по вовлечённости. Верхняя граница — cluster_read_limit.
+        # На большом срезе читаем тысячи сообщений: сначала по cluster_per_cluster представителей
+        # каждого кластера, остаток — самые значимые по вовлечённости (это делает _corpus_picks).
+        # Размер выборки задают два ключа, и ни один из них не срезается: берём максимум, поэтому
+        # поднять выборку можно любым из них (cluster_read_limit — основной, cluster_top_messages —
+        # гарантия, что значимых сообщений в выборке не меньше указанного).
         clusters_n = len(corpus.get("clusters") or [])
         limit = max(
-            clusters_n * max(1, int(texts_cfg["cluster_per_cluster"])),
+            int(texts_cfg["cluster_read_limit"]),
             int(texts_cfg["cluster_top_messages"]),
+            clusters_n * max(1, int(texts_cfg["cluster_per_cluster"])),
+            MIN_USEFUL_LIMIT,
         )
-        limit = min(int(texts_cfg["cluster_read_limit"]), max(MIN_USEFUL_LIMIT, limit))
     else:
         limit = max(MIN_USEFUL_LIMIT, min(
             int(texts_cfg["cluster_read_limit"]),
@@ -1627,6 +1631,9 @@ async def analyze_texts(
     reading_started = time.time()
     if tracker is not None:
         waves = -(-len(batches) // max(1, parallel_batches))
+        # Оценка времени — по замеру одной пачки (~20 с на 20 сообщений), а не «волна × 2 мин»:
+        # на выборке в тысячи сообщений прежняя формула давала абсурдные десятки минут.
+        estimate_min = max(1, int(round(waves * 20 / 60.0)))
         await tracker.sub(
             0,
             selected,
@@ -1635,7 +1642,7 @@ async def analyze_texts(
                 (f"читаю выборку значимых сообщений: пачек {len(batches)} по {batch_size}, "
                  if strategy != "full" else
                  f"читаю {selected} сообщений среза: пачек {len(batches)} по {batch_size}, ")
-                + f"{min(parallel_batches, len(batches))} параллельно (обычно ~{waves * 2} мин)"
+                + f"{min(parallel_batches, len(batches))} параллельно (обычно ~{estimate_min} мин)"
             ),
             units_done=0,
             units_total=len(batches),

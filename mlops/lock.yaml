@@ -128,7 +128,7 @@ texts_bulk:
   fallback_to_generate: true
   max_tokens: 3000
   batch_size: 20
-  parallel_batches: 8
+  parallel_batches: 12
   max_model_len: 16384
   gpu: "0"
   container: vllm-fast-reader
@@ -173,7 +173,8 @@ texts:
   # каждого кластера, остаток добираем самыми значимыми сообщениями по вовлечённости.
   cluster_read_limit: 2500
   cluster_per_cluster: 4      # представителей каждого кластера (3–5)
-  cluster_top_messages: 400   # минимум самых значимых по вовлечённости
+  cluster_top_messages: 2500  # минимум самых значимых по вовлечённости (и нижняя граница
+                              # размера выборки: берётся максимум с cluster_read_limit)
   cluster_min_size: 30
   cluster_max: 40
   cluster_embed_batch: 64
