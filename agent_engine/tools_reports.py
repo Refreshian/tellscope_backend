@@ -438,8 +438,9 @@ def _findings_blocks(section: Dict[str, Any]) -> List[str]:
         if item.get("category"):
             head += f", категория: {item.get('category')}"
         blocks.append("• " + head)
-        if item.get("essence"):
-            blocks.append(f"   суть: {item['essence']}")
+        explanation = item.get("essence") or item.get("summary")
+        if explanation:
+            blocks.append(f"   пояснение: {explanation}")
         for quote in (item.get("quotes") or []):
             text = _quote_text(quote)
             if not text:
@@ -503,17 +504,19 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
         findings = _finding_rows(section.get("findings"))
         if findings:
             doc.add_heading("Темы из текстов сообщений", level=2)
-            table = doc.add_table(rows=1, cols=4)
+            table = doc.add_table(rows=1, cols=5)
             table.style = "Light Grid Accent 1"
             header = table.rows[0].cells
-            for cell, label in zip(header, ("Тема", "Сообщений", "Доля среза", "Тональность")):
+            for cell, label in zip(header, ("Тема", "Пояснение", "Сообщений", "Доля среза", "Тональность")):
                 cell.text = label
             for item in findings[:12]:
                 row = table.add_row().cells
                 row[0].text = str(item.get("topic") or "—")
-                row[1].text = _fmt(item.get("count"))
-                row[2].text = _fmt_share(item.get("share")) if item.get("share") is not None else "—"
-                row[3].text = str(item.get("tone") or "—")
+                # Пояснение — от модели (Qwen3-32B): о чём эта тема, без цифр и перечислений.
+                row[1].text = str(item.get("essence") or item.get("summary") or "—")
+                row[2].text = _fmt(item.get("count"))
+                row[3].text = _fmt_share(item.get("share")) if item.get("share") is not None else "—"
+                row[4].text = str(item.get("tone") or "—")
             for item in findings[:12]:
                 topic = str(item.get("topic") or "Тема")
                 head = doc.add_paragraph()
@@ -1114,6 +1117,9 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "tone": row.get("tone") or "",
             "category": category,
             "essence": row.get("essence") or "",
+            # Пояснение темы сохраняем в структурный итог: в годовых и межгодовых отчётах
+            # пояснения берутся оттуда вместе с частотами.
+            "summary": row.get("summary") or row.get("essence") or "",
             "quotes": quotes[:3],
         })
 

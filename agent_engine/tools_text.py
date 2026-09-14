@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import hashlib
 import math
 import os
 import re
@@ -740,6 +741,55 @@ def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, An
     }
 
 
+# --------------------------------------------------------- нецензурная лексика в названиях тем
+# Фильтр по КОРНЯМ, а не по точному слову: «блять», «блядь», «блядский», «нахуй», «охуенно» и
+# любые словоформы должны отсекаться и на входе (термины кластера), и на выходе (название от
+# модели), иначе мат попадает в таблицу тем отчёта.
+PROFANITY_ROOTS = (
+    "бля", "хуй", "хуя", "хую", "хуе", "хуё", "хуи", "пизд", "ебал", "ебан", "ебет", "ебут",
+    "ебат", "еби", "ебу", "ешь", "ахуе", "охуе", "нахуй", "нахуя", "нахер", "наху", "сука",
+    "суки", "сучар", "мудак", "мудил", "мраз", "гандон", "дерьм", "жоп", "срат", "говн",
+    "хрен", "долбоеб", "пидор", "пидар", "шлюх", "залуп", "манда",
+)
+
+
+def _has_profanity(value: Any) -> bool:
+    """Есть ли в тексте нецензурная лексика (по корням слов)."""
+    text = str(value or "").lower().replace("ё", "е")
+    for word in re.findall(r"[а-яa-z]+", text):
+        for root in PROFANITY_ROOTS:
+            if root in word:
+                return True
+    return False
+
+
+def _clean_title(value: Any, limit_words: int = 5) -> str:
+    """Название темы: без мата, не список терминов, 2–5 слов. Пусто — если не подходит."""
+    text = re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ\s-]+", " ", str(value or "").replace("\n", " "))
+    text = re.sub(r"\s{2,}", " ", text).strip(" -–—·,")
+    if not text or _has_profanity(text):
+        return ""
+    if text.count(",") >= 1 and len(text.split()) > 6:
+        return ""  # перечисление терминов вместо названия
+    words = [word for word in text.split() if word]
+    if len(words) > limit_words:
+        words = words[:limit_words]
+    result = " ".join(words).strip(" -–—·,")
+    if len(result) < 3 or _has_profanity(result):
+        return ""
+    return result[:1].upper() + result[1:]
+
+
+def _clean_summary(value: Any, limit: int = 220) -> str:
+    """Пояснение темы: одно короткое предложение без мата."""
+    text = " ".join(str(value or "").split())
+    if not text or _has_profanity(text):
+        return ""
+    if not text.endswith((".", "!", "?")):
+        text += "."
+    return text[:limit]
+
+
 # ------------------------------------------------- слияние одинаковых тем и названия по содержимому
 # Названия тем приходят из двух источников (модель и готовые метки датасета) и почти всегда
 # расходятся в мелочах: «качество еды» и «Качество еды», «закрытие ресторанов» и «закрытие
@@ -807,9 +857,20 @@ def _merge_similar_rows(rows: List[Dict[str, Any]], total: int) -> List[Dict[str
             if key and other:
                 union = len(key | other)
                 inter = len(key & other)
-                if key == other or (key <= other) or (other <= key) or (union and inter / union >= 0.6):
+                overlap = inter / float(min(len(key), len(other)) or 1)
+                if (key == other or (key <= other) or (other <= key)
+                        or (union and inter / union >= 0.6) or overlap >= 0.5):
                     target = candidate
                     break
+                # Смысловая близость по терминам кластеров: если наборы терминов почти совпадают,
+                # это одна тема, как бы ни назывались кластеры.
+                terms_a = {_topic_stem(word) for word in (row.get("content_terms") or [])}
+                terms_b = {_topic_stem(word) for word in (candidate.get("content_terms") or [])}
+                if terms_a and terms_b:
+                    shared = terms_a & terms_b
+                    if len(shared) / float(min(len(terms_a), len(terms_b))) >= 0.5:
+                        target = candidate
+                        break
             if members and candidate.get("_members"):
                 other_members = candidate["_members"]
                 smaller = min(len(members), len(other_members)) or 1
@@ -1065,6 +1126,155 @@ def _cluster_rows(corpus: Dict[str, Any], merged_topics: List[Dict[str, Any]],
             "_members": set(cluster.get("members") or []),
         })
     rows.sort(key=lambda item: (-item["count"], -item["importance"]))
+    return rows
+
+
+_TITLE_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _titles_cache_key(rows: List[Dict[str, Any]]) -> str:
+    parts = []
+    for row in rows:
+        parts.append("%s|%s|%s" % (row.get("cluster_id"), row.get("topic"), ",".join(row.get("content_terms") or [])))
+    return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()
+
+
+def _cluster_prompt_block(rows: List[Dict[str, Any]], docs_by_id: Dict[str, Dict[str, Any]],
+                          examples: int = 4) -> str:
+    """Кластеры для модели: номер, ключевые термины и несколько представительных сообщений."""
+    lines: List[str] = []
+    for row in rows:
+        cluster_id = row.get("cluster_id")
+        members = [doc for doc in docs_by_id.values() if int(doc.get("cluster_id") or -1) == int(cluster_id)]
+        members.sort(key=lambda item: -float(item.get("importance") or 0))
+        samples = []
+        for doc in members[:examples]:
+            text = " ".join(str(doc.get("text") or "").split())[:170]
+            if text:
+                samples.append("- " + text)
+        lines.append(
+            "Кластер %s. Термины: %s.\nПримеры сообщений:\n%s" % (
+                cluster_id, ", ".join(str(t) for t in (row.get("content_terms") or [])[:8]) or "—",
+                "\n".join(samples) or "- (нет примеров)",
+            )
+        )
+    return "\n\n".join(lines)
+
+
+TITLE_SYSTEM = (
+    "Ты аналитик соцмедиа и СМИ. Ты даёшь короткие, точные названия темам обсуждений и по одному "
+    "предложению пояснения к каждой теме. Пиши по-русски, без мата и оскорблений, без воды. "
+    "Отвечай ТОЛЬКО JSON."
+)
+
+TITLE_INSTRUCTION = """Ниже кластеры сообщений датасета «{dataset}»{scope}. Для каждого кластера придумай:
+  * title — короткое название темы, 2–5 слов, по существу содержимого; НЕ перечисление терминов
+    через запятую, без мата;
+  * summary — одно короткое предложение: о чём эта тема (без цифр и без перечисления слов).
+
+{clusters}
+
+Верни JSON строго такого вида:
+{{"topics": [{{"id": 1, "title": "название темы", "summary": "о чём тема одним предложением"}}]}}
+В ответе должны быть ВСЕ кластеры: {ids}."""
+
+
+async def _llm_cluster_titles(ctx, rows: List[Dict[str, Any]], docs_by_id: Dict[str, Dict[str, Any]],
+                              scope: str = "") -> Dict[str, str]:
+    """Названия и пояснения тем от Qwen3-32B (профиль генерации, порт 8000).
+
+    Пользователь просит именно 32B: качество формулировок важно, объём небольшой (термины и
+    несколько сообщений на кластер). Быстрая 4B остаётся на массовом чтении текстов.
+    Кластеры идут одним-двумя вызовами; при невалидном JSON — повтор; при недоступности 32B —
+    честный откат на прежнее название (проверенное на мат), но не на список терминов.
+    """
+    if not rows:
+        return {}
+    cache_key = _titles_cache_key(rows)
+    cached = _TITLE_CACHE.get(cache_key)
+    if cached:
+        return dict(cached)
+
+    meta: Dict[str, Any] = {}
+    batch_size = 20
+    result: Dict[str, str] = {}
+    used_model = ""
+    dataset = ""
+    try:
+        from .tools_data import guard
+        _idx, dataset = guard(ctx)
+    except Exception:
+        dataset = str(getattr(ctx, "dataset_name", "") or "")
+
+    for start in range(0, len(rows), batch_size):
+        chunk = rows[start:start + batch_size]
+        payload = _cluster_prompt_block(chunk, docs_by_id)
+        ids = ", ".join(str(row.get("cluster_id")) for row in chunk)
+        prompt = TITLE_INSTRUCTION.format(dataset=dataset or "—", scope=scope, clusters=payload, ids=ids)
+        parsed: Dict[str, Any] = {}
+        for attempt in (1, 2):
+            try:
+                text, _tokens = await _qwen(ctx, prompt, system=TITLE_SYSTEM, max_tokens=2500,
+                                            temperature=0.2, meta=meta)
+                parsed = _extract_json(text) or {}
+                if isinstance(parsed.get("topics"), list):
+                    break
+                prompt += "\n\nНапоминаю: ответ — только JSON вида {\"topics\": [...]}."
+            except Exception as exc:  # noqa: BLE001 — откат на прежние названия честнее падения
+                await ctx.log(f"Названия тем моделью 32B не получены ({type(exc).__name__}: {exc}) — "
+                              "оставляю прежние названия", level="error")
+                parsed = {}
+                break
+        if meta.get("model"):
+            used_model = str(meta["model"])
+        for item in (parsed.get("topics") or []):
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id"))
+            title = _clean_title(item.get("title"))
+            summary = _clean_summary(item.get("summary"))
+            if key and (title or summary):
+                result[key] = {"title": title, "summary": summary}
+
+    if result:
+        _TITLE_CACHE[cache_key] = dict(result)
+        if len(_TITLE_CACHE) > 32:
+            _TITLE_CACHE.clear()
+    if used_model:
+        result["__model__"] = used_model
+    return result
+
+
+async def _retitle_clusters(ctx, rows: List[Dict[str, Any]], docs_by_id: Dict[str, Dict[str, Any]],
+                            scope: str = "") -> List[Dict[str, Any]]:
+    """Проставляет названия и пояснения тем от 32B; мусорные названия и термины не пропускает."""
+    if not rows:
+        return rows
+    titles = await _llm_cluster_titles(ctx, rows, docs_by_id, scope)
+    for row in rows:
+        got = titles.get(str(row.get("cluster_id"))) or {}
+        title = _clean_title(got.get("title"))
+        if title:
+            row["topic"] = title
+        else:
+            # Откат: прежнее название, если оно не мат, иначе один нейтральный термин
+            # (список терминов в отчёт не попадает).
+            previous = _clean_title(row.get("topic"), limit_words=6)
+            if previous and "," not in previous:
+                row["topic"] = previous
+            else:
+                safe_terms = [t for t in (row.get("content_terms") or []) if not _has_profanity(t)]
+                hint = _clean_title(row.get("tag_hint"), limit_words=5)
+                row["topic"] = (hint if hint and not _has_profanity(hint)
+                                else (str(safe_terms[0]).capitalize() if safe_terms else "Прочее"))
+        summary = _clean_summary(got.get("summary")) or _clean_summary(row.get("essence"))
+        if summary:
+            row["essence"] = summary
+            row["summary"] = summary
+    row_model = titles.get("__model__") or ""
+    for row in rows:
+        if row_model:
+            row["titles_model"] = row_model
     return rows
 
 
@@ -1886,7 +2096,12 @@ async def analyze_texts(
         # бы понять, что тема частая во всём корпусе.
         cluster_rows = _cluster_rows(corpus, merged["topics"], docs_by_id, corpus_total)
         if cluster_rows:
-            # Сливаем кластеры-близнецы (по названию и по составу сообщений), затем строки-дубли.
+            # Названия и пояснения тем даёт Qwen3-32B (профиль генерации), затем кластеры-близнецы
+            # сливаются — по названию, по терминам и по составу сообщений.
+            cluster_rows = await _retitle_clusters(
+                ctx, cluster_rows, docs_by_id,
+                scope=f" за период {_iso(lo)} — {_iso(hi)}",
+            )
             topics = _merge_similar_rows(cluster_rows, corpus_total)
             categories = _categories_from_rows(topics, corpus_total)
 
@@ -2103,6 +2318,7 @@ async def analyze_texts(
             "cluster_noise": int(corpus.get("noise") or 0) if corpus else 0,
             "clusters_noise_filtered": len([c for c in (corpus.get("clusters") or []) if c.get("noise")]) if corpus else 0,
             "topics_merged": len(topics),
+            "titles_model": (topics[0].get("titles_model") if topics else "") or "",
             "cluster_tagged_docs": int(corpus.get("tagged") or 0) if corpus else 0,
             "cluster_stages": dict(corpus.get("stages") or {}) if corpus else {},
             "cluster_truncated": bool(corpus.get("truncated")) if corpus else False,
