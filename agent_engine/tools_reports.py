@@ -244,7 +244,11 @@ def _clean_cell(value: Any) -> str:
 
 
 def _clean_tables(tables: Any) -> List[Dict[str, Any]]:
-    """Готовит таблицы разделов к сборке: колонки, строки, заголовок и примечание."""
+    """Готовит таблицы разделов к сборке: колонки, строки, заголовок, примечание и раскладка.
+
+    ``layout`` переносится как есть («auto» по умолчанию): по нему PDF выбирает книжную или
+    альбомную страницу для конкретной таблицы.
+    """
     out: List[Dict[str, Any]] = []
     for spec in (tables or []):
         if not isinstance(spec, dict):
@@ -255,11 +259,13 @@ def _clean_tables(tables: Any) -> List[Dict[str, Any]]:
         rows = [row for row in rows if any(row)]
         if not columns and not rows:
             continue
+        layout = str(spec.get("layout") or "").strip().lower()
         out.append({
             "title": _clean_cell(spec.get("title")),
             "columns": columns,
             "rows": rows,
             "note": _sanitize_report_text(spec.get("note")) if spec.get("note") else "",
+            "layout": layout if layout in ("auto", "portrait", "landscape") else "auto",
         })
     return out
 
@@ -790,14 +796,20 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
             wrapped = textwrap.wrap(raw, width=104) or [""]
             lines.extend(wrapped)
     pages = [lines[i : i + page_lines] for i in range(0, len(lines), page_lines)] or [[""]]
+    # Кегль заголовка подбирается под ширину листа: длинное название темы иначе уезжает за край.
+    title_lines, title_font = _page_title_lines(title, 8.27 * 0.84, 15.0, 10.0)
     for page_no, chunk in enumerate(pages):
         fig = plt.figure(figsize=(8.27, 11.69), dpi=140)
         label = counter.mark()
-        fig.text(0.08, 0.94, title, fontsize=15, fontweight="bold", va="top")
+        header_y = 0.94
+        for line in title_lines:
+            fig.text(0.08, header_y, line, fontsize=title_font, fontweight="bold", va="top")
+            header_y -= 0.032
         if page_no == 0:
+            meta_y = header_y - 0.005
             fig.text(
                 0.08,
-                0.90,
+                meta_y,
                 "Тема: {d}   |   Период: {p}   |   {a}, {dt}".format(
                     d=meta.get("dataset_label") or "—",
                     p=meta.get("period") or "весь период",
@@ -808,9 +820,9 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
                 color="#667085",
                 va="top",
             )
-            start_y = 0.86
+            start_y = meta_y - 0.04
         else:
-            start_y = 0.90
+            start_y = header_y - 0.02
         y = start_y
         for line in chunk:
             fig.text(0.08, y, line, fontsize=9.5, va="top", family="DejaVu Sans")
@@ -820,36 +832,79 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
         plt.close(fig)
 
 
+# Ширина табличного блока в символах моноширинного шрифта. Книжная страница — 108 символов
+# при кегле 7,5 (6,8" из 7,4" полезной ширины), альбомная — 164 символа (10,3" из 10,4").
 TABLE_LINE_WIDTH = 108
-TABLE_LINE_WIDTH_WIDE = 160
+TABLE_LINE_WIDTH_WIDE = 164
+
+# Полоса набора страницы таблицы: сверху — заголовок, снизу — номер страницы.
+TABLE_TOP = 0.905
+TABLE_BOTTOM = 0.055
+TABLE_CAPTION_H = 0.035
+TABLE_NOTE_H = 0.024
+TABLE_MARGIN = 0.055
+
+# Кегль таблицы подбирается так, чтобы таблица уместилась ЦЕЛИКОМ на одной странице:
+# от читаемого 7,5 к 4,8 (кегль, доля базового шага строки от шага при 7,5).
+TABLE_FIT_STEPS = (
+    (7.5, 1.00), (7.2, 0.96), (7.0, 0.93), (6.8, 0.90), (6.5, 0.86),
+    (6.2, 0.82), (6.0, 0.78), (5.8, 0.74), (5.5, 0.70), (5.2, 0.66),
+    (5.0, 0.62), (4.8, 0.58),
+)
+TABLE_BASE_ROW_H = 0.0145       # шаг строки при кегле 7,5 на книжной странице
+TABLE_BASE_ROW_H_WIDE = 0.0185  # шаг строки при кегле 7,5 на альбомной странице; в альбоме
+                                # строк на странице больше за счёт ширины, а не мелкого текста
+TABLE_LANDSCAPE_HINTS = ("landscape", "wide", "альбом", "альбомная", "горизонтальная")
+TABLE_PORTRAIT_HINTS = ("portrait", "narrow", "книж", "книжная", "портрет", "вертикальная")
 
 
-def _table_grid(spec: Dict[str, Any], total_width: int = TABLE_LINE_WIDTH) -> List[str]:
-    """Табличный блок для PDF: колонки выровнены пробелами под моноширинный шрифт.
-
-    Длинные ячейки (названия тем, перечисления) переносятся на следующую строку внутри
-    самой ячейки, поэтому данные не теряются.
-    """
+def _table_body(spec: Dict[str, Any]) -> "tuple[List[str], List[List[str]]]":
+    """Шапка и строки таблицы: колонки дополняются, лишние ячейки отбрасываются."""
     columns = [str(c) for c in (spec.get("columns") or [])]
     rows = [[("" if c is None else str(c)) for c in row] for row in (spec.get("rows") or [])]
     ncols = max([len(columns)] + [len(row) for row in rows] or [0])
     if ncols <= 0:
-        return []
+        return [], []
     columns += [""] * (ncols - len(columns))
     rows = [row + [""] * (ncols - len(row)) for row in rows]
+    return columns, rows
+
+
+def _table_widths(columns, rows, total_width: int) -> List[int]:
+    """Ширины колонок: самые широкие колонки ужимаются, пока таблица не впишется в страницу."""
+    ncols = len(columns)
     gap = 2
     min_width = 8
     budget = max(ncols * min_width, total_width - gap * (ncols - 1))
     widths = [max(len(row[i]) for row in ([columns] + rows)) for i in range(ncols)]
-    # Ужимаем самые широкие колонки по одной, пока таблица не впишется в ширину страницы.
     guard = 0
-    while sum(widths) > budget and guard < 100000:
+    while sum(widths) > budget and guard < 200000:
         guard += 1
         shrinkable = [i for i in range(ncols) if widths[i] > min_width]
         if not shrinkable:
             break
         widths[max(shrinkable, key=lambda i: widths[i])] -= 1
-    aligns = ["right" if _is_numeric_label(columns[i]) and all(_is_numeric_cell(r[i]) for r in rows) else "left"
+    return widths
+
+
+def _table_grid_rows(spec: Dict[str, Any], total_width: int = TABLE_LINE_WIDTH):
+    """Табличный блок для PDF: (шапка со разделителем, строки) как списки строк текста.
+
+    Колонки выровнены пробелами под моноширинный шрифт. Длинные ячейки (названия тем,
+    перечисления) переносятся на следующую строку внутри самой ячейки, поэтому данные не
+    теряются. Важно: перенос остаётся ВНУТРИ логической строки таблицы — постраничная
+    разбивка идёт по строкам целиком и не рвёт строку пополам.
+    """
+    columns, rows = _table_body(spec)
+    if not columns:
+        return [], []
+    ncols = len(columns)
+    gap = 2
+    widths = _table_widths(columns, rows, total_width)
+    # Числовая колонка — по правому краю, текстовая — по левому. Здесь именно булево значение:
+    # раньше в списке лежали строки «right»/«left», условие if aligns[i] было истинным всегда,
+    # и все колонки печатались по правому краю — заголовки не вставали над своими колонками.
+    aligns = [bool(_is_numeric_label(columns[i]) and all(_is_numeric_cell(r[i]) for r in rows))
               for i in range(ncols)]
 
     def cell_lines(value: str, width: int) -> List[str]:
@@ -858,27 +913,149 @@ def _table_grid(spec: Dict[str, Any], total_width: int = TABLE_LINE_WIDTH) -> Li
             return [text]
         return textwrap.wrap(text, width=width) or [""]
 
-    out: List[str] = []
-    for idx, row in enumerate([columns] + rows):
+    def render(row: List[str]) -> List[str]:
         cells = [cell_lines(row[i], widths[i]) for i in range(ncols)]
         height = max(len(cell) for cell in cells)
+        out: List[str] = []
         for line_no in range(height):
             parts = []
             for i in range(ncols):
                 text = cells[i][line_no] if line_no < len(cells[i]) else ""
                 parts.append(text.rjust(widths[i]) if aligns[i] else text.ljust(widths[i]))
             out.append("  ".join(parts).rstrip())
-        if idx == 0:
-            out.append("─" * min(total_width, sum(widths) + gap * (ncols - 1)))
+        return out
+
+    head = render(columns)
+    head.append("─" * min(total_width, sum(widths) + gap * (ncols - 1)))
+    return head, [render(row) for row in rows]
+
+
+def _table_grid(spec: Dict[str, Any], total_width: int = TABLE_LINE_WIDTH) -> List[str]:
+    """Плоский табличный блок (шапка + строки) — для случаев, когда разбивка не нужна."""
+    head, body = _table_grid_rows(spec, total_width)
+    out = list(head)
+    for row in body:
+        out.extend(row)
     return out
+
+
+def _table_capacity(row_h: float, head_h: float, note_h: float) -> int:
+    """Сколько строк текста таблицы помещается на странице при данном шаге строки."""
+    return max(4, int((TABLE_TOP - head_h - note_h - TABLE_BOTTOM) / row_h))
+
+
+def _readable_steps(landscape: bool):
+    """Шаги подбора кегля: (кегль, шаг строки) от самого читаемого к самому мелкому."""
+    base = TABLE_BASE_ROW_H_WIDE if landscape else TABLE_BASE_ROW_H
+    return [(font, base * factor) for font, factor in TABLE_FIT_STEPS]
+
+
+def _table_fit(spec: Dict[str, Any], landscape: bool) -> Optional[Dict[str, Any]]:
+    """Раскладка таблицы на странице: шапка, строки, кегль, шаг строки, влезает ли целиком.
+
+    Кегль берётся самый крупный из тех, при которых таблица укладывается на одну страницу.
+    ``fits=False`` — не влезает даже самым мелким кеглем, таблицу придётся разбить по строкам.
+    """
+    width_chars = TABLE_LINE_WIDTH_WIDE if landscape else TABLE_LINE_WIDTH
+    head, body = _table_grid_rows(spec, width_chars)
+    if not head:
+        return None
+    lines = len(head) + sum(len(row) for row in body)
+    caption_h = TABLE_CAPTION_H if spec.get("title") else 0.0
+    note_h = TABLE_NOTE_H if spec.get("note") else 0.0
+    font, row_h = _readable_steps(landscape)[-1]
+    fits = False
+    for candidate_font, candidate_row_h in _readable_steps(landscape):
+        if lines <= _table_capacity(candidate_row_h, caption_h, note_h):
+            font, row_h, fits = candidate_font, candidate_row_h, True
+            break
+    return {"landscape": landscape, "head": head, "body": body, "lines": lines,
+            "font": font, "row_h": row_h, "fits": fits}
+
+
+def _table_landscape(spec: Dict[str, Any]) -> bool:
+    """Альбомная страница для конкретной таблицы.
+
+    Явная подсказка (``layout``) важнее расчёта. Без подсказки сравниваются обе раскладки:
+    альбом берётся, если только он позволяет уместить таблицу целиком либо если на альбомной
+    странице кегль заметно крупнее (узкие колонки книжной страницы рвут длинные ячейки на
+    много строк и текст становится мелким).
+    """
+    hint = str(spec.get("layout") or "").strip().lower()
+    if hint in TABLE_LANDSCAPE_HINTS:
+        return True
+    if hint in TABLE_PORTRAIT_HINTS:
+        return False
+    portrait = _table_fit(spec, False)
+    landscape = _table_fit(spec, True)
+    if portrait is None:
+        return landscape is not None
+    if landscape is None:
+        return False
+    if landscape["fits"] != portrait["fits"]:
+        return landscape["fits"]
+    if not landscape["fits"]:
+        return landscape["lines"] < portrait["lines"]
+    return landscape["font"] > portrait["font"] + 0.2
+
+
+def _text_width_in(text: str, font: float, bold: bool = False):
+    """Ширина строки в дюймах. None — измерить не удалось (тогда считаем по среднему)."""
+    try:
+        from matplotlib.font_manager import FontProperties
+        from matplotlib.textpath import TextPath
+
+        prop = FontProperties(family="DejaVu Sans", weight="bold" if bold else "normal")
+        return TextPath((0, 0), str(text), size=font, prop=prop).get_extents().width / 72.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _title_font(text: str, width_in: float, max_font: float = 13.0, min_font: float = 9.0) -> float:
+    """Кегль заголовка страницы: длинный заголовок раздела не должен уезжать за край листа."""
+    if not text:
+        return max_font
+    size = max_font
+    while size >= min_font:
+        measured = _text_width_in(text, size, bold=True)
+        if measured is None:
+            measured = len(text) * 0.66 * size / 72.0
+        if measured <= width_in:
+            return size
+        size -= 0.5
+    return min_font
+
+
+def _page_title_lines(title: str, width_in: float, max_font: float, min_font: float):
+    """Заголовок страницы: (список строк, кегль). Сначала уменьшаем кегль, потом переносим.
+
+    Длинный заголовок раздела («Год → месяц → основные темы, доля негатива, ключевой
+    инфоповод» в верхнем регистре) иначе уезжает за правый край листа.
+    """
+    text = str(title or "")
+    font = _title_font(text, width_in, max_font, min_font)
+    measured = _text_width_in(text, font, bold=True)
+    if measured is None:
+        measured = len(text) * 0.66 * font / 72.0
+    if measured <= width_in:
+        return [text], font
+    # Кегль уже минимальный, а строка всё ещё шире листа: переносим по словам, не больше двух строк.
+    char_width_in = min_font * 0.62 / 72.0
+    per_line = max(24, int(width_in / char_width_in))
+    lines = textwrap.wrap(text, width=per_line) or [text]
+    if len(lines) > 2:
+        lines = textwrap.wrap(text, width=max(24, int(per_line * 1.35))) or [text]
+    return lines[:2], min_font
 
 
 def _pdf_table_pages(pdf, title: str, specs: List[Dict[str, Any]], meta: Dict[str, Any],
                      counter: "_PageCounter" = None) -> None:
     """Таблицы раздела отдельными страницами PDF: подпись, шапка, выровненные колонки.
 
-    Широкая таблица (много колонок или длинные ячейки) уходит на альбомную страницу,
-    чтобы текст не сжимался в нечитаемую колонку.
+    Таблица печатается ЦЕЛИКОМ на одной странице: кегль и шаг строки подбираются под её
+    объём (от 7,5 к 4,8), широкая таблица уходит на альбомную страницу. Если таблица не
+    влезает даже самым мелким кеглем, она разбивается по строкам целиком — шапка
+    повторяется на каждой странице, а строка не рвётся пополам.
     """
     plt = _mpl()
     counter = counter or _PageCounter()
@@ -886,34 +1063,57 @@ def _pdf_table_pages(pdf, title: str, specs: List[Dict[str, Any]], meta: Dict[st
     for spec in specs:
         if not isinstance(spec, dict):
             continue
-        lines = _table_grid(spec, TABLE_LINE_WIDTH)
-        if not lines:
+        landscape = _table_landscape(spec)
+        fit = _table_fit(spec, landscape)
+        if not fit:
             continue
-        landscape = max(len(line) for line in lines) > TABLE_LINE_WIDTH + 10
-        if landscape:
-            lines = _table_grid(spec, TABLE_LINE_WIDTH_WIDE)
+        head, body = fit["head"], fit["body"]
+        chosen_font, chosen_row_h = fit["font"], fit["row_h"]
         size = (11.69, 8.27) if landscape else (8.27, 11.69)
-        row_h = 0.0205 if landscape else 0.0145
+        usable_in = size[0] - 2 * TABLE_MARGIN * size[0]
         caption = str(spec.get("title") or "")
         note = str(spec.get("note") or "")
-        head_h = 0.035 if caption else 0.0
-        per_page = max(8, int((0.845 - head_h) / row_h))
-        chunks = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
+        caption_h = TABLE_CAPTION_H if caption else 0.0
+
+        per_page = _table_capacity(chosen_row_h, caption_h, 0.0)
+        header_h = len(head)
+        chunks: List[List[str]] = []
+        current = list(head)
+        used = header_h
+        for row in body:
+            if used + len(row) > per_page and len(current) > header_h:
+                chunks.append(current)          # разрыв — только между строками таблицы
+                current = list(head)
+                used = header_h
+            current.extend(row)
+            used += len(row)
+        chunks.append(current)
+
+        title_lines, title_font = _page_title_lines(title, usable_in, 13.0, 9.5)
+        note_lines = textwrap.wrap(note, width=max(40, int(usable_in * 72.0 / 7.2))) if note else []
         for page_no, chunk in enumerate(chunks):
             fig = plt.figure(figsize=size, dpi=140)
             label = counter.mark()
-            fig.text(0.055, 0.955, title, fontsize=13, fontweight="bold", va="top")
+            y = 0.955
+            for line in title_lines:
+                fig.text(TABLE_MARGIN, y, line, fontsize=title_font, fontweight="bold", va="top")
+                y -= 0.030
             if page_no:
-                fig.text(0.945, 0.955, "(продолжение)", fontsize=8, color="#98A2B3", ha="right", va="top")
-            y = 0.905
+                fig.text(1 - TABLE_MARGIN, 0.955, "(продолжение)", fontsize=8, color="#98A2B3",
+                         ha="right", va="top")
+            y = TABLE_TOP
             if caption:
-                fig.text(0.055, y, caption, fontsize=9.5, fontweight="bold", va="top", color="#101828")
-                y -= head_h
+                fig.text(TABLE_MARGIN, y, caption, fontsize=9.5, fontweight="bold", va="top", color="#101828")
+                y -= caption_h
             for line in chunk:
-                fig.text(0.055, y, line, fontsize=7.5, va="top", family="DejaVu Sans Mono", color="#101828")
-                y -= row_h
-            if note and page_no == len(chunks) - 1:
-                fig.text(0.055, max(0.05, y - 0.008), note, fontsize=8, va="top", color="#667085", style="italic")
+                fig.text(TABLE_MARGIN, y, line, fontsize=chosen_font, va="top",
+                         family="DejaVu Sans Mono", color="#101828")
+                y -= chosen_row_h
+            if note_lines and page_no == len(chunks) - 1:
+                y = max(TABLE_BOTTOM, y - 0.008)
+                for line in note_lines:
+                    fig.text(TABLE_MARGIN, y, line, fontsize=8, va="top", color="#667085", style="italic")
+                    y -= 0.017
             fig.text(0.5, 0.03, label, fontsize=8, color="#98A2B3", ha="center")
             pdf.savefig(fig)
             plt.close(fig)
@@ -1035,6 +1235,13 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
                                     "columns": {"type": "array", "description": "шапка таблицы"},
                                     "rows": {"type": "array", "description": "строки: список списков ячеек"},
                                     "note": {"type": "string", "description": "примечание под таблицей"},
+                                    "layout": {
+                                        "type": "string",
+                                        "enum": ["auto", "portrait", "landscape"],
+                                        "description": "раскладка таблицы в PDF: auto (по содержимому), "
+                                                       "portrait (книжная) или landscape (альбомная, "
+                                                       "для широких таблиц)",
+                                    },
                                 },
                                 "required": ["columns", "rows"],
                             },

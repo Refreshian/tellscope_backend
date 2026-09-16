@@ -136,9 +136,16 @@ def prose_num(value):
     return short_num(value) if DANGER.search(text.replace("\u00a0", " ")) else text
 
 
-def TABLE(title, columns, rows, note=""):
-    """Описание настоящей таблицы раздела: заголовок, шапка, строки, примечание."""
-    return {"title": title, "columns": list(columns), "rows": [list(r) for r in rows], "note": note}
+def TABLE(title, columns, rows, note="", layout="auto"):
+    """Описание настоящей таблицы раздела: заголовок, шапка, строки, примечание, раскладка.
+
+    Раскладка: «auto» — сборщик сам решает (по содержимому), «landscape» — таблица печатается
+    на альбомной странице PDF, «portrait» — на книжной. Широкие таблицы с длинными названиями
+    тем уходят в альбом: иначе колонки сжимаются, а строки рвутся на много строк и таблица
+    не укладывается на одну страницу.
+    """
+    return {"title": title, "columns": list(columns), "rows": [list(r) for r in rows],
+            "note": note, "layout": layout}
 
 
 def clip(text, limit=48):
@@ -553,11 +560,23 @@ def build_year_report(year, months, summaries, probe, ctx):
             "; ".join("%s (%s)" % (clip(t["name"], 26), num(t["count"])) for t in tops[:3]) or "—",
             clip(tops[0]["name"], 34) if tops else "—",
         ])
+    # Полные значения колонок таблицы: в ячейках названия тем сокращены по длине, поэтому
+    # тот же список приводим целиком — чтобы ни одно название не потерялось.
+    dyn_detail = []
+    for key in months:
+        tops = per_month.get(key) or []
+        dyn_detail.append(
+            "• %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s."
+            % (month_label(key), prose_num((probe.get(key) or {}).get("total")),
+               pct((probe.get(key) or {}).get("negative_share")),
+               "; ".join("%s (%s)" % (t["name"], prose_num(t["count"])) for t in tops[:3]) or "—",
+               tops[0]["name"] if tops else "—"))
     sections.append({
         "heading": "Динамика по месяцам",
         "text": ("Объём обсуждений и доля негатива по месяцам. Самый крупный месяц года — %s (%s "
                  "сообщений), самый спокойный — %s (%s). Всего за год учтено %s сообщений и %s тем "
-                 "в месячных отчётах."
+                 "в месячных отчётах. Названия тем и инфоповодов в таблице сокращены по длине — "
+                 "полностью они приведены в списке по месяцам ниже."
                  % (month_label(biggest), prose_num((probe.get(biggest) or {}).get("total")),
                     month_label(smallest), prose_num((probe.get(smallest) or {}).get("total")),
                     prose_num(total), prose_num(theme_count))),
@@ -567,7 +586,9 @@ def build_year_report(year, months, summaries, probe, ctx):
                           "Ключевой инфоповод"],
                          dyn_rows,
                          note="Основные темы — три ведущие темы месяца; в скобках — сколько раз тема "
-                              "встретилась в месячном отчёте.")],
+                              "встретилась в месячном отчёте.",
+                         layout="landscape")],
+        "bullets": dyn_detail,
     })
 
     # 3. Тематики года
@@ -964,12 +985,30 @@ def build_interannual(summaries, probe, years, ctx):
                            pct((probe.get(key) or {}).get("negative_share")),
                            "; ".join("%s (%s)" % (clip(t["name"], 26), num(t["count"])) for t in tops[:2]) or "—",
                            clip(tops[0]["name"], 34) if tops else "—"])
+    # Полные значения колонок: в ячейках названия тем и инфоповодов сокращены по длине, поэтому
+    # тот же перечень приводим целиком — ни одно значение не теряется.
+    table_detail = []
+    for key in months:
+        tops = per_month.get(key) or []
+        table_detail.append(
+            "• %s %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s."
+            % (key[:4], month_name(key), prose_num((probe.get(key) or {}).get("total")),
+               pct((probe.get(key) or {}).get("negative_share")),
+               "; ".join("%s (%s)" % (t["name"], prose_num(t["count"])) for t in tops[:2]) or "—",
+               tops[0]["name"] if tops else "—"))
     sections.append({
         "heading": "Год → месяц → основные темы, доля негатива, ключевой инфоповод",
-        "text": "Сводная таблица по всем месяцам периода и объём обсуждений по годам.",
+        "text": ("Сводная таблица по всем месяцам периода и объём обсуждений по годам. Таблица "
+                 "печатается на альбомной странице и целиком: месяцы не разрываются между "
+                 "страницами. Названия тем и инфоповодов в ячейках сокращены по длине — полностью "
+                 "они приведены в списке по месяцам ниже."),
         "chart_ids": [chart_volume_all["chart_id"]],
         "tables": [TABLE("Все месяцы периода", ["Год", "Месяц", "Сообщений", "Доля негатива",
-                                               "Основные темы", "Ключевой инфоповод"], table_rows)],
+                                               "Основные темы", "Ключевой инфоповод"], table_rows,
+                         note="Основные темы — две ведущие темы месяца; в скобках — сколько раз тема "
+                              "встретилась в месячном отчёте.",
+                         layout="landscape")],
+        "bullets": table_detail,
     })
 
     # 9. Примеры
