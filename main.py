@@ -210,7 +210,7 @@ app = FastAPI(
 # Гейт авторизации: без валидного JWT (Authorization: Bearer, cookie token /
 # tellscope_refresh_token) либо сервисного токена (X-Service-Token) недоступно
 # ничего, кроме белого списка ниже.
-PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/models", "/chat",
+PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/mlops/health", "/models", "/chat",
                 "/auth/login", "/auth/refresh", "/auth/logout", "/auth/session"}
 PUBLIC_PREFIXES = ("/auth/jwt/", "/static/", "/favicon")
 
@@ -11588,6 +11588,16 @@ from mosinform_api import router as mosinform_router
 app.include_router(mosinform_router)
 from mlops_api import router as mlops_router
 app.include_router(mlops_router)
+
+
+@app.get("/health", tags=["mlops"])
+def health_root():
+    """Живость сервиса без токена: тот же ответ, что у /mlops/health.
+
+    Путь /health уже был в белом списке гейта, но маршрута для него в приложении не было —
+    запрос отвечал 404. Теперь /health и /mlops/health отвечают одинаково.
+    """
+    return {"status": "ok"}
 from ba_api import router as ba_router
 app.include_router(ba_router, dependencies=[Depends(current_user)])
 from information_summary import router as information_summary_router

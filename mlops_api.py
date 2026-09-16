@@ -39,6 +39,17 @@ def ready(response: Response):
     return {"ready": True, "jobs": []}
 
 
+@router.get("/health")
+def health():
+    """Живость сервиса: 200 и {"status": "ok"} без токена.
+
+    Отдельно от /mlops/ready: ready отвечает про занятость GPU (503, если держит батч),
+    а health — просто «сервис жив». Оба пути открыты в белом списке гейта (main.PUBLIC_EXACT),
+    поэтому внешние проверки не нуждаются в токене.
+    """
+    return {"status": "ok"}
+
+
 @router.get("/prompts")
 def prompts():
     return {"prompts": list_prompts()}

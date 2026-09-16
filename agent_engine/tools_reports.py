@@ -783,32 +783,95 @@ class _PageCounter:
         self.no = 0
 
 
+# --- Текстовые страницы PDF: поля листа и полоса набора ---------------------
+# Раньше текст начинался от x=0.08, а строка резалась по ЧИСЛУ символов (104). Широкие буквы
+# давали строку шире листа, и хвост строки обрезался по краю бумаги — правое поле выходило 0 pt.
+# Теперь у текстовой страницы есть явные поля, а строка переносится по ИЗМЕРЕННОЙ ширине (тем же
+# шрифтом, которым печатается), поэтому за полосу набора не выходит ничего.
+PDF_PAGE_W_IN = 8.27      # A4 в дюймах: ширина
+PDF_PAGE_H_IN = 11.69     # A4 в дюймах: высота
+TEXT_MARGIN = 0.045       # поле текстовой страницы слева и справа, доля ширины листа
+TEXT_BODY_FONT = 9.5      # кегль основного текста
+TEXT_LINE_STEP = 0.0155   # шаг строки, доля высоты листа
+TEXT_PAGE_LINES = 52      # строк основного текста на странице
+TEXT_BODY_WIDTH_IN = PDF_PAGE_W_IN * (1.0 - 2 * TEXT_MARGIN)   # 7,53 дюйма = 542 pt
+_FALLBACK_CHAR_W = 0.62   # оценка ширины символа, если шрифт измерить не удалось
+
+
+def _wrap_pdf_line(text: str, width_in: float, font: float = TEXT_BODY_FONT) -> List[str]:
+    """Переносит строку по ИЗМЕРЕННОЙ ширине: строка не выходит за полосу набора.
+
+    Ширина меряется тем же шрифтом (DejaVu Sans), которым строка печатается; замер кешируется
+    по слову. Если замер недоступен, берётся заведомо широкая оценка «на символ» — строка тогда
+    переносится чуть раньше. Слова длиннее полосы (ссылки, склейки) режутся по символам: целиком
+    они не влезают и иначе уехали бы за правый край листа.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return [raw]
+    cache: Dict[str, float] = {}
+
+    def width_pt(chunk: str) -> float:
+        if not chunk:
+            return 0.0
+        if chunk not in cache:
+            measured = _text_width_in(chunk, font)
+            cache[chunk] = (measured * 72.0 if measured is not None
+                            else len(chunk) * _FALLBACK_CHAR_W * font)
+        return cache[chunk]
+
+    limit = width_in * 72.0
+    gap = width_pt(" ")
+    words = raw.split()
+    lines: List[str] = []
+    current = words[0]
+    used = width_pt(current)
+    for word in words[1:]:
+        width = width_pt(word)
+        if used + gap + width <= limit:
+            current = f"{current} {word}"
+            used += gap + width
+        else:
+            lines.append(current)
+            current, used = word, width
+    lines.append(current)
+    out: List[str] = []
+    for line in lines:
+        while len(line) > 1 and width_pt(line) > limit:
+            cut = len(line) - 1
+            while cut > 1 and width_pt(line[:cut]) > limit:
+                cut -= 1
+            out.append(line[:cut])
+            line = line[cut:]
+        out.append(line)
+    return out or [""]
+
+
 def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
                     counter: "_PageCounter" = None) -> None:
     plt = _mpl()
     from matplotlib.backends.backend_pdf import PdfPages  # noqa: F401  (тип для аннотации)
 
     counter = counter or _PageCounter()
-    page_lines = 52
+    page_lines = TEXT_PAGE_LINES
     lines: List[str] = []
     for block in blocks:
         for raw in str(block).split("\n"):
-            wrapped = textwrap.wrap(raw, width=104) or [""]
-            lines.extend(wrapped)
+            lines.extend(_wrap_pdf_line(raw, TEXT_BODY_WIDTH_IN))
     pages = [lines[i : i + page_lines] for i in range(0, len(lines), page_lines)] or [[""]]
-    # Кегль заголовка подбирается под ширину листа: длинное название темы иначе уезжает за край.
-    title_lines, title_font = _page_title_lines(title, 8.27 * 0.84, 15.0, 10.0)
+    # Кегль заголовка подбирается под ширину полосы: длинное название темы иначе уезжает за край.
+    title_lines, title_font = _page_title_lines(title, TEXT_BODY_WIDTH_IN, 15.0, 10.0)
     for page_no, chunk in enumerate(pages):
-        fig = plt.figure(figsize=(8.27, 11.69), dpi=140)
+        fig = plt.figure(figsize=(PDF_PAGE_W_IN, PDF_PAGE_H_IN), dpi=140)
         label = counter.mark()
         header_y = 0.94
         for line in title_lines:
-            fig.text(0.08, header_y, line, fontsize=title_font, fontweight="bold", va="top")
+            fig.text(TEXT_MARGIN, header_y, line, fontsize=title_font, fontweight="bold", va="top")
             header_y -= 0.032
         if page_no == 0:
             meta_y = header_y - 0.005
             fig.text(
-                0.08,
+                TEXT_MARGIN,
                 meta_y,
                 "Тема: {d}   |   Период: {p}   |   {a}, {dt}".format(
                     d=meta.get("dataset_label") or "—",
@@ -825,7 +888,7 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
             start_y = header_y - 0.02
         y = start_y
         for line in chunk:
-            fig.text(0.08, y, line, fontsize=9.5, va="top", family="DejaVu Sans")
+            fig.text(TEXT_MARGIN, y, line, fontsize=TEXT_BODY_FONT, va="top", family="DejaVu Sans")
             y -= 0.0155
         fig.text(0.5, 0.03, label, fontsize=8, color="#98A2B3", ha="center")
         pdf.savefig(fig)
