@@ -626,7 +626,34 @@ def history_run_seconds(user_id: Any, mode: str = "") -> float:
     return sum(samples) / float(len(samples))
 
 
-def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
+def _mark_unseen(run: Dict[str, Any], task: Optional[Dict[str, Any]]) -> bool:
+    """Нужно ли показать плашку «Пока вас не было» по этому завершению.
+
+    Плашку ставим только один раз на запуск: если задачу уже смотрели после того, как запуск
+    завершился (``seen_at`` позже ``finished_ts``), признак не возвращаем. Иначе скрытие
+    не запоминалось: первый же синхронизации статуса/повторный разбор списка задач снова
+    ставили ``unseen = True``, и плашка возвращалась после обновления страницы.
+    """
+    if not isinstance(task, dict):
+        return True
+    if task.get("unseen"):
+        # Уже помечена — оставляем как есть, пока пользователь не посмотрит.
+        return True
+    seen_ts = _parse_local_ts(task.get("seen_at"))
+    finished_ts = run.get("finished_ts")
+    try:
+        finished_ts = float(finished_ts) if finished_ts else 0.0
+    except (TypeError, ValueError):
+        finished_ts = 0.0
+    if seen_ts and finished_ts and float(seen_ts) >= finished_ts - 5:
+        return False
+    if not seen_ts and task.get("seen_at"):
+        # Дата просмотра есть, но не распозналась — безопаснее не показывать повторно.
+        return False
+    return True
+
+
+def task_patch_from_run(run: Dict[str, Any], task: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Приводит запись задачи Центра ИИ-задач в соответствие с её запуском."""
     status = str(run.get("status") or "")
     ok = status == "completed"
@@ -657,8 +684,9 @@ def task_patch_from_run(run: Dict[str, Any]) -> Dict[str, Any]:
         "run_finished_ts": run.get("finished_ts"),
     }
     # Задача, завершившаяся без пользователя на странице, помечается непросмотренной:
-    # при следующем заходе покажем плашку «Пока вас не было».
-    if status in TERMINAL_STATUSES:
+    # при следующем заходе покажем плашку «Пока вас не было». Повторно не помечаем —
+    # иначе уже скрытая плашка возвращалась после синхронизации статуса.
+    if status in TERMINAL_STATUSES and _mark_unseen(run, task):
         patch["unseen"] = True
     return patch
 
@@ -679,7 +707,7 @@ def sync_harness_task(run: Dict[str, Any]) -> int:
         for task in harness_store.list_tasks(user_id, limit=200):
             if str(task.get("run_id") or "") != run_id:
                 continue
-            harness_store.update_task(user_id, task.get("id"), task_patch_from_run(run))
+            harness_store.update_task(user_id, task.get("id"), task_patch_from_run(run, task))
             changed += 1
         return changed
     except Exception:
@@ -727,7 +755,7 @@ def reconcile_harness_tasks(user_id: Any) -> int:
                         "error": "запись запуска не найдена: задача прервана, запустите её снова",
                     }
             elif str(run.get("status")) in TERMINAL_STATUSES:
-                patch = task_patch_from_run(run)
+                patch = task_patch_from_run(run, task)
             elif run_is_stale(run, now):
                 idle = int((now - run_last_activity(run)) / 60.0)
                 # Гасим и сам запуск: иначе зависшая запись держит слот пользователя
