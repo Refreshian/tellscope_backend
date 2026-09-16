@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from .loop import MODEL_CHOICES, DEFAULT_CHOICE
@@ -124,17 +125,153 @@ def _account_llm(ctx: Any, result: Any) -> None:
     ctx.cost_usd += (prompt * float(choice.get("price_in") or 0) + completion * float(choice.get("price_out") or 0)) / 1_000_000.0
 
 
-async def _run_tool_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
+# --- санитайзер аргументов шага -------------------------------------------------------
+# Модель, собирая цепочку, регулярно кладёт в аргументы литерал вместо значения
+# ("index": "search.index", "phrase": "search.phrase") или пустое значение (phrase: null,
+# tone: "", limit: 0). Отдельные инструменты это молча проглатывают и отдают пустой срез,
+# поэтому месяц «закрывался» за секунды без анализа. Ниже — единая чистка аргументов.
+
+# Значения тональности, которые понимает _tone_filter / _tone_label.
+_TONE_OK = {
+    "any", "all", "любая", "любой", "все", "всё",
+    "negative", "негатив", "негативный", "негативная",
+    "positive", "позитив", "позитивный", "позитивная",
+    "neutral", "нейтрал", "нейтральный", "нейтральная",
+}
+# Разумные пределы выборки для инструментов, у которых есть аргумент limit.
+_SANE_LIMITS = {"search_messages": 30, "media_rating": 30, "popular_hooks": 30, "analyze_texts": 400}
+_MAX_LIMIT = 20000
+
+# Строка-заглушка: подстановка, имя поля или служебное слово вместо значения.
+_LITERAL_ARGS = re.compile(
+    r"^\s*(\{\{.*?\}\}|<[^>]{1,40}>|none|null|nil|nan|undefined|n/?a|—|-\s*|\.{2,}"
+    r"|(phrase|topic|query|tone|index|limit|keyword|focus|value|count)\s*"
+    r"|[a-z_][\w]*(\.[\w]+)+\s*)\s*$",
+    re.I,
+)
+
+_MONTHS_NOM = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+               "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+_MONTHS_GEN = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+               "августа", "сентября", "октября", "ноября", "декабря"]
+_MONTH_YEAR = re.compile(
+    r"(?<![\w])(январ[ья]|феврал[ья]|март[а]?|апрел[ья]|ма[йя]|июн[ья]|июл[ья]"
+    r"|август[а]?|сентябр[ья]|октябр[ья]|ноябр[ья]|декабр[ья])(?![\w])\s+(\d{4})",
+    re.I,
+)
+_ISO_RANGE = re.compile(r"\d{4}-\d{2}-\d{2}\s*[–—-]\s*\d{4}-\d{2}-\d{2}")
+
+
+def _is_blank_or_literal(value: Any) -> bool:
+    """Пустое значение или подстановка вместо значения («search.phrase», «phrase», null)."""
+    if value is None:
+        return True
+    if isinstance(value, (list, dict, tuple, set)):
+        return not value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return False
+    text = str(value).strip()
+    if not text:
+        return True
+    return bool(_LITERAL_ARGS.match(text))
+
+
+def _date_only(value: Any) -> str:
+    """Дата ГГГГ-ММ-ДД из ISO-строки или unix-времени (иначе пустая строка)."""
+    if value is None or value == "" or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        try:
+            return time.strftime("%Y-%m-%d", time.localtime(float(value)))
+        except Exception:
+            return ""
+    match = re.match(r"\s*(\d{4})-(\d{2})-(\d{2})", str(value))
+    return "%s-%s-%s" % match.groups() if match else ""
+
+
+def _task_topic(ctx: Any) -> str:
+    """Тема из постановки задачи: «Проанализируй тему KFC за декабрь…» → «KFC»."""
+    text = str(getattr(ctx, "task", "") or "")
+    for pattern in (
+        r"(?:тему|тема|темы|по теме|по подтеме)\s*[«\"'„]?\s*"
+        r"([^»\"'“\n,.;:()]{2,60}?)\s*[»\"'“]?\s+(?:за|в|с|по)\s",
+        r"(?:про|о|об)\s+теме\s*[«\"'„]?\s*([^»\"'“\n,.;:()]{2,60}?)\s*[»\"'“]?\s+(?:за|в|с)\s",
+    ):
+        match = re.search(pattern, text, re.I)
+        if match:
+            value = match.group(1).strip(" «»\"'")
+            if value and not _is_blank_or_literal(value):
+                return value[:80]
+    # Запасной вариант — имя датасета без дат: «kfc_13.05.2024-22.09.2026» → «kfc».
+    name = str(getattr(ctx, "dataset_name", "") or "")
+    head = re.split(r"[_\d]", name.strip())[0].strip(" .-_")
+    return head[:40]
+
+
+def _fix_period_literals(text: Any, ctx: Any) -> Any:
+    """Чужой месяц/период в заголовке меняем на период задачи.
+
+    Шаги цепочки собираются под конкретный месяц и хранятся как есть: если задачу потом
+    переиспользуют для другого периода (или планировщик ошибся с месяцем), в заголовке
+    оставался прежний месяц, и отчёт за декабрь назывался январским.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    iso = _date_only(getattr(ctx, "min_date", None))
+    if not iso:
+        return text
+    year, month = iso[:4], int(iso[5:7])
+    nom, gen = _MONTHS_NOM[month - 1], _MONTHS_GEN[month - 1]
+
+    def month_repl(match):
+        word, found_year = match.group(1), match.group(2)
+        low = word.lower()
+        form = "gen" if low in _MONTHS_GEN else ("nom" if low in _MONTHS_NOM else
+                                                ("nom" if low.endswith(("ь", "й")) else "gen"))
+        target = nom if form == "nom" else gen
+        if found_year == year and low == target:
+            return match.group(0)
+        return "%s %s" % (target, year)
+
+    fixed = _MONTH_YEAR.sub(month_repl, text)
+    lo, hi = _date_only(getattr(ctx, "min_date", None)), _date_only(getattr(ctx, "max_date", None))
+    if lo and hi:
+        fixed = _ISO_RANGE.sub("%s–%s" % (lo, hi), fixed)
+    return fixed
+
+
+def _align_period(ctx: Any, args: Dict[str, Any]) -> List[str]:
+    """Период задачи главнее литералов в шаге: без этого шаг читал чужой месяц."""
+    notes: List[str] = []
+    t_lo, t_hi = _date_only(getattr(ctx, "min_date", None)), _date_only(getattr(ctx, "max_date", None))
+    if not (t_lo or t_hi):
+        return notes
+    a_lo, a_hi = _date_only(args.get("min_date")), _date_only(args.get("max_date"))
+    if a_lo and a_hi and t_lo and t_hi and (a_hi < t_lo or a_lo > t_hi):
+        args["min_date"], args["max_date"] = ctx.min_date, ctx.max_date
+        notes.append("период шага %s–%s не пересекается с периодом задачи — беру %s–%s"
+                     % (a_lo, a_hi, t_lo, t_hi))
+        return notes
+    if t_lo and ctx.min_date and (not a_lo or a_lo < t_lo):
+        args["min_date"] = ctx.min_date
+        if a_lo:
+            notes.append("начало периода %s вне задачи — беру %s" % (a_lo, t_lo))
+    if t_hi and ctx.max_date and (not a_hi or a_hi > t_hi):
+        args["max_date"] = ctx.max_date
+        if a_hi:
+            notes.append("конец периода %s вне задачи — беру %s" % (a_hi, t_hi))
+    return notes
+
+
+async def _sanitize_tool_args(ctx, step: Dict[str, Any], args: Any) -> Dict[str, Any]:
+    """Чистит аргументы шага: литералы и пустые значения → значения из задачи."""
     name = str(step.get("tool") or "").strip()
-    spec = get_tool(name)
-    if spec is None:
-        return {"ok": False, "error": f"инструмент {name} не найден"}
-    args = render(step.get("args") or {}, ctx, results)
-    # Модель, собирая цепочку, иногда кладёт в аргументы литерал вместо значения (например
-    # "index": "search.index") — тогда каждый инструмент падает с «Тема не найдена», и месяц
-    # закрывался за 20 секунд без анализа. Если index не номер и не известное имя темы, убираем
-    # его и подставляем датасет из контекста.
-    if isinstance(args, dict) and args.get("index") not in (None, ""):
+    if not isinstance(args, dict):
+        args = {}
+    notes: List[str] = []
+
+    # index: не номер и не известное имя темы — литерал или мусор.
+    if args.get("index") not in (None, ""):
         raw_index = str(args.get("index")).strip()
         keep = raw_index.lstrip("-").isdigit()
         if not keep:
@@ -145,17 +282,71 @@ async def _run_tool_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> 
             except Exception:
                 keep = False
         if not keep:
-            await ctx.log(
-                f"Шаг «{step.get('tool')}»: аргумент index={raw_index!r} не является темой — "
-                "беру датасет из задачи"
-            )
+            notes.append("index=%r не является темой — беру датасет из задачи" % raw_index)
             args.pop("index", None)
-    if ctx.dataset_index is not None and "index" not in (args or {}):
+
+    # phrase/topic/query/focus: пусто или подстановка → тема из постановки задачи.
+    topic = _task_topic(ctx)
+    for key in ("phrase", "topic", "query", "keyword", "focus"):
+        if key not in args or not _is_blank_or_literal(args.get(key)):
+            continue
+        raw = args.pop(key)
+        if key in ("phrase", "topic", "query") and topic:
+            args[key] = topic
+            notes.append("%s=%r пусто или литерал — подставляю тему задачи %r" % (key, raw, topic))
+        else:
+            notes.append("убрал пустое значение %s=%r" % (key, raw))
+
+    # tone: неизвестная тональность молча превращалась в «без фильтра» — говорим об этом явно.
+    if "tone" in args and str(args.get("tone") or "").strip().lower() not in _TONE_OK:
+        raw = args.get("tone")
+        args["tone"] = "all"
+        notes.append("тональность %r неизвестна — читаю все сообщения" % raw)
+
+    # limit: 0/пусто/мусор вместо числа.
+    if "limit" in args:
+        raw_limit = args.get("limit")
+        try:
+            number = int(float(str(raw_limit).strip()))
+        except (TypeError, ValueError):
+            number = 0
+        if number < 1:
+            sane = _SANE_LIMITS.get(name)
+            if sane:
+                args["limit"] = sane
+                notes.append("limit=%r некорректен — беру %d" % (raw_limit, sane))
+            else:
+                args.pop("limit", None)
+                notes.append("убрал некорректный limit=%r" % (raw_limit,))
+        elif number > _MAX_LIMIT:
+            args["limit"] = _MAX_LIMIT
+            notes.append("limit=%d слишком велик — срезал до %d" % (number, _MAX_LIMIT))
+
+    notes.extend(_align_period(ctx, args))
+
+    if ctx.dataset_index is not None and "index" not in args:
         args["index"] = ctx.dataset_index
-    if ctx.min_date and "min_date" not in (args or {}):
+    if ctx.min_date and "min_date" not in args:
         args["min_date"] = ctx.min_date
-    if ctx.max_date and "max_date" not in (args or {}):
+    if ctx.max_date and "max_date" not in args:
         args["max_date"] = ctx.max_date
+
+    if notes:
+        await ctx.log("Шаг «%s»: %s" % (name, "; ".join(notes)))
+    return args
+
+
+async def _run_tool_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(step.get("tool") or "").strip()
+    spec = get_tool(name)
+    if spec is None:
+        return {"ok": False, "error": f"инструмент {name} не найден"}
+    args = render(step.get("args") or {}, ctx, results)
+    args = await _sanitize_tool_args(ctx, step, args)
+    for key in ("title", "subtitle", "heading", "name", "caption", "report_title"):
+        # Заголовки инструментов тоже подчиняем периоду задачи.
+        if isinstance(args.get(key), str):
+            args[key] = _fix_period_literals(args[key], ctx)
     outcome = await run_tool(spec, ctx, args)
     return {"ok": outcome.get("ok"), "result": outcome.get("result"), "error": outcome.get("error"), "args": args, "tool": name}
 
@@ -187,7 +378,7 @@ async def _run_chart_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) ->
         return {"ok": False, "error": "нет данных для графика: проверьте поле «откуда брать данные» и поля подписей"}
 
     args = {
-        "title": render(step.get("title"), ctx, results) or "График",
+        "title": render(_fix_period_literals(step.get("title"), ctx), ctx, results) or "График",
         "chart_type": step.get("chart_type") or "bar",
         "categories": labels,
         "series": [{"name": render(step.get("series_name"), ctx, results) or "Значение", "values": values}],
@@ -271,7 +462,7 @@ async def _run_report_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -
     sections = []
     for section in raw_sections:
         item = {
-            "heading": render(section.get("heading") or "Раздел", ctx, results),
+            "heading": render(_fix_period_literals(section.get("heading") or "Раздел", ctx), ctx, results),
             "text": render(section.get("text") or "", ctx, results),
             "bullets": [render(b, ctx, results) for b in (section.get("bullets") or [])],
             "chart_ids": section.get("chart_ids") or [],
@@ -285,8 +476,9 @@ async def _run_report_step(ctx, step: Dict[str, Any], results: Dict[str, Any]) -
             item["citations"] = render(section.get("citations"), ctx, results)
         sections.append(item)
     args = {
-        "title": render(step.get("report_title") or step.get("title"), ctx, results) or "Аналитический отчёт",
-        "subtitle": render(step.get("subtitle") or "", ctx, results),
+        "title": render(_fix_period_literals(step.get("report_title") or step.get("title"), ctx),
+                        ctx, results) or "Аналитический отчёт",
+        "subtitle": render(_fix_period_literals(step.get("subtitle") or "", ctx), ctx, results),
         "folder": render(step.get("folder") or ctx.folder, ctx, results),
         "sections": sections,
     }
@@ -319,7 +511,7 @@ async def run_pipeline(ctx, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
             break
 
         kind = str(step.get("kind") or "tool")
-        title = render(step.get("title"), ctx, results) or STEP_KINDS.get(kind, kind)
+        title = render(_fix_period_literals(step.get("title"), ctx), ctx, results) or STEP_KINDS.get(kind, kind)
         save_as = str(step.get("save_as") or f"step{number}")
         await tracker.begin_stage(f"Шаг {number}. {title}", detail=STEP_KINDS.get(kind, kind))
         await ctx.event({"type": "tool_start", "name": kind, "title": f"Шаг {number}. {title}", "args": step.get("args") or {}})

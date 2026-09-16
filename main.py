@@ -13387,7 +13387,11 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
         agent = _agent_agents_store.get_agent(user.id, agent_id)
         if agent is None:
             raise HTTPException(status_code=404, detail="Агент из задачи не найден")
-        run = _agent_agents_store.start_agent_run(user.id, agent, user)
+        # Период берём из записи задачи: шаги цепочки могли быть собраны под другой месяц,
+        # и тогда без этого отчёт за декабрь строился по январскому срезу.
+        run = _agent_agents_store.start_agent_run(user.id, agent, user,
+                                                  min_date=task.get("min_date"),
+                                                  max_date=task.get("max_date"))
         run_id = run["run_id"]
     else:
         dataset_index = task.get("dataset_index")

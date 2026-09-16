@@ -550,8 +550,15 @@ async def _load_user(user_id: Any):
         return await session.get(AuthUser, int(user_id))
 
 
-def start_agent_run(user_id: Any, agent: Dict[str, Any], user: Any, main_loop: Any = None) -> Dict[str, Any]:
-    """Создаёт и запускает прогон по конфигурации агента."""
+def start_agent_run(user_id: Any, agent: Dict[str, Any], user: Any, main_loop: Any = None,
+                    min_date: Any = None, max_date: Any = None) -> Dict[str, Any]:
+    """Создаёт и запускает прогон по конфигурации агента.
+
+    ``min_date``/``max_date`` передаёт задача Центра ИИ-задач: период из постановки главнее
+    литералов в шагах цепочки. Раньше прогон цепочки вообще не получал период задачи, поэтому
+    шаг с чужим (например, январским) периодом читал не тот месяц, и отчёт за декабрь
+    назывался январским.
+    """
     from . import runs as agent_runs
 
     run = agent_runs.create_run(
@@ -561,6 +568,8 @@ def start_agent_run(user_id: Any, agent: Dict[str, Any], user: Any, main_loop: A
         dataset_index=agent.get("dataset_index"),
         dataset_name=agent.get("dataset_name") or "",
         dataset_label=agent.get("dataset_name") or "",
+        min_date=min_date,
+        max_date=max_date,
         tools=agent.get("tools"),
         model_choice=str(agent.get("model") or "gpt"),
         folder=str(agent.get("folder") or "Агент"),
