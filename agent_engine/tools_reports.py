@@ -790,6 +790,16 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
                     "required": ["heading"],
                 },
             },
+            "findings": {
+                "type": "array",
+                "description": "темы и цитаты из analyze_texts, если передаются отдельно от разделов",
+                "items": {"type": "object"},
+            },
+            "highlights": {
+                "type": "array",
+                "description": "ключевые сообщения, если передаются отдельно от разделов",
+                "items": {"type": "object"},
+            },
             "folder": {"type": "string", "description": "папка во вкладке «Отчёты» (по умолчанию папка агента)"},
             "author": {"type": "string", "description": "подпись автора отчёта"},
         },
@@ -806,8 +816,58 @@ async def build_report(
     subtitle: str = "",
     folder: Optional[str] = None,
     author: str = "агент Tellscope",
+    findings: Any = None,
+    highlights: Any = None,
+    **extra: Any,
 ):
     sections = _coerce_list(sections, "sections")
+    # Темы с цитатами и ключевые сообщения модель передаёт не только внутри раздела, но и
+    # параметрами верхнего уровня. Раньше такой вызов падал с
+    # TypeError: build_report() got an unexpected keyword argument 'findings' — инструмент
+    # не собирал отчёт вообще, и темы с цитатами терялись. Теперь они превращаются в разделы.
+    _rejected_top: List[str] = []
+
+    def _top_level_rows(value: Any, field: str) -> List[Dict[str, Any]]:
+        """Список объектов из параметра верхнего уровня; мусор не ломает сборку отчёта."""
+        if value is None or value == "":
+            return []
+        try:
+            items = _coerce_list(value, field)
+        except ToolError as exc:
+            _rejected_top.append(f"{field}: {exc}")
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    _top_findings = _top_level_rows(findings, "findings")
+    _top_highlights = _top_level_rows(highlights, "highlights")
+    if _rejected_top:
+        await ctx.log(
+            "build_report: параметры верхнего уровня пропущены — " + "; ".join(_rejected_top),
+            level="error",
+        )
+    if extra:
+        # Незнакомые параметры не должны ронять сборку отчёта. В журнале сервера этот же
+        # TypeError случался и с другими ключами модели ('links', 'index'): вызов падал
+        # целиком, и отчёт не собирался. Пишем ключи в журнал агента и продолжаем.
+        await ctx.log(
+            "build_report: незнакомые параметры пропущены — " + ", ".join(sorted(extra)),
+            level="error",
+        )
+    if _top_findings:
+        sections.append({
+            "heading": "Темы и цитаты из текстов сообщений",
+            "findings": _top_findings,
+        })
+    if _top_highlights:
+        sections.append({
+            "heading": "Ключевые сообщения",
+            "highlights": _top_highlights,
+        })
+    if _top_findings or _top_highlights:
+        await ctx.log(
+            "build_report: findings/highlights переданы параметрами верхнего уровня "
+            f"(темы: {len(_top_findings)}, сообщения: {len(_top_highlights)}) — добавлены разделами"
+        )
     if not sections:
         raise ToolError(
             "Нужны заголовок и разделы: вызовите build_report с аргументами "
