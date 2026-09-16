@@ -1721,6 +1721,97 @@ def _slice_stats(ctx) -> Dict[str, Any]:
     return out
 
 
+# --- Спам и шум в темах -----------------------------------------------------
+# Кластеры вроде «цена аккаунта» (194 дословно одинаковых сообщения «Цена - 50.000 ₽» из одного
+# канала) попадали в темы месяца и выбирались «ключевым инфоповодом». Признаки считаются по
+# сохранённым цитатам темы: метка Brand Analytics, рекламный шаблон и копипаста одного источника.
+SPAM_CATEGORIES = ("спам", "рекламные посты", "реклама", "спам и реклама", "рекламный пост")
+SPAM_AD_MARKERS = (
+    # продажа и обмен аккаунтов, игровых предметов
+    "цена аккаунта", "продам аккаунт", "продаю аккаунт", "куплю аккаунт", "купить аккаунт",
+    "покупка аккаунта", "продажа аккаунт", "аккаунты в наличии", "обмен продажа",
+    # ссылки-приглашения и реферальные предложения
+    "реферальн", "рефа", "по моей ссылке", "приглашаю в",
+    "больше скидок в боте", "промокод в боте", "промокоды в боте",
+    # прочий накруточный мусор
+    "казино", "букмекер", "ставки на спорт", "накрутка подписчиков", "бесплатные подписчики",
+    "заработок в интернете", "быстрый заработок",
+)
+# Копипаста: одинаковая фраза во всех цитатах темы, пришедшая из одного источника.
+SPAM_COPYPASTE_SHARE = 0.8
+SPAM_COPYPASTE_MIN_COUNT = 5
+
+
+def _noise_text(value: Any) -> str:
+    """Текст для сравнения: без регистра, знаков и лишних пробелов — «почти одинаковая фраза»."""
+    low = str(value or "").lower().replace("ё", "е")
+    low = re.sub(r"[^0-9a-zа-я]+", " ", low)
+    return re.sub(r"\s+", " ", low).strip()
+
+
+def _noise_voices(topic: Dict[str, Any]) -> int:
+    """Сколько разных голосов за темой: уникальные авторы и площадки среди её цитат."""
+    quotes = [q for q in (topic.get("quotes") or []) if isinstance(q, dict)]
+    authors = {str(q.get("author") or "").strip().lower() for q in quotes} - {""}
+    hubs = {str(q.get("hub") or "").strip().lower() for q in quotes} - {""}
+    return max(len(authors), len(hubs))
+
+
+def topic_noise_reasons(topic: Dict[str, Any]) -> List[str]:
+    """Почему тема считается спамом или шумом. Пустой список — тема нормальная.
+
+    Проверки намеренно узкие: «цена», «акции», «скидки», «купон» и прочие слова деловой
+    повестки спамом не считаются — за них отвечает копипаста одного источника и метка
+    Brand Analytics. Рекламные шаблоны перечислены только те, что не относятся к теме KFC.
+    """
+    if not isinstance(topic, dict):
+        return []
+    reasons: List[str] = []
+    category = _noise_text(topic.get("category"))
+    if any(marker in category for marker in SPAM_CATEGORIES):
+        reasons.append("метка Brand Analytics «%s»" % topic.get("category"))
+    haystack = " ".join(_noise_text(x) for x in
+                        (topic.get("name"), topic.get("essence"), topic.get("summary")))
+    for quote in (topic.get("quotes") or []):
+        if isinstance(quote, dict):
+            haystack += " " + _noise_text(quote.get("text"))
+    hit = next((marker for marker in SPAM_AD_MARKERS if marker in haystack), "")
+    if hit:
+        reasons.append("рекламный шаблон «%s»" % hit)
+    quotes = [q for q in (topic.get("quotes") or [])
+              if isinstance(q, dict) and str(q.get("text") or "").strip()]
+    if len(quotes) >= 2 and int(topic.get("count") or 0) >= SPAM_COPYPASTE_MIN_COUNT:
+        texts = [_noise_text(q.get("text")) for q in quotes]
+        top = max(set(texts), key=texts.count)
+        share = texts.count(top) / float(len(texts))
+        authors = {str(q.get("author") or "").strip().lower() for q in quotes} - {""}
+        hubs = {str(q.get("hub") or "").strip().lower() for q in quotes} - {""}
+        if share >= SPAM_COPYPASTE_SHARE and (len(authors) <= 1 or len(hubs) <= 1):
+            reasons.append("копипаста %.0f%% цитат из одного источника" % (share * 100))
+    return reasons
+
+
+def filter_spam_topics(topics: List[Dict[str, Any]]):
+    """Делит темы на нормальные и спам/шум.
+
+    Возвращает (оставшиеся темы, отфильтрованные с причинами, сколько сообщений отфильтровано).
+    """
+    kept: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    for topic in topics or []:
+        if not isinstance(topic, dict):
+            continue
+        reasons = topic_noise_reasons(topic)
+        if reasons:
+            dropped.append({"name": str(topic.get("name") or ""),
+                            "count": int(topic.get("count") or 0),
+                            "reasons": reasons})
+        else:
+            kept.append(topic)
+    messages = sum(item["count"] for item in dropped)
+    return kept, dropped, messages
+
+
 def _share(value: Any, total: Any) -> float:
     try:
         total = float(total or 0)
@@ -1767,16 +1858,8 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
     findings = _finding_rows(texts.get("findings"))
 
     topics: List[Dict[str, Any]] = []
-    category_counts: Dict[str, int] = {}
-    authors: Dict[str, int] = {}
     for row in findings:
         quotes = [q for q in (_quote_row(item) for item in (row.get("quotes") or [])) if q]
-        for quote in quotes:
-            if quote.get("author"):
-                authors[quote["author"]] = authors.get(quote["author"], 0) + 1
-        category = str(row.get("category") or "").strip()
-        if category:
-            category_counts[category] = category_counts.get(category, 0) + int(row.get("count") or 0)
         topics.append({
             "name": row.get("topic") or row.get("name") or "",
             "count": int(row.get("count") or 0),
@@ -1790,6 +1873,27 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "summary": row.get("summary") or row.get("essence") or "",
             "quotes": quotes[:3],
         })
+
+    # Спам и шум темами месяца не становятся: копипаста и рекламные шаблоны («цена аккаунта» в
+    # майском отчёте 2024 года — 194 одинаковых сообщения «Цена - 50.000 ₽» из одного канала)
+    # искажали и список тем, и выбор ключевого инфоповода. Сколько отфильтровано — видно пометкой.
+    topics, spam_topics, spam_messages = filter_spam_topics(topics)
+    topic_total = sum(int(item.get("count") or 0) for item in topics)
+    for item in topics:
+        item["share"] = _share(int(item.get("count") or 0), topic_total)
+        item["share_pct"] = round(item["share"] * 100, 2)
+
+    # Авторы и категории считаются уже без спама: иначе в «Активных авторах» годового отчёта
+    # оказывался автор рекламного канала, а категория «цена» раздувалась спам-кластером.
+    category_counts: Dict[str, int] = {}
+    authors: Dict[str, int] = {}
+    for item in topics:
+        for quote in item["quotes"]:
+            if quote.get("author"):
+                authors[quote["author"]] = authors.get(quote["author"], 0) + 1
+        category = str(item.get("category") or "").strip()
+        if category:
+            category_counts[category] = category_counts.get(category, 0) + int(item.get("count") or 0)
 
     highlights: List[Dict[str, Any]] = []
     for item in (texts.get("highlights") or []):
@@ -1878,6 +1982,13 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "shares": {key: _share(value, total) for key, value in tone_abs.items()},
         },
         "topics": topics,
+        # Сколько сообщений ушло в спам/шум: цифра видна в отчётах, но темами месяца не считается.
+        "filtered": {
+            "spam_topics": spam_topics,
+            "spam_messages": spam_messages,
+            "note": ("отфильтровано как спам/шум: %s сообщений" % _fmt(spam_messages))
+            if spam_messages else "",
+        },
         "categories": [
             {"category": name, "count": count, "share": _share(count, total)}
             for name, count in sorted(category_counts.items(), key=lambda item: -item[1])
@@ -1895,7 +2006,11 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "topics и quotes — из раздела чтения текстов (analyze_texts), их охват указан в sample_note",
             "tonality и messages.in_slice — по всему срезу периода",
             "authors — по процитированным и ключевым сообщениям отчёта",
-        ],
+        ] + ([
+            "отфильтровано как спам/шум: %s сообщений (%s)"
+            % (_fmt(spam_messages), "; ".join(
+                "«%s» — %s" % (item["name"], _fmt(item["count"])) for item in spam_topics[:5]))
+        ] if spam_messages else []),
     }
 
 

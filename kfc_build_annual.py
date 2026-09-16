@@ -243,6 +243,14 @@ FOCUS_RULES = [
 ]
 OTHER_FOCUS = "Прочие обсуждения"
 
+# Ключевой повод месяца — не просто самый крупный кластер, а самая крупная ОСМЫСЛЕННАЯ тема:
+# без спама и шума, подтверждённая не одним голосом и заметная в потоке месяца. Иначе честнее
+# прямо написать, что выраженного повода нет (как в мае 2024: после отсева спама «цена аккаунта»
+# крупнейшая тема месяца — 13 сообщений из 39 760).
+HOOK_MIN_VOICES = 2           # уникальных авторов или площадок среди цитат темы
+HOOK_MIN_MONTH_SHARE = 0.01   # доля сообщений месяца: повод не мельче 1% потока
+HOOK_NONE = "выраженного инфоповода нет"
+
 
 def focus_of(name):
     low = norm_name(name)
@@ -278,11 +286,81 @@ def focus_map(topics, months_total=0):
     return sorted(rows, key=lambda item: -item["count"])
 
 
+def month_topics(summaries, key):
+    """Темы месяца без спама и шума.
+
+    Фильтр тот же, что в месячном итоге (tools_reports.filter_spam_topics), поэтому и «сырые»
+    месячные итоги прошлых сборок читаются уже очищенными: спам не попадает ни в темы месяца,
+    ни в устойчивые направления, ни в выбор ключевого повода.
+    """
+    raw = (summaries.get(key) or {}).get("topics") or []
+    kept, dropped, count = TR.filter_spam_topics(raw)
+    return kept, dropped, count
+
+
+def month_spam(months, summaries):
+    """Отфильтрованный спам/шум по месяцам: объём и названия тем (для пометки в отчёте)."""
+    out = {}
+    for key in months:
+        payload = summaries.get(key) or {}
+        block = payload.get("filtered") if isinstance(payload.get("filtered"), dict) else {}
+        count = int(block.get("spam_messages") or 0)
+        names = [str(item.get("name") or "") for item in (block.get("spam_topics") or [])
+                 if isinstance(item, dict)]
+        if not count:
+            _kept, dropped, count = month_topics(summaries, key)
+            names = [item["name"] for item in dropped]
+        if count:
+            out[key] = {"messages": count, "topics": [name for name in names if name]}
+    return out
+
+
+def spam_note(months, spam_by_month):
+    """Строка-пометка: «Отфильтровано как спам/шум: N сообщений за K месяцев: …»."""
+    rows = [key for key in months if key in spam_by_month]
+    if not rows:
+        return ""
+    total = sum(int(spam_by_month[key]["messages"]) for key in rows)
+    parts = ["%s — %s" % (month_label(key), prose_num(spam_by_month[key]["messages"]))
+             for key in rows]
+    word = "месяц" if len(rows) == 1 else ("месяца" if 2 <= len(rows) <= 4 else "месяцев")
+    note = ("Отфильтровано как спам/шум: %s сообщений за %s %s: %s."
+            % (prose_num(total), prose_num(len(rows)), word, "; ".join(parts)))
+    # Названия отфильтрованных тем в отчёт не выносим: они лежат в поле filtered месячных
+    # итогов (там же причины), а в отчёте важно только, что это мусор и сколько его.
+    return note
+
+
+def voices_of(topic):
+    """Сколько разных голосов за темой: уникальные авторы и площадки среди её цитат."""
+    quotes = [q for q in (topic.get("quotes") or []) if isinstance(q, dict)]
+    authors = {str(q.get("author") or "").strip().lower() for q in quotes} - {""}
+    hubs = {str(q.get("hub") or "").strip().lower() for q in quotes} - {""}
+    return max(len(authors), len(hubs))
+
+
+def hook_of(tops, month_total):
+    """Самая крупная осмысленная тема месяца или None, если повода нет.
+
+    ``tops`` уже отсортированы по частоте. Тема спама и шума в список не попадает (её отсекает
+    month_topics), но проверяем ещё раз — на случай сырых месячных итогов.
+    """
+    for row in tops or []:
+        if row.get("spam") or not str(row.get("name") or "").strip():
+            continue
+        if int(row.get("voices") or 0) < HOOK_MIN_VOICES:
+            continue
+        if month_total and float(row.get("count") or 0) / float(month_total) < HOOK_MIN_MONTH_SHARE:
+            continue
+        return row
+    return None
+
+
 def aggregate_topics(months, summaries):
     agg = {}
     for key in months:
-        payload = summaries.get(key) or {}
-        for topic in payload.get("topics") or []:
+        # Спам и шум в устойчивые направления и в таблицы тем не попадают.
+        for topic in month_topics(summaries, key)[0]:
             name = norm_name(topic.get("name"))
             if not name:
                 continue
@@ -309,11 +387,20 @@ def aggregate_topics(months, summaries):
 
 
 def topics_by_month_map(months, summaries):
-    """Ведущие темы каждого месяца: список словарей, отсортированный по частоте."""
+    """Ведущие темы каждого месяца: список словарей, отсортированный по частоте.
+
+    Кроме частоты и тональности каждая тема несёт число голосов (уникальные авторы и площадки
+    среди её цитат) и признак спама: по ним выбирается осмысленный ключевой повод месяца.
+    """
     out = {}
     for key in months:
-        rows = [{"name": str(t.get("name") or "").strip(), "count": int(t.get("count") or 0),
-                 "tone": str(t.get("tone") or "")} for t in (summaries.get(key) or {}).get("topics") or []]
+        rows = []
+        for topic in month_topics(summaries, key)[0]:
+            rows.append({"name": str(topic.get("name") or "").strip(),
+                         "count": int(topic.get("count") or 0),
+                         "tone": str(topic.get("tone") or ""),
+                         "voices": voices_of(topic),
+                         "spam": bool(TR.topic_noise_reasons(topic))})
         rows.sort(key=lambda item: -item["count"])
         out[key] = rows
     return out
@@ -333,8 +420,9 @@ def aggregate_authors(months, summaries):
 def collect_links(months, summaries):
     links = []
     for key in months:
-        payload = summaries.get(key) or {}
-        for topic in payload.get("topics") or []:
+        # Ссылки берём только из тем без спама: иначе в «Источниках» оказывались ссылки
+        # рекламных каналов.
+        for topic in month_topics(summaries, key)[0]:
             for quote in (topic.get("quotes") or []):
                 if isinstance(quote, dict) and quote.get("url"):
                     links.append({"url": quote["url"], "text": str(quote.get("text") or "")[:220],
@@ -404,18 +492,26 @@ def informative_events(months, summaries):
     return out
 
 
-def hooks_of(months, topics_by_month, topics):
-    """Ведущий повод каждого месяца и его тип: повторяющийся или разовый."""
+def hooks_of(months, topics_by_month, topics, probe=None):
+    """Ключевой повод каждого месяца и его тип: повторяющийся, разовый или «нет повода».
+
+    Повод — самая крупная ОСМЫСЛЕННАЯ тема месяца: самый большой кластер берётся только если он
+    не спам, подтверждён не одним голосом и занимает не меньше процента сообщений месяца.
+    """
     index = {t["name"]: t for t in topics}
     rows = []
     for key in months:
         tops = topics_by_month.get(key) or []
-        if not tops:
+        total = int(((probe or {}).get(key) or {}).get("total") or 0)
+        best = hook_of(tops, total)
+        if best is None:
+            rows.append({"month": key, "name": HOOK_NONE, "count": 0, "months_count": 0,
+                         "voices": 0, "type": "нет повода"})
             continue
-        meta = index.get(tops[0]["name"]) or {}
+        meta = index.get(best["name"]) or {}
         months_count = int(meta.get("months_count") or 1)
-        rows.append({"month": key, "name": tops[0]["name"], "count": tops[0]["count"],
-                     "months_count": months_count,
+        rows.append({"month": key, "name": best["name"], "count": best["count"],
+                     "months_count": months_count, "voices": int(best.get("voices") or 0),
                      "type": "повторяющийся" if months_count > 1 else "разовый"})
     return rows
 
@@ -525,12 +621,14 @@ def build_year_report(year, months, summaries, probe, ctx):
     authors = aggregate_authors(months, summaries)
     links = collect_links(months, summaries)
     focuses = focus_map(topics)
-    hooks = hooks_of(months, per_month, topics)
+    hooks = hooks_of(months, per_month, topics, probe)
+    hook_by_month = {hook["month"]: hook for hook in hooks}
+    spam_by_month = month_spam(months, summaries)
     worst = max(months, key=lambda k: float((probe.get(k) or {}).get("negative_share") or 0))
     best = min(months, key=lambda k: float((probe.get(k) or {}).get("negative_share") or 0))
     biggest = max(months, key=lambda k: int((probe.get(k) or {}).get("total") or 0))
     smallest = min(months, key=lambda k: int((probe.get(k) or {}).get("total") or 0))
-    theme_count = sum(len((summaries.get(k) or {}).get("topics") or []) for k in months)
+    theme_count = sum(len(month_topics(summaries, key)[0]) for key in months)
 
     # ---- графики
     chart_volume = chart_volume_by_month(ctx, "Объём обсуждений KFC по месяцам: %d год" % year, months, probe)
@@ -558,35 +656,42 @@ def build_year_report(year, months, summaries, probe, ctx):
             pct(row.get("negative_share")),
             num(len((summaries.get(key) or {}).get("topics") or [])),
             "; ".join("%s (%s)" % (clip(t["name"], 26), num(t["count"])) for t in tops[:3]) or "—",
-            clip(tops[0]["name"], 34) if tops else "—",
+            clip((hook_by_month.get(key) or {}).get("name") or HOOK_NONE, 34),
         ])
     # Полные значения колонок таблицы: в ячейках названия тем сокращены по длине, поэтому
     # тот же список приводим целиком — чтобы ни одно название не потерялось.
     dyn_detail = []
     for key in months:
         tops = per_month.get(key) or []
+        hook = (hook_by_month.get(key) or {}).get("name") or HOOK_NONE
+        spam = spam_by_month.get(key) or {}
+        filtered = ("; отфильтровано как спам/шум: %s сообщений" % prose_num(spam["messages"])
+                    if spam else "")
         dyn_detail.append(
-            "• %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s."
+            "• %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s%s."
             % (month_label(key), prose_num((probe.get(key) or {}).get("total")),
                pct((probe.get(key) or {}).get("negative_share")),
                "; ".join("%s (%s)" % (t["name"], prose_num(t["count"])) for t in tops[:3]) or "—",
-               tops[0]["name"] if tops else "—"))
+               hook, filtered))
+    spam_line = spam_note(months, spam_by_month)
     sections.append({
         "heading": "Динамика по месяцам",
         "text": ("Объём обсуждений и доля негатива по месяцам. Самый крупный месяц года — %s (%s "
                  "сообщений), самый спокойный — %s (%s). Всего за год учтено %s сообщений и %s тем "
-                 "в месячных отчётах. Названия тем и инфоповодов в таблице сокращены по длине — "
+                 "в месячных отчётах. %sНазвания тем и инфоповодов в таблице сокращены по длине — "
                  "полностью они приведены в списке по месяцам в этом разделе."
                  % (month_label(biggest), prose_num((probe.get(biggest) or {}).get("total")),
                     month_label(smallest), prose_num((probe.get(smallest) or {}).get("total")),
-                    prose_num(total), prose_num(theme_count))),
+                    prose_num(total), prose_num(theme_count),
+                    (spam_line + " ") if spam_line else "")),
         "chart_ids": [chart_volume["chart_id"]],
         "tables": [TABLE("Месяц → объём, доля негатива, основные темы, ключевой инфоповод",
                          ["Месяц", "Сообщений", "Доля негатива", "Тем в отчёте", "Основные темы",
                           "Ключевой инфоповод"],
                          dyn_rows,
                          note="Основные темы — три ведущие темы месяца; в скобках — сколько раз тема "
-                              "встретилась в месячном отчёте.",
+                              "встретилась в месячном отчёте. Ключевой инфоповод — самая крупная "
+                              "осмысленная тема месяца: спам и шум исключены.",
                          layout="landscape")],
         "bullets": dyn_detail,
     })
@@ -671,10 +776,14 @@ def build_year_report(year, months, summaries, probe, ctx):
                             ["Месяц", "Повод"], extra_events))
     sections.append({
         "heading": "Ключевые инфоповоды года",
-        "text": ("Инфоповод месяца — ведущая тема месячного отчёта. Повод считается повторяющимся, "
+        "text": ("Инфоповод месяца — ведущая ОСМЫСЛЕННАЯ тема месячного отчёта: темы спама и шума "
+                 "отфильтрованы, повод должен быть подтверждён не одним источником и занимать не "
+                 "меньше процента сообщений месяца. Если такой темы нет, в отчёте прямо стоит «%s». "
+                 "Повод считается повторяющимся, "
                  "если та же тема встречается в отчётах нескольких месяцев года, и разовым, если "
                  "только в одном. Самый крупный повод года — %s (%s сообщений, %s)."
-                 % (top_hooks[0]["name"], prose_num(top_hooks[0]["count"]), month_label(top_hooks[0]["month"]))
+                 % (HOOK_NONE, top_hooks[0]["name"], prose_num(top_hooks[0]["count"]),
+                    month_label(top_hooks[0]["month"]))
                  if top_hooks else "Инфоповоды в месячных отчётах не выделены."),
         "tables": tables,
     })
@@ -738,7 +847,9 @@ def build_interannual(summaries, probe, years, ctx):
     authors = aggregate_authors(months, summaries)
     links = collect_links(months, summaries)
     focuses = focus_map(topics)
-    hooks = hooks_of(months, per_month, topics)
+    hooks = hooks_of(months, per_month, topics, probe)
+    hook_by_month = {hook["month"]: hook for hook in hooks}
+    spam_by_month = month_spam(months, summaries)
     focus_by_year = {}
     for year in years:
         focus_by_year[year] = {f["name"]: f for f in focus_map(aggregate_topics(per_year_months[year], summaries))}
@@ -946,13 +1057,16 @@ def build_interannual(summaries, probe, years, ctx):
     ]
     sections.append({
         "heading": "Инфоповоды: разовые и повторяющиеся",
-        "text": ("Инфоповод месяца — ведущая тема месячного отчёта. Повод считается повторяющимся, "
+        "text": ("Инфоповод месяца — ведущая ОСМЫСЛЕННАЯ тема месячного отчёта: темы спама и шума "
+                 "отфильтрованы, повод подтверждён не одним источником и занимает не меньше процента "
+                 "сообщений месяца (иначе в отчёте стоит «%s»). Повод считается повторяющимся, "
                  "если та же тема встречается в отчётах нескольких месяцев, и разовым, если только "
-                 "в одном."),
+                 "в одном." % HOOK_NONE),
         "tables": [
             TABLE("Инфоповоды по месяцам: разовые и повторяющиеся",
                   ["Месяц", "Ключевой повод", "Объём обсуждения", "Тип"], hook_rows,
-                  note="Объём обсуждения — частота ведущей темы месяца в месячном отчёте."),
+                  note="Объём обсуждения — частота ведущей темы месяца в месячном отчёте; "
+                       "спам и шум в выборе повода не участвуют."),
             TABLE("Поводы с максимальным объёмом (топ-5)",
                   ["Месяц", "Ключевой повод", "Объём обсуждения", "Тип"], top_rows),
         ],
@@ -984,29 +1098,35 @@ def build_interannual(summaries, probe, years, ctx):
         table_rows.append([key[:4], month_label(key), num((probe.get(key) or {}).get("total")),
                            pct((probe.get(key) or {}).get("negative_share")),
                            "; ".join("%s (%s)" % (clip(t["name"], 26), num(t["count"])) for t in tops[:2]) or "—",
-                           clip(tops[0]["name"], 34) if tops else "—"])
+                           clip((hook_by_month.get(key) or {}).get("name") or HOOK_NONE, 34)])
     # Полные значения колонок: в ячейках названия тем и инфоповодов сокращены по длине, поэтому
     # тот же перечень приводим целиком — ни одно значение не теряется.
     table_detail = []
     for key in months:
         tops = per_month.get(key) or []
+        hook = (hook_by_month.get(key) or {}).get("name") or HOOK_NONE
+        spam = spam_by_month.get(key) or {}
+        filtered = ("; отфильтровано как спам/шум: %s сообщений" % prose_num(spam["messages"])
+                    if spam else "")
         table_detail.append(
-            "• %s %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s."
+            "• %s %s — %s сообщений, доля негатива %s; основные темы: %s; ключевой инфоповод: %s%s."
             % (key[:4], month_name(key), prose_num((probe.get(key) or {}).get("total")),
                pct((probe.get(key) or {}).get("negative_share")),
                "; ".join("%s (%s)" % (t["name"], prose_num(t["count"])) for t in tops[:2]) or "—",
-               tops[0]["name"] if tops else "—"))
+               hook, filtered))
+    spam_line_all = spam_note(months, spam_by_month)
     sections.append({
         "heading": "Год → месяц → основные темы, доля негатива, ключевой инфоповод",
-        "text": ("Сводная таблица по всем месяцам периода и объём обсуждений по годам. Таблица "
+        "text": ("Сводная таблица по всем месяцам периода и объём обсуждений по годам. %sТаблица "
                  "печатается на альбомной странице и целиком: месяцы не разрываются между "
                  "страницами. Названия тем и инфоповодов в ячейках сокращены по длине — полностью "
-                 "они приведены в списке по месяцам в этом разделе."),
+                 "они приведены в списке по месяцам в этом разделе."
+                 % ((spam_line_all + " ") if spam_line_all else "")),
         "chart_ids": [chart_volume_all["chart_id"]],
         "tables": [TABLE("Все месяцы периода", ["Год", "Месяц", "Сообщений", "Доля негатива",
                                                "Основные темы", "Ключевой инфоповод"], table_rows,
                          note="Основные темы — две ведущие темы месяца; в скобках — сколько раз тема "
-                              "встретилась в месячном отчёте.",
+                              "встретилась в месячном отчёте. Ключевой инфоповод — самая крупная осмысленная тема месяца: спам и шум исключены.",
                          layout="landscape")],
         "bullets": table_detail,
     })
