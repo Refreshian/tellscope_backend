@@ -2038,6 +2038,12 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
     findings = _finding_rows(texts.get("findings"))
 
     topics: List[Dict[str, Any]] = []
+    # Все цитаты темы — для проверки на спам: решение обязано опираться на те же данные, что и
+    # путь сборки отчёта (там фильтр проверяет строку findings целиком). Иначе итог месяца и
+    # документ расходятся: в июне 2026 кластер «Рефералы и возвраты» вычищался из отчёта, но
+    # оставался в темах итога — рекламный шаблон стоял в 6 цитатах из 9, а в итог попадали
+    # только первые три.
+    all_quotes: List[List[Dict[str, Any]]] = []
     for row in findings:
         quotes = [q for q in (_quote_row(item) for item in (row.get("quotes") or [])) if q]
         # Категорию берём здесь: она нужна записи темы, а счётчики категорий считаются ниже,
@@ -2056,11 +2062,19 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
             "summary": row.get("summary") or row.get("essence") or "",
             "quotes": quotes[:3],
         })
+        all_quotes.append(quotes)
 
     # Спам и шум темами месяца не становятся: копипаста и рекламные шаблоны («цена аккаунта» в
     # майском отчёте 2024 года — 194 одинаковых сообщения «Цена - 50.000 ₽» из одного канала)
     # искажали и список тем, и выбор ключевого инфоповода. Сколько отфильтровано — видно пометкой.
-    topics, spam_topics, spam_messages = filter_spam_topics(topics)
+    probe: List[Dict[str, Any]] = []
+    for item, item_quotes in zip(topics, all_quotes):
+        row = dict(item)
+        row["quotes"] = item_quotes
+        probe.append(row)
+    kept, spam_topics, spam_messages = filter_spam_topics(probe)
+    kept_names = {str(item.get("name") or "") for item in kept}
+    topics = [item for item in topics if str(item.get("name") or "") in kept_names]
     topic_total = sum(int(item.get("count") or 0) for item in topics)
     for item in topics:
         item["share"] = _share(int(item.get("count") or 0), topic_total)
