@@ -199,11 +199,13 @@ def _clean_sections(sections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         for key in ("bullets", "items"):
             if isinstance(section.get(key), list):
                 section[key] = [item for item in (_sanitize_report_text(x) for x in section[key]) if item]
+        section["tables"] = _clean_tables(section.get("tables"))
         for finding in section.get("findings") or []:
             if isinstance(finding, dict) and finding.get("essence"):
                 finding["essence"] = _sanitize_report_text(finding["essence"])
         has_data = bool(section.get("findings") or section.get("highlights") or section.get("chart_ids")
-                        or section.get("citations") or section.get("text") or section.get("bullets"))
+                        or section.get("citations") or section.get("text") or section.get("bullets")
+                        or section.get("tables"))
         if has_data:
             out.append(section)
     return out or sections
@@ -215,6 +217,91 @@ def _fmt(value: Any) -> str:
     if isinstance(value, int):
         return f"{value:,}".replace(",", " ")
     return str(value)
+
+
+# Маркеры списка, которые инструмент иногда присылает уже внутри текста. Стиль «List Bullet»
+# рисует свой маркер, поэтому второй («• • пункт») нужно убрать.
+BULLET_CHARS = "•·▪●◦‣∙"
+
+
+def _strip_bullet(value: Any) -> str:
+    """Убирает ведущие маркеры списка из строки пункта (может быть несколько подряд)."""
+    text = str(value if value is not None else "").strip()
+    while text and text[0] in BULLET_CHARS:
+        text = text[1:].strip()
+    return text
+
+
+def _clean_cell(value: Any) -> str:
+    """Ячейка таблицы: только косметика — переводы строк, табы, лишние пробелы.
+
+    Фильтр технических сообщений (TECHNICAL_RE) к ячейкам не применяется: он режет текст по
+    предложениям, а в ячейке лежит одно значение — иначе пропадали бы числа вида 404 или 507.
+    """
+    text = str(value if value is not None else "").strip()
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    return re.sub(r"\s{2,}", " ", text)
+
+
+def _clean_tables(tables: Any) -> List[Dict[str, Any]]:
+    """Готовит таблицы разделов к сборке: колонки, строки, заголовок и примечание."""
+    out: List[Dict[str, Any]] = []
+    for spec in (tables or []):
+        if not isinstance(spec, dict):
+            continue
+        columns = [_clean_cell(c) for c in (spec.get("columns") or [])]
+        rows = [[_clean_cell(c) for c in row] for row in (spec.get("rows") or [])
+                if isinstance(row, (list, tuple))]
+        rows = [row for row in rows if any(row)]
+        if not columns and not rows:
+            continue
+        out.append({
+            "title": _clean_cell(spec.get("title")),
+            "columns": columns,
+            "rows": rows,
+            "note": _sanitize_report_text(spec.get("note")) if spec.get("note") else "",
+        })
+    return out
+
+
+NUMERIC_HINTS = ("сообщени", "упоминани", "доля", "месяцев", "месяц", "объём", "объем", "%", "всего")
+
+
+def _is_numeric_label(label: Any) -> bool:
+    low = str(label or "").lower()
+    return any(hint in low for hint in NUMERIC_HINTS)
+
+
+def _is_numeric_cell(value: Any) -> bool:
+    text = (str(value if value is not None else "")
+            .replace(" ", "").replace("\u00a0", "").replace("%", "").replace("—", "").strip())
+    if not text:
+        return True  # пустая ячейка и прочерк не мешают считать колонку числовой
+    return bool(re.fullmatch(r"-?\d+([.,]\d+)?", text))
+
+
+def _set_table_align(table, labels: List[str]) -> None:
+    """Числовые колонки — по правому краю, текстовые — по левому (единый стиль таблиц)."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    right = [_is_numeric_label(label) for label in labels]
+    if not any(right):
+        return
+    for row in table.rows:
+        for idx, cell in enumerate(row.cells):
+            if idx < len(right) and right[idx]:
+                for para in cell.paragraphs:
+                    para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+
+def _opt_float(value: Any) -> Optional[float]:
+    """None и пустая строка → None («нет данных»), остальное → float."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _coerce_list(value: Any, name: str) -> List[Any]:
@@ -341,10 +428,11 @@ async def make_chart(
         ax.axis("equal")
     elif ctype == "line" or ctype == "area":
         for i, s in enumerate(series):
-            values = [float(v or 0) for v in (s.get("values") or [])]
+            # None в ряду означает «нет данных»: линия рвётся, а не рисует ложный ноль.
+            values = [_opt_float(v) for v in (s.get("values") or [])]
             color = PALETTE[i % len(PALETTE)]
             if ctype == "area":
-                ax.fill_between(idx, values, alpha=0.18, color=color)
+                ax.fill_between(idx, [0.0 if v is None else v for v in values], alpha=0.18, color=color)
             ax.plot(idx, values, marker="o", markersize=4, linewidth=2, color=color, label=str(s.get("name") or f"ряд {i+1}"))
     elif ctype == "hbar":
         values = [float(v or 0) for v in (series[0].get("values") or [])]
@@ -509,9 +597,48 @@ def _highlight_blocks(section: Dict[str, Any]) -> List[str]:
     return blocks
 
 
+def _docx_add_table(doc, spec: Dict[str, Any]) -> None:
+    """Настоящая таблица DOCX: шапка, выровненные колонки, единый стиль со таблицами тем."""
+    columns = [str(c) for c in (spec.get("columns") or [])]
+    rows = [list(row) for row in (spec.get("rows") or [])]
+    ncols = max([len(columns)] + [len(row) for row in rows] or [0])
+    if ncols <= 0:
+        return
+    columns += [""] * (ncols - len(columns))
+    if spec.get("title"):
+        doc.add_heading(str(spec["title"]), level=2)
+    table = doc.add_table(rows=1, cols=ncols)
+    table.style = "Light Grid Accent 1"
+    header = table.rows[0].cells
+    for cell, label in zip(header, columns):
+        cell.text = label
+    for row in rows:
+        cells = table.add_row().cells
+        for idx in range(ncols):
+            cells[idx].text = str(row[idx]) if idx < len(row) else ""
+    _set_table_align(table, columns)
+    if spec.get("note"):
+        note = doc.add_paragraph()
+        note.add_run(str(spec["note"])).italic = True
+
+
+def _docx_add_charts(doc, section: Dict[str, Any], meta: Dict[str, Any], figure_no: List[int]) -> None:
+    """Графики раздела с нумерованной подписью: «Рисунок 1. Заголовок»."""
+    from docx.shared import Inches
+
+    for chart_id in section.get("chart_ids") or []:
+        chart = (meta.get("charts") or {}).get(chart_id)
+        if not chart or not os.path.isfile(chart.get("path") or ""):
+            continue
+        figure_no[0] += 1
+        doc.add_picture(chart["path"], width=Inches(6.3))
+        caption = doc.add_paragraph()
+        caption.add_run(f"Рисунок {figure_no[0]}. {chart.get('title') or chart_id}").italic = True
+
+
 def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
     from docx import Document
-    from docx.shared import Inches, Pt
+    from docx.shared import Pt
 
     doc = Document()
     style = doc.styles["Normal"]
@@ -529,31 +656,47 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
             date=meta.get("date") or datetime.now().strftime("%d.%m.%Y %H:%M"),
         )
     ).italic = True
+    figure_no = [0]
     for section in sections:
         heading = section.get("heading") or "Раздел"
         doc.add_heading(heading, level=1)
         text = section.get("text") or ""
         for para in [p.strip() for p in str(text).split("\n") if p.strip()]:
             doc.add_paragraph(para)
+        # -------- графики: сразу после вводного текста, с подписью --------
+        _docx_add_charts(doc, section, meta, figure_no)
+        # -------- настоящие таблицы раздела --------
+        for spec in section.get("tables") or []:
+            _docx_add_table(doc, spec)
         for bullet in section.get("bullets") or []:
-            doc.add_paragraph(str(bullet), style="List Bullet")
+            line = _strip_bullet(bullet)
+            if line:
+                doc.add_paragraph(line, style="List Bullet")
         # -------- текстовые находки: темы с частотами, долями и цитатами --------
         findings = _finding_rows(section.get("findings"))
         if findings:
             doc.add_heading("Темы из текстов сообщений", level=2)
-            table = doc.add_table(rows=1, cols=5)
+            show_share = any(item.get("share") is not None for item in findings[:12])
+            labels = ["Тема", "Пояснение", "Сообщений"] + (["Доля среза"] if show_share else []) + ["Тональность"]
+            table = doc.add_table(rows=1, cols=len(labels))
             table.style = "Light Grid Accent 1"
             header = table.rows[0].cells
-            for cell, label in zip(header, ("Тема", "Пояснение", "Сообщений", "Доля среза", "Тональность")):
+            for cell, label in zip(header, labels):
                 cell.text = label
             for item in findings[:12]:
                 row = table.add_row().cells
-                row[0].text = str(item.get("topic") or "—")
-                # Пояснение — от модели (Qwen3-32B): о чём эта тема, без цифр и перечислений.
-                row[1].text = str(item.get("essence") or item.get("summary") or "—")
-                row[2].text = _fmt(item.get("count"))
-                row[3].text = _fmt_share(item.get("share")) if item.get("share") is not None else "—"
-                row[4].text = str(item.get("tone") or "—")
+                values = [
+                    str(item.get("topic") or "—"),
+                    # Пояснение — от модели (Qwen3-32B): о чём эта тема, без цифр и перечислений.
+                    str(item.get("essence") or item.get("summary") or "—"),
+                    _fmt(item.get("count")),
+                ]
+                if show_share:
+                    values.append(_fmt_share(item.get("share")) if item.get("share") is not None else "—")
+                values.append(str(item.get("tone") or "—"))
+                for cell, value in zip(row, values):
+                    cell.text = value
+            _set_table_align(table, labels)
             for item in findings[:12]:
                 topic = str(item.get("topic") or "Тема")
                 head = doc.add_paragraph()
@@ -604,12 +747,7 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
                 if item.get("url"):
                     para.add_run(" ")
                     _docx_hyperlink(para, str(item["url"]), "ссылка")
-        for chart_id in section.get("chart_ids") or []:
-            chart = meta.get("charts", {}).get(chart_id)
-            if chart and os.path.isfile(chart.get("path") or ""):
-                doc.add_picture(chart["path"], width=Inches(6.3))
-                cap = doc.add_paragraph()
-                cap.add_run(f"Рис. {chart_id}: {chart.get('title')}").italic = True
+        # Графики раздела уже вставлены выше (перед таблицами) через _docx_add_charts.
         citations = section.get("citations") or []
         if citations:
             doc.add_paragraph("Источники:")
@@ -624,10 +762,27 @@ def _build_docx(path: str, title: str, subtitle: str, sections: List[Dict[str, A
     doc.save(path)
 
 
-def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any]) -> None:
+class _PageCounter:
+    """Сквозная нумерация страниц PDF: «стр. 7 из 29» вместо номера внутри блока."""
+
+    def __init__(self):
+        self.no = 0
+        self.total = 0
+
+    def mark(self) -> str:
+        self.no += 1
+        return f"стр. {self.no} из {self.total}" if self.total else f"стр. {self.no}"
+
+    def reset(self):
+        self.no = 0
+
+
+def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any],
+                    counter: "_PageCounter" = None) -> None:
     plt = _mpl()
     from matplotlib.backends.backend_pdf import PdfPages  # noqa: F401  (тип для аннотации)
 
+    counter = counter or _PageCounter()
     page_lines = 52
     lines: List[str] = []
     for block in blocks:
@@ -637,6 +792,7 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any]) ->
     pages = [lines[i : i + page_lines] for i in range(0, len(lines), page_lines)] or [[""]]
     for page_no, chunk in enumerate(pages):
         fig = plt.figure(figsize=(8.27, 11.69), dpi=140)
+        label = counter.mark()
         fig.text(0.08, 0.94, title, fontsize=15, fontweight="bold", va="top")
         if page_no == 0:
             fig.text(
@@ -659,16 +815,117 @@ def _pdf_text_pages(pdf, title: str, blocks: List[str], meta: Dict[str, Any]) ->
         for line in chunk:
             fig.text(0.08, y, line, fontsize=9.5, va="top", family="DejaVu Sans")
             y -= 0.0155
-        fig.text(0.5, 0.03, f"стр. {page_no + 1} из {len(pages)}", fontsize=8, color="#98A2B3", ha="center")
+        fig.text(0.5, 0.03, label, fontsize=8, color="#98A2B3", ha="center")
         pdf.savefig(fig)
         plt.close(fig)
 
 
-def _pdf_chart_page(pdf, chart: Dict[str, Any]) -> None:
+TABLE_LINE_WIDTH = 108
+TABLE_LINE_WIDTH_WIDE = 160
+
+
+def _table_grid(spec: Dict[str, Any], total_width: int = TABLE_LINE_WIDTH) -> List[str]:
+    """Табличный блок для PDF: колонки выровнены пробелами под моноширинный шрифт.
+
+    Длинные ячейки (названия тем, перечисления) переносятся на следующую строку внутри
+    самой ячейки, поэтому данные не теряются.
+    """
+    columns = [str(c) for c in (spec.get("columns") or [])]
+    rows = [[("" if c is None else str(c)) for c in row] for row in (spec.get("rows") or [])]
+    ncols = max([len(columns)] + [len(row) for row in rows] or [0])
+    if ncols <= 0:
+        return []
+    columns += [""] * (ncols - len(columns))
+    rows = [row + [""] * (ncols - len(row)) for row in rows]
+    gap = 2
+    min_width = 8
+    budget = max(ncols * min_width, total_width - gap * (ncols - 1))
+    widths = [max(len(row[i]) for row in ([columns] + rows)) for i in range(ncols)]
+    # Ужимаем самые широкие колонки по одной, пока таблица не впишется в ширину страницы.
+    guard = 0
+    while sum(widths) > budget and guard < 100000:
+        guard += 1
+        shrinkable = [i for i in range(ncols) if widths[i] > min_width]
+        if not shrinkable:
+            break
+        widths[max(shrinkable, key=lambda i: widths[i])] -= 1
+    aligns = ["right" if _is_numeric_label(columns[i]) and all(_is_numeric_cell(r[i]) for r in rows) else "left"
+              for i in range(ncols)]
+
+    def cell_lines(value: str, width: int) -> List[str]:
+        text = str(value or "")
+        if len(text) <= width:
+            return [text]
+        return textwrap.wrap(text, width=width) or [""]
+
+    out: List[str] = []
+    for idx, row in enumerate([columns] + rows):
+        cells = [cell_lines(row[i], widths[i]) for i in range(ncols)]
+        height = max(len(cell) for cell in cells)
+        for line_no in range(height):
+            parts = []
+            for i in range(ncols):
+                text = cells[i][line_no] if line_no < len(cells[i]) else ""
+                parts.append(text.rjust(widths[i]) if aligns[i] else text.ljust(widths[i]))
+            out.append("  ".join(parts).rstrip())
+        if idx == 0:
+            out.append("─" * min(total_width, sum(widths) + gap * (ncols - 1)))
+    return out
+
+
+def _pdf_table_pages(pdf, title: str, specs: List[Dict[str, Any]], meta: Dict[str, Any],
+                     counter: "_PageCounter" = None) -> None:
+    """Таблицы раздела отдельными страницами PDF: подпись, шапка, выровненные колонки.
+
+    Широкая таблица (много колонок или длинные ячейки) уходит на альбомную страницу,
+    чтобы текст не сжимался в нечитаемую колонку.
+    """
+    plt = _mpl()
+    counter = counter or _PageCounter()
+
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        lines = _table_grid(spec, TABLE_LINE_WIDTH)
+        if not lines:
+            continue
+        landscape = max(len(line) for line in lines) > TABLE_LINE_WIDTH + 10
+        if landscape:
+            lines = _table_grid(spec, TABLE_LINE_WIDTH_WIDE)
+        size = (11.69, 8.27) if landscape else (8.27, 11.69)
+        row_h = 0.0205 if landscape else 0.0145
+        caption = str(spec.get("title") or "")
+        note = str(spec.get("note") or "")
+        head_h = 0.035 if caption else 0.0
+        per_page = max(8, int((0.845 - head_h) / row_h))
+        chunks = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
+        for page_no, chunk in enumerate(chunks):
+            fig = plt.figure(figsize=size, dpi=140)
+            label = counter.mark()
+            fig.text(0.055, 0.955, title, fontsize=13, fontweight="bold", va="top")
+            if page_no:
+                fig.text(0.945, 0.955, "(продолжение)", fontsize=8, color="#98A2B3", ha="right", va="top")
+            y = 0.905
+            if caption:
+                fig.text(0.055, y, caption, fontsize=9.5, fontweight="bold", va="top", color="#101828")
+                y -= head_h
+            for line in chunk:
+                fig.text(0.055, y, line, fontsize=7.5, va="top", family="DejaVu Sans Mono", color="#101828")
+                y -= row_h
+            if note and page_no == len(chunks) - 1:
+                fig.text(0.055, max(0.05, y - 0.008), note, fontsize=8, va="top", color="#667085", style="italic")
+            fig.text(0.5, 0.03, label, fontsize=8, color="#98A2B3", ha="center")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+def _pdf_chart_page(pdf, chart: Dict[str, Any], counter: "_PageCounter" = None) -> None:
     plt = _mpl()
     import matplotlib.image as mpimg
 
+    counter = counter or _PageCounter()
     fig = plt.figure(figsize=(8.27, 11.69), dpi=140)
+    label = counter.mark()
     try:
         img = mpimg.imread(chart["path"])
         ax = fig.add_axes([0.06, 0.28, 0.88, 0.5])
@@ -677,15 +934,19 @@ def _pdf_chart_page(pdf, chart: Dict[str, Any]) -> None:
     except Exception:
         fig.text(0.08, 0.6, "график недоступен", fontsize=11)
     fig.text(0.08, 0.22, chart.get("title") or "", fontsize=13, fontweight="bold", va="top")
+    fig.text(0.5, 0.03, label, fontsize=8, color="#98A2B3", ha="center")
     pdf.savefig(fig)
     plt.close(fig)
 
 
 def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+    """Собирает PDF за два прохода: сначала считаем страницы, потом печатаем «стр. N из M»."""
+    import io as _io
+
     plt = _mpl()
     from matplotlib.backends.backend_pdf import PdfPages
 
-    with PdfPages(path) as pdf:
+    def render(pdf, counter: _PageCounter) -> None:
         cover_lines: List[str] = []
         if subtitle:
             cover_lines.append(subtitle)
@@ -693,38 +954,59 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
         cover_lines.append("Содержание:")
         for i, section in enumerate(sections, 1):
             cover_lines.append(f"{i}. {section.get('heading') or 'Раздел'}")
-        _pdf_text_pages(pdf, title, cover_lines, meta)
+        _pdf_text_pages(pdf, title, cover_lines, meta, counter)
         for section in sections:
-            blocks = [f"{(section.get('heading') or 'Раздел').upper()}"]
+            head = (section.get("heading") or "Раздел").upper()
+            # 1) заголовок, вводный текст и списки выводов (без двойных маркеров)
+            blocks = [head]
             if section.get("text"):
                 blocks.append(section["text"])
             for bullet in section.get("bullets") or []:
-                blocks.append(f"• {bullet}")
-            findings = _finding_rows(section.get("findings"))
-            if findings:
-                blocks.append("")
-                blocks.append("ТЕМЫ ИЗ ТЕКСТОВ СООБЩЕНИЙ")
-                blocks.extend(_findings_blocks(section))
-            highlights = _finding_rows(section.get("highlights"))
-            if highlights:
-                blocks.append("")
-                blocks.append("КЛЮЧЕВЫЕ СООБЩЕНИЯ")
-                blocks.extend(_highlight_blocks(section))
-            for cite in (section.get("citations") or [])[:20]:
-                blocks.append(f"— {cite.get('title') or ''} {cite.get('url') or ''}".strip())
-            _pdf_text_pages(pdf, title, blocks, meta)
+                line = _strip_bullet(bullet)
+                if line:
+                    blocks.append(f"• {line}")
+            _pdf_text_pages(pdf, title, blocks, meta, counter)
+            # 2) графики раздела — отдельными страницами
             for chart_id in section.get("chart_ids") or []:
                 chart = meta.get("charts", {}).get(chart_id)
                 if chart and os.path.isfile(chart.get("path") or ""):
-                    _pdf_chart_page(pdf, chart)
+                    _pdf_chart_page(pdf, chart, counter)
+            # 3) таблицы раздела — табличными блоками
+            tables = section.get("tables") or []
+            if tables:
+                _pdf_table_pages(pdf, head, tables, meta, counter)
+            # 4) находки, ключевые сообщения и источники
+            extra: List[str] = []
+            findings = _finding_rows(section.get("findings"))
+            if findings:
+                extra.append("")
+                extra.append("ТЕМЫ ИЗ ТЕКСТОВ СООБЩЕНИЙ")
+                extra.extend(_findings_blocks(section))
+            highlights = _finding_rows(section.get("highlights"))
+            if highlights:
+                extra.append("")
+                extra.append("КЛЮЧЕВЫЕ СООБЩЕНИЯ")
+                extra.extend(_highlight_blocks(section))
+            for cite in (section.get("citations") or [])[:20]:
+                extra.append(f"— {cite.get('title') or ''} {cite.get('url') or ''}".strip())
+            if extra:
+                _pdf_text_pages(pdf, title, extra, meta, counter)
+
+    counter = _PageCounter()
+    with PdfPages(_io.BytesIO()) as probe_pdf:
+        render(probe_pdf, counter)
+    counter.total = counter.no
+    counter.reset()
+    with PdfPages(path) as pdf:
+        render(pdf, counter)
 
 
 @tool(
     "build_report",
     title="Собрать отчёт (DOCX/PDF)",
     description=(
-        "Собирает итоговый отчёт: разделы с текстом, списки выводов, ТЕМЫ С ЦИТАТАМИ (findings из analyze_texts), "
-        "графики (по chart_id из make_chart) и ссылки на источники. "
+        "Собирает итоговый отчёт: разделы с текстом, списки выводов, ТАБЛИЦЫ (tables), ТЕМЫ С ЦИТАТАМИ "
+        "(findings из analyze_texts), графики (по chart_id из make_chart) и ссылки на источники. "
         "Файлы DOCX и PDF сохраняются в папку датасета во вкладке «Отчёты» и становятся доступны пользователю для скачивания. "
         "Вызывай последним шагом, когда данные собраны и тексты прочитаны (analyze_texts)."
     ),
@@ -743,6 +1025,20 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
                         "text": {"type": "string", "description": "основной текст раздела, абзацы через перевод строки"},
                         "bullets": {"type": "array", "items": {"type": "string"}, "description": "список выводов/тезисов"},
                         "chart_ids": {"type": "array", "items": {"type": "string"}, "description": "графики из make_chart"},
+                        "tables": {
+                            "type": "array",
+                            "description": "настоящие таблицы раздела: подпись, колонки, строки",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string", "description": "подпись таблицы"},
+                                    "columns": {"type": "array", "description": "шапка таблицы"},
+                                    "rows": {"type": "array", "description": "строки: список списков ячеек"},
+                                    "note": {"type": "string", "description": "примечание под таблицей"},
+                                },
+                                "required": ["columns", "rows"],
+                            },
+                        },
                         "findings": {
                             "type": "array",
                             "description": "темы из чтения текстов (analyze_texts): тема, число сообщений, доля, цитаты",
