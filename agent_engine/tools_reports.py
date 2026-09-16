@@ -1063,6 +1063,11 @@ def _period_key(lo: Any, hi: Any, fallback: str = "") -> str:
                 return "%04d-%02d-%02d" % (start[0], start[1], start[2])
             return "%04d-%02d" % (start[0], start[1])
         return "%04d" % start[0]
+    if start and end and start[0] != end[0]:
+        # Межгодовой период (например 2024–2026): ключ ГГГГ-ГГГГ. Раньше в этом случае
+        # возвращался месяц начала, и межгодовой итог сохранялся как 2024-05_summary.json,
+        # то есть под именем месячного итога за май 2024.
+        return "%04d-%04d" % (start[0], end[0])
     if start:
         return "%04d-%02d" % (start[0], start[1])
     return fallback or datetime.now().strftime("%Y-%m")
