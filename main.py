@@ -13000,6 +13000,8 @@ class HarnessTaskRequest(BaseModel):
     min_date: Optional[str] = None
     max_date: Optional[str] = None
     model: Optional[str] = None
+    # Необязательный белый список инструментов: прогон получит только их
+    tools: Optional[List[str]] = None
 
 
 def _harness_dataset_name(index: Optional[int]) -> str:
@@ -13197,6 +13199,7 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
     task = _harness.create_task(
         str(user.id), text, mode, request.index, dataset_name,
         min_date=request.min_date, max_date=request.max_date, model=(request.model or _harness.DEFAULT_MODEL),
+        tools=request.tools,
     )
 
     try:
@@ -13210,7 +13213,7 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
                 dataset_label=dataset_name,
                 min_date=request.min_date,
                 max_date=request.max_date,
-                tools=None,
+                tools=request.tools,
                 model_choice=(request.model or _harness.DEFAULT_MODEL),
                 folder="Центр задач",
                 mode=mode,
@@ -13406,7 +13409,7 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
             # Постановку повторяем целиком: период, датасет и модель из записи задачи.
             min_date=task.get("min_date"),
             max_date=task.get("max_date"),
-            tools=None,
+            tools=task.get("tools"),
             model_choice=str(task.get("model") or _harness.DEFAULT_MODEL),
             folder="Центр задач",
             mode=str(task.get("mode") or "run"),

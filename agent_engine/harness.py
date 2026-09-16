@@ -172,8 +172,14 @@ def find_task_by_run(user_id: Any, run_id: str) -> Optional[Dict[str, Any]]:
 
 
 def create_task(user_id: Any, text: str, mode: str, index: Optional[int], dataset_name: str = "",
-                min_date: Any = None, max_date: Any = None, model: str = "") -> Dict[str, Any]:
-    """Создаёт задачу. Период и модель сохраняем, чтобы «Запустить снова» повторял постановку."""
+                min_date: Any = None, max_date: Any = None, model: str = "",
+                tools: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Создаёт задачу; период, модель и набор инструментов нужны для «Запустить снова».
+
+    ``tools`` — необязательный белый список инструментов: если он задан, прогон получает только
+    эти инструменты (движок отклоняет остальные), поэтому тяжёлая сводная задача не уходит
+    в повторный разбор сырых данных, а собирается, например, только из готовых месячных отчётов.
+    """
     task = {
         "id": "ht_" + uuid.uuid4().hex[:10],
         "user_id": str(user_id),
@@ -186,6 +192,7 @@ def create_task(user_id: Any, text: str, mode: str, index: Optional[int], datase
         "min_date": min_date,
         "max_date": max_date,
         "model": model or "",
+        "tools": [str(name) for name in tools] if tools else None,
         "run_id": None,
         "result": None,
         "answer": "",
