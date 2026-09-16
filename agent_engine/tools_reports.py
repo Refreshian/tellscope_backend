@@ -1608,6 +1608,21 @@ async def build_report(
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "charts": ctx.charts,
     }
+    # Спам и шум в готовый отчёт не попадают: кластеры-копипасты убираются из тем, таблиц,
+    # пунктов и прозы разделов, а их объём показывается пометкой «Отфильтровано как спам/шум».
+    try:
+        _stats_for_hook = _slice_stats(ctx)
+    except Exception:  # noqa: BLE001
+        _stats_for_hook = {}
+    try:
+        _hook_topics = _text_topics(getattr(ctx, "text_analysis", None))
+    except Exception:  # noqa: BLE001
+        _hook_topics = []
+    sections, spam_info = _strip_spam_sections(sections, int(_stats_for_hook.get("total") or 0),
+                                               _hook_topics)
+    if spam_info.get("messages"):
+        await ctx.log("Спам и шум вычищены из отчёта: %s сообщений (%s)"
+                      % (_fmt(spam_info["messages"]), ", ".join(spam_info["topics"][:3])), level="info")
     # Из разделов убираем служебные технические сообщения перед сборкой документов.
     sections = _clean_sections(sections)
     _build_docx(docx_path, str(title), subtitle, sections, meta)
@@ -1839,6 +1854,169 @@ def _quote_row(quote: Any) -> Optional[Dict[str, str]]:
     }
 
 
+# --- Спам и шум в готовом отчёте -------------------------------------------
+# Сборщик не должен печатать кластеры-копипасты (реклама аккаунтов, реферальные ссылки,
+# пресс-релизы вне темы): они убираются из тем, таблиц, пунктов и прозы разделов, а объём
+# показывается пометкой «Отфильтровано как спам/шум: N сообщений». Ключевой повод считается
+# по тому же правилу, что в годовых отчётах: осмысленная тема, не спам, подтверждённая не
+# одним голосом и не мельче процента сообщений месяца.
+HOOK_MIN_VOICES = 2
+HOOK_MIN_MONTH_SHARE = 0.01
+HOOK_NONE = "выраженного инфоповода нет"
+_FILTERED_PREFIX = "Отфильтровано как спам/шум:"
+_SPAM_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_SPAM_BULLETS = ("- ", "* ", "• ", "– ", "— ")
+
+
+def _spam_voices(topic: Dict[str, Any]) -> int:
+    """Сколько разных голосов за темой: уникальные авторы и площадки среди её цитат."""
+    quotes = [q for q in (topic.get("quotes") or []) if isinstance(q, dict)]
+    authors = {str(q.get("author") or "").strip().lower() for q in quotes} - {""}
+    hubs = {str(q.get("hub") or "").strip().lower() for q in quotes} - {""}
+    return max(len(authors), len(hubs))
+
+
+def _strip_marked_sentence(sentence: str, markers: List[str]) -> str:
+    """Вырезает из предложения название отфильтрованной темы и повисший союз.
+
+    «Активность по темам «X» (4052) и «Y» (1278)» -> «Активность по темам «Y» (1278)»:
+    соседние темы в предложении сохраняются, поэтому теряется только мусор.
+    """
+    out = sentence
+    for mark in markers:
+        out = re.sub(r"«\s*" + re.escape(mark) + r"\s*»\s*\([^)]*\)", " ", out, flags=re.I)
+        out = re.sub(r"«\s*" + re.escape(mark) + r"\s*»", " ", out, flags=re.I)
+        out = re.sub(re.escape(mark), " ", out, flags=re.I)
+    out = re.sub(r"\s+", " ", out)
+    out = re.sub(r"\s+и\s+(?=[«\"(])", " ", out)
+    out = re.sub(r"\s+и\s*([.,;:])", r"\1", out)
+    out = re.sub(r"\s+и\s*$", "", out)
+    out = re.sub(r"^\s*(и|а также|также|но)\s+", "", out, flags=re.I)
+    out = re.sub(r",\s*(?=[.,;:])", "", out)
+    out = re.sub(r"\s+([.,;:])", r"\1", out)
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
+def _strip_spam_text(text: Any, markers: List[str]) -> str:
+    """Текст раздела без упоминаний отфильтрованных тем. Пункты списка убираются целиком."""
+    if not text:
+        return text
+    kept_paras: List[str] = []
+    for para in str(text).split("\n"):
+        stripped = para.strip()
+        if not stripped or not any(m in stripped.lower() for m in markers):
+            kept_paras.append(para)
+            continue
+        if stripped.startswith(_SPAM_BULLETS):
+            continue
+        keep: List[str] = []
+        for sentence in _SPAM_SENT_SPLIT.split(stripped):
+            if not any(m in sentence.lower() for m in markers):
+                keep.append(sentence)
+                continue
+            fixed = _strip_marked_sentence(sentence, markers)
+            if len(fixed) >= 25 and not any(m in fixed.lower() for m in markers):
+                keep.append(fixed)
+        merged = re.sub(r"\s{2,}", " ", " ".join(keep)).strip()
+        if merged:
+            kept_paras.append(merged)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept_paras).strip())
+
+
+def _text_topics(texts: Any) -> List[Dict[str, Any]]:
+    """Темы из раздела чтения текстов с цитатами (автор и площадка) — источник для правила повода.
+
+    В разделы отчёта агент передаёт цитаты урезанными, поэтому «сколько голосов за темой»
+    считается здесь, по данным analyze_texts.
+    """
+    data = texts if isinstance(texts, dict) else {}
+    out: List[Dict[str, Any]] = []
+    for row in _finding_rows(data.get("findings")):
+        quotes = [q for q in (_quote_row(item) for item in (row.get("quotes") or [])) if q]
+        out.append({"name": str(row.get("topic") or row.get("name") or ""),
+                    "count": int(row.get("count") or 0),
+                    "tone": row.get("tone") or "",
+                    "category": str(row.get("category") or ""),
+                    "quotes": quotes})
+    return out
+
+
+def _hook_line(topics: List[Dict[str, Any]], month_total: int = 0) -> str:
+    """Ключевой повод месяца по правилу годовых: осмысленная тема или честное «нет»."""
+    for item in topics:
+        if item.get("spam") or not str(item.get("name") or "").strip():
+            continue
+        if _spam_voices(item) < HOOK_MIN_VOICES:
+            continue
+        if month_total and int(item.get("count") or 0) / float(month_total) < HOOK_MIN_MONTH_SHARE:
+            continue
+        return ("Ключевой инфоповод: «%s» — %s сообщений, голосов не меньше %d."
+                % (item["name"], _fmt(int(item.get("count") or 0)), _spam_voices(item)))
+    return ("Ключевой инфоповод: %s — крупнейшая осмысленная тема не подтверждена "
+            "несколькими источниками и не занимает процент сообщений месяца." % HOOK_NONE)
+
+
+def _strip_spam_sections(sections: List[Dict[str, Any]], month_total: int = 0,
+                         topics: List[Dict[str, Any]] = None):
+    """Убирает спам и шум из разделов готового отчёта.
+
+    Возвращает (разделы, справка): из findings/таблиц/пунктов/ссылок вычищаются записи
+    отфильтрованных тем, из прозы — предложения с их названиями, в первый раздел с текстом
+    добавляется пометка «Отфильтровано как спам/шум: N сообщений» и строка о ключевом поводе.
+    """
+    if not topics:
+        topics = []
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            for row in (section.get("findings") or []):
+                if isinstance(row, dict):
+                    topics.append(row)
+    kept_topics, dropped, spam_messages = filter_spam_topics(topics)
+    if not dropped:
+        return sections, {"messages": 0, "topics": [], "note": ""}
+    markers = sorted({str(item["name"]).lower() for item in dropped if item.get("name")},
+                     key=len, reverse=True)
+    markers += [m for m in SPAM_AD_MARKERS if m not in markers]
+    out: List[Dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        section = dict(section)
+        if section.get("findings"):
+            section["findings"] = [row for row in section["findings"]
+                                   if not (isinstance(row, dict) and topic_noise_reasons(row))]
+        for key in ("highlights", "citations"):
+            if isinstance(section.get(key), list):
+                section[key] = [
+                    item for item in section[key]
+                    if not any(m in json.dumps(item, ensure_ascii=False).lower() for m in markers)
+                ]
+        if isinstance(section.get("bullets"), list):
+            section["bullets"] = [item for item in section["bullets"]
+                                  if not any(m in str(item).lower() for m in markers)]
+        for table in (section.get("tables") or []):
+            if isinstance(table, dict) and isinstance(table.get("rows"), list):
+                table["rows"] = [row for row in table["rows"]
+                                 if not any(m in " ".join(str(cell) for cell in row).lower()
+                                            for m in markers)]
+        section["text"] = _strip_spam_text(section.get("text"), markers)
+        out.append(section)
+    note = ("%s %s сообщений — рекламная копипаста из одного канала (в темы месяца и в отчёт "
+            "такие кластеры не включены). %s"
+            % (_FILTERED_PREFIX, _fmt(spam_messages),
+               _hook_line([row for row in kept_topics], month_total)))
+    target = next((s for s in out if str(s.get("text") or "").strip()), None)
+    if target is not None:
+        target["text"] = note + "\n\n" + str(target.get("text") or "").lstrip()
+    elif out:
+        out[0]["text"] = note
+    else:
+        out = [{"heading": "Отчёт", "text": note}]
+    return out, {"messages": spam_messages,
+                 "topics": [str(item["name"]) for item in dropped], "note": note}
+
+
 def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str, Any]],
                      files: List[Dict[str, Any]], negative_count: int) -> Dict[str, Any]:
     """Компактный итог одного запуска в одинаковом формате.
@@ -1862,6 +2040,9 @@ def _summary_payload(ctx, title: str, folder_name: str, sections: List[Dict[str,
     topics: List[Dict[str, Any]] = []
     for row in findings:
         quotes = [q for q in (_quote_row(item) for item in (row.get("quotes") or [])) if q]
+        # Категорию берём здесь: она нужна записи темы, а счётчики категорий считаются ниже,
+        # уже без спама (иначе категория «цена» раздувалась спам-кластером).
+        category = str(row.get("category") or "").strip()
         topics.append({
             "name": row.get("topic") or row.get("name") or "",
             "count": int(row.get("count") or 0),
