@@ -1770,8 +1770,10 @@ def topic_noise_reasons(topic: Dict[str, Any]) -> List[str]:
     category = _noise_text(topic.get("category"))
     if any(marker in category for marker in SPAM_CATEGORIES):
         reasons.append("метка Brand Analytics «%s»" % topic.get("category"))
+    # Название темы приходит то полем name (месячный итог), то полем topic (findings чтения текстов).
     haystack = " ".join(_noise_text(x) for x in
-                        (topic.get("name"), topic.get("essence"), topic.get("summary")))
+                        (topic.get("name") or topic.get("topic"), topic.get("essence"),
+                         topic.get("summary")))
     for quote in (topic.get("quotes") or []):
         if isinstance(quote, dict):
             haystack += " " + _noise_text(quote.get("text"))
@@ -1803,7 +1805,7 @@ def filter_spam_topics(topics: List[Dict[str, Any]]):
             continue
         reasons = topic_noise_reasons(topic)
         if reasons:
-            dropped.append({"name": str(topic.get("name") or ""),
+            dropped.append({"name": str(topic.get("name") or topic.get("topic") or ""),
                             "count": int(topic.get("count") or 0),
                             "reasons": reasons})
         else:
