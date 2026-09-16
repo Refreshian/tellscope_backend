@@ -27,6 +27,16 @@ BATCH_MAX_TOKENS = 700
 REDUCE_MAX_TOKENS = 1200
 PARALLEL_BATCHES = 4
 
+# Окно локального vLLM (mlops/lock.yaml, generate.max_model_len): промпт вместе с ответом
+# обязаны в него укладываться, иначе vLLM отвечает 400 и вызов падает. Именно так падало
+# наименование тем: промпт 5693 токена плюс запрошенные 2500 = 8193 при окне 8192, и темы
+# оставались с черновыми названиями. Оценка размера — та же, что в agent_engine/loop.py.
+VLLM_MAX_MODEL_LEN = int(os.environ.get("TELLSCOPE_VLLM_MAX_LEN") or 8192)
+VLLM_SAFETY_TOKENS = int(os.environ.get("TELLSCOPE_VLLM_SAFETY_TOKENS") or 256)
+VLLM_MIN_OUTPUT_TOKENS = int(os.environ.get("TELLSCOPE_VLLM_MIN_OUTPUT") or 192)
+CHARS_PER_TOKEN = 3.2
+TOKEN_ESTIMATE_MARGIN = 1.2
+
 THINK_OFF = {"chat_template_kwargs": {"enable_thinking": False}}
 
 MAP_SYSTEM = (
@@ -89,6 +99,39 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
+def _context_limit(vllm_cfg: Optional[dict] = None) -> int:
+    """Окно модели для профиля: у быстрого чтения и у 32B оно своё (в lock.yaml)."""
+    limit = int((vllm_cfg or {}).get("max_model_len") or 0)
+    return limit or VLLM_MAX_MODEL_LEN
+
+
+def _prompt_tokens_estimate(messages: List[dict]) -> int:
+    """Оценка размера промпта в токенах — с запасом на шаблон чата и разметку JSON."""
+    chars = sum(len(str(msg.get("content") or "")) for msg in messages)
+    return int(chars / CHARS_PER_TOKEN * TOKEN_ESTIMATE_MARGIN) + VLLM_SAFETY_TOKENS
+
+
+async def _fit_max_tokens(ctx, messages: List[dict], want: int, vllm_cfg: Optional[dict] = None) -> int:
+    """Сколько токенов ответа можно запросить, чтобы промпт и ответ влезли в окно модели.
+
+    Без этого вызова вида «промпт 5693 + ответ 2500» vLLM отклоняет с 400 и инструмент
+    теряет результат целиком: честнее отдать ответ меньшего размера и записать об урезании.
+    """
+    want = int(want or 0) or BATCH_MAX_TOKENS
+    prompt_tokens = _prompt_tokens_estimate(messages)
+    room = _context_limit(vllm_cfg) - prompt_tokens - VLLM_SAFETY_TOKENS
+    if want <= room:
+        return want
+    safe = max(VLLM_MIN_OUTPUT_TOKENS, room)
+    try:
+        await ctx.log("Запрос к локальной модели не влезал в окно %d токенов (промпт ≈ %d + ответ %d) — "
+                      "ответ урезан до %d токенов" % (_context_limit(vllm_cfg), prompt_tokens, want, safe),
+                      level="warning")
+    except Exception:  # noqa: BLE001 — логирование не должно ломать вызов
+        pass
+    return safe
+
+
 async def _qwen(ctx, prompt: str, *, system: str = "", max_tokens: int = BATCH_MAX_TOKENS,
                 temperature: float = 0.15, vllm_cfg: Optional[dict] = None,
                 meta: Optional[Dict[str, Any]] = None) -> Tuple[str, int]:
@@ -104,6 +147,7 @@ async def _qwen(ctx, prompt: str, *, system: str = "", max_tokens: int = BATCH_M
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    max_tokens = await _fit_max_tokens(ctx, messages, max_tokens, vllm_cfg)
     result = await gateway.achat(
         provider="vllm",
         messages=messages,

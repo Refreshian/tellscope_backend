@@ -1140,7 +1140,7 @@ def _titles_cache_key(rows: List[Dict[str, Any]]) -> str:
 
 
 def _cluster_prompt_block(rows: List[Dict[str, Any]], docs_by_id: Dict[str, Dict[str, Any]],
-                          examples: int = 4) -> str:
+                          examples: int = 3) -> str:
     """Кластеры для модели: номер, ключевые термины и несколько представительных сообщений."""
     lines: List[str] = []
     for row in rows:
@@ -1149,7 +1149,7 @@ def _cluster_prompt_block(rows: List[Dict[str, Any]], docs_by_id: Dict[str, Dict
         members.sort(key=lambda item: -float(item.get("importance") or 0))
         samples = []
         for doc in members[:examples]:
-            text = " ".join(str(doc.get("text") or "").split())[:170]
+            text = " ".join(str(doc.get("text") or "").split())[:150]
             if text:
                 samples.append("- " + text)
         lines.append(
@@ -1196,7 +1196,9 @@ async def _llm_cluster_titles(ctx, rows: List[Dict[str, Any]], docs_by_id: Dict[
         return dict(cached)
 
     meta: Dict[str, Any] = {}
-    batch_size = 20
+    # Пачка из 12 кластеров: промпт остаётся в окне 8192 токенов с запасом на ответ
+    # (20 кластеров давали промпт ~5700 токенов, и ответ уже не помещался).
+    batch_size = 12
     result: Dict[str, str] = {}
     used_model = ""
     dataset = ""
@@ -1913,6 +1915,10 @@ async def analyze_texts(
             docs_by_id[msg_id] = doc
             lines.append(_message_line(msg_id, doc))
         found["docs"], found["docs_by_id"], found["lines"] = picks, docs_by_id, lines
+        # Пачки собираются из локального docs ниже: без обновления в модель уходил старый пул
+        # кандидатов Elasticsearch, обрезанный ENGAGEMENT_POOL_MAX — 400 сообщений вместо
+        # отобранных cluster_read_limit (2 500). Отчёт получал в 6 раз меньше цитат и тем.
+        docs = picks
         await ctx.log(
             f"Читаю представителей кластеров и самые значимые сообщения: кластеров "
             f"{len(corpus.get('clusters') or [])}, сообщений к прочтению {len(picks)}"
