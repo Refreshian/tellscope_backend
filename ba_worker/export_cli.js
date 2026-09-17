@@ -19,19 +19,46 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const BA = 'https://brandanalytics.ru';
-const COOKIES = '/home/dev/tellscope_app/tellscope_backend/ba_worker/cookies.json';
-const LOGIN = process.env.BA_LOGIN || 'alexmisis@list.ru';
+// Cookies строго пер-аккаунтные: путь задаёт ba_import.py (data/ba_cookies/u<id>.json).
+// Раньше все пользователи Tellscope делили один ba_worker/cookies.json — сессия одного
+// аккаунта молча переиспользовалась для выгрузки под другим подключением.
+const COOKIES = process.env.BA_COOKIES ||
+  path.join('/tmp', 'ba_export_cookies_' + crypto.createHash('sha1').update(String(process.env.BA_LOGIN || 'anon')).digest('hex').slice(0, 16) + '.json');
+const LOGIN = process.env.BA_LOGIN || '';
 const PASS = process.env.BA_PASS || '';
+function readCookies() {
+  try {
+    const data = JSON.parse(fs.readFileSync(COOKIES, 'utf8'));
+    if (data && data.login && String(data.login).toLowerCase() === LOGIN.toLowerCase() && Array.isArray(data.cookies)) return data.cookies;
+    if (Array.isArray(data)) return data;  // старый формат без привязки к логину
+  } catch (e) {}
+  return null;
+}
+function writeCookies(cookies) {
+  try {
+    fs.mkdirSync(path.dirname(COOKIES), { recursive: true });
+    fs.writeFileSync(COOKIES, JSON.stringify({ login: LOGIN, cookies: cookies }, null, 1));
+  } catch (e) {}
+}
+async function isAuthed(page) {
+  return await page.evaluate((em) => {
+    const txt = (document.body ? document.body.innerText : '') || '';
+    return !!document.querySelector('[data-testid="export-selector-toggle"]') ||
+      (!!em && txt.toLowerCase().indexOf(String(em).toLowerCase()) >= 0);
+  }, LOGIN);
+}
 async function ensureLogin(page) {
-  if (fs.existsSync(COOKIES)) {
-    try { await page.setCookie(...JSON.parse(fs.readFileSync(COOKIES,'utf8'))); } catch(e) {}
+  if (!LOGIN || !PASS) throw new Error('BA_AUTH_FAILED: не заданы логин и пароль Brand Analytics (подключите свой аккаунт BA в Tellscope)');
+  const saved = readCookies();
+  if (saved) {
+    try { await page.setCookie(...saved); } catch (e) {}
   }
   await page.goto(BA + '/summary', { waitUntil: 'domcontentloaded', timeout: 600000 });
   await sleep(5000);
-  const has = await page.evaluate(() => !!document.querySelector('[data-testid="export-selector-toggle"]'));
-  if (has) return true;
+  if (await isAuthed(page)) return true;
   const clicked = await page.evaluate(() => {
     const b=[...document.querySelectorAll('a,button')].find(x=>/войти|вход|sign in|login/i.test((x.textContent||'').trim()) && (x.textContent||'').trim().length<25);
     if(b){b.click(); return true;} return false;
@@ -49,9 +76,14 @@ async function ensureLogin(page) {
     if(btn) btn.click();
     return true;
   }, LOGIN, PASS);
+  if (!filled) throw new Error('BA_AUTH_FAILED: не нашёл форму входа Brand Analytics');
   await sleep(10000);
-  fs.mkdirSync(path.dirname(COOKIES), { recursive: true });
-  fs.writeFileSync(COOKIES, JSON.stringify(await page.cookies(), null, 1));
+  await page.goto(BA + '/summary', { waitUntil: 'domcontentloaded', timeout: 600000 }).catch(()=>{});
+  await sleep(5000);
+  if (!(await isAuthed(page))) {
+    throw new Error('BA_AUTH_FAILED: Brand Analytics не принял логин или пароль');
+  }
+  writeCookies(await page.cookies());
   return true;
 }
 (async () => {
