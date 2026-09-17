@@ -1032,17 +1032,26 @@ def build_summary_block(data: Data, ctx: Ctx) -> dict:
     fastest = min((e for e in data.events if e["shape"]["days_to_peak"] >= 0),
                   key=lambda e: e["shape"]["days_to_peak"], default=None)
     heaviest = max(data.events, key=lambda e: e["shape"]["negative"], default=None)
+    instant = [e for e in data.events if e["shape"]["days_to_peak"] <= 1]
+    plainest = next((e for e in instant if e is not heaviest), (instant[0] if instant else None))
+    average_active = round(sum(e["shape"]["days_active"] for e in data.events)
+                           / float(len(data.events) or 1))
     actions = [
         "Маркетингу: считать срок реакции по худшему поводу периода. У повода «%s» на пике суток "
-        "вышло %s негативных сообщений, а пик пришёл через %s после начала волны; активная фаза "
-        "заняла %s. Окно для реакции — первые сутки."
+        "вышло %s негативных сообщений, а пик пришёл %s; активная фаза заняла %s. Окно для "
+        "реакции — первые сутки."
         % ((heaviest or {}).get("name", "—"), num((heaviest or {}).get("shape", {}).get("negative", 0)),
-           days_phrase((heaviest or {}).get("shape", {}).get("days_to_peak", 0)),
+           ("в тот же день, когда началась волна"
+            if (heaviest or {}).get("shape", {}).get("days_to_peak", 0) == 0
+            else "через " + days_phrase((heaviest or {}).get("shape", {}).get("days_to_peak", 0))),
            days_phrase((heaviest or {}).get("shape", {}).get("days_active", 0))),
-        "Маркетингу: помнить, что у части поводов пик наступает сразу — у повода «%s» от старта "
-        "до пика %s. Если ответ готов только на второй день, он выходит уже после пика."
-        % ((fastest or {}).get("name", "—"),
-           days_phrase((fastest or {}).get("shape", {}).get("days_to_peak", 0))),
+        "Маркетингу: держать заготовку ответа заранее. У %s поводов из %s пик пришёл в первые "
+        "сутки: например, у повода «%s» от старта до пика %s, а в среднем активная фаза длится %s. "
+        "Если ответ готов только на второй день, он выходит уже после пика."
+        % (prose_num(len(instant)), prose_num(len(data.events)),
+           (plainest or fastest or {}).get("name", "—"),
+           days_phrase((plainest or fastest or {}).get("shape", {}).get("days_to_peak", 0)),
+           days_phrase(average_active)),
         "PR: каждый день смотреть карты и отзовики, а не только соцсети — там %s всего негатива, "
         "и он адресный: по нему видно конкретный ресторан. Соцсети дают объём, карты — причину."
         % pct(map_share),
@@ -1729,8 +1738,6 @@ def build_actions_block(data: Data, ctx: Ctx) -> dict:
                  + plat.get("2gis.ru", {}).get("share_of_negative", 0))
     risk = data.risk
     worst = risk[0] if risk else {"month": "", "index": 0, "negative_share": 0, "total": 0}
-    events = sorted(data.events, key=lambda e: e["shape"]["days_to_peak"])
-    fast = events[0] if events else None
     campaigns = data.campaigns
     # Кампанию и «осадок» выбираем только там, где сравнение опирается на заметный фон:
     # иначе деление на две недели с десятком сообщений даёт случайные проценты.
@@ -1752,36 +1759,39 @@ def build_actions_block(data: Data, ctx: Ctx) -> dict:
     shortage = data.theme_by_name.get("Дефицит курицы") or {}
     spoiled = data.theme_by_name.get("Отравление/сальмонелла/тухлое") or {}
     worst_event = max(data.events, key=lambda e: e["shape"]["negative"], default=None)
+    # Сколько поводов выстреливает в первые сутки и как долго в среднем длится активная фаза:
+    # по этим двум числам маркетинг понимает, сколько времени у него есть на реакцию.
     instant = [e for e in data.events if e["shape"]["days_to_peak"] <= 1]
+    average_active = round(sum(e["shape"]["days_active"] for e in data.events)
+                           / float(len(data.events) or 1))
     price_share = {y: ((price.get("years", {}).get(y) or {}).get("negative", 0)
                        / float((price.get("years", {}).get(y) or {}).get("total") or 1) * 100)
                    for y in ("2024", "2025", "2026")}
+    best_share = ((best_camp or {}).get("spans", {}).get("during", {}).get("positive_share", 0))
     marketing = [
-        "Строить кампании короткими окнами. У %s крупных поводов из %s пик наступил в первые сутки, "
-        "а активная фаза — %s. Всё, что должно быть сказано, нужно сказать сразу: позже волна "
+        "Держать короткое окно кампании. У %s поводов из %s пик пришёл в первые сутки, а в среднем "
+        "активная фаза длится %s. Всё, что должно быть сказано, нужно сказать сразу: позже волна "
         "уходит без нас."
-        % (prose_num(len(instant)), prose_num(len(data.events)),
-           days_phrase(round(sum(e["shape"]["days_active"] for e in data.events)
-                             / float(len(data.events) or 1)))),
-        "Усиливать детские и игровые наборы: они дают и объём, и позитив. Доказательство — "
-        "кампания «%s»: за две недели до старта доля позитива %s, в период проведения %s (%s)."
-        % ((best_camp or {}).get("label", "—"),
-           pct((best_camp or {}).get("spans", {}).get("before", {}).get("positive_share", 0)),
-           pct((best_camp or {}).get("spans", {}).get("during", {}).get("positive_share", 0)),
-           delta_pp((best_camp or {}).get("spans", {}).get("during", {}).get("positive_share", 0),
-                    (best_camp or {}).get("spans", {}).get("before", {}).get("positive_share", 0)))
-        if best_camp else "Усиливать детские и игровые наборы: по данным периода измеримого "
-                          "прироста позитива они не дают, поэтому решение стоит проверять "
-                          "точечно, а не переносить на всю линейку.",
-        "Следить за остатком товара в кампаниях: %s"
-        % ("у кампании «%s» после окончания доля негатива выросла с %s до %s — люди продолжают "
-           "искать то, что уже закончилось."
+        % (prose_num(len(instant)), prose_num(len(data.events)), days_phrase(average_active)),
+        "Повторять формат с материальным предложением — набор, бокс, игрушка, новая линейка: "
+        "%s"
+        % ("лучший результат периода у кампании «%s» — за две недели до старта доля позитива %s, "
+           "в период проведения %s (%s)."
+           % ((best_camp or {}).get("label", "—"),
+              pct((best_camp or {}).get("spans", {}).get("before", {}).get("positive_share", 0)),
+              pct(best_share),
+              delta_pp(best_share, (best_camp or {}).get("spans", {}).get("before", {})
+                       .get("positive_share", 0)))
+           if best_camp else "измеримого прироста позитива в период кампаний не видно, поэтому "
+                             "решение стоит проверять на одной линейке, а не переносить на все."),
+        "Считать «осадок» после кампании, а не только её ход: %s"
+        % ("у кампании «%s» после окончания доля негатива выросла с %s до %s — причину стоит "
+           "проверить отдельно (наличие товара, сроки выдачи)."
            % ((worst_camp or {}).get("label", "—"),
               pct((worst_camp or {}).get("spans", {}).get("during", {}).get("negative_share", 0)),
               pct((worst_camp or {}).get("spans", {}).get("after", {}).get("negative_share", 0)))
-           if worst_camp else "ни у одной кампании периода заметного роста негатива после "
-                              "окончания нет, поэтому правило простое — не обещать больше, "
-                              "чем есть в наличии."),
+           if worst_camp else "ни у одной кампании периода заметного роста негатива после окончания "
+                              "нет — правило простое: не обещать больше, чем есть в наличии."),
         "Отвечать на цену цифрами: тема цены — %s сообщений за период, её доля негатива прошла "
         "путь %s → %s → %s. Разговор идёт не про деньги вообще, а про соотношение цены и размера "
         "порции: это видно по примерам ниже."
