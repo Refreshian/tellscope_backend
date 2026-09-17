@@ -103,6 +103,7 @@ def backfill_mosinform() -> None:
                 message=data.get("message") or "",
                 period=data.get("period") or "",
                 files=data.get("files") or "",
+                user_id=data.get("user_id") or "",
                 created_at=data.get("created_at") or "",
                 updated_at=data.get("updated_at") or "",
             )
