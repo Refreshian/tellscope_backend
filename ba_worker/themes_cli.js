@@ -103,6 +103,26 @@ async function launch() {
   return await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] });
 }
 
+// Список тем на /summary наполняется асинхронно и по частям. Одиночный замер через 7 секунд
+// давал то 7 тем, то 6 (строка не успевала отрисоваться), а иногда — ссылку на уже удалённую
+// тему. Из-за этого пер-пользовательский снапшот молча терял тему. Поэтому ждём, пока
+// результат перестанет меняться: две подряд одинаковые непустые выборки = список готов.
+async function scrapeStable(page, budgetMs = 45000) {
+  const t0 = Date.now();
+  let prev = null;
+  let best = {};
+  while (Date.now() - t0 < budgetMs) {
+    const cur = await scrape(page);
+    const keys = Object.keys(cur).sort().join(',');
+    if (keys && prev !== null && keys === prev) return cur;
+    if (Object.keys(cur).length > Object.keys(best).length) best = cur;
+    prev = keys;
+    await sleep(3000);
+  }
+  if (DEBUG) console.error('DEBUG scrape not stable, using best(' + Object.keys(best).length + ')');
+  return best;
+}
+
 function emit(themes) {
   console.log('AUTH_OK');
   console.log('RESULT_JSON');
@@ -126,7 +146,7 @@ function emit(themes) {
       const st1 = await authState(p1);
       if (DEBUG) console.error('DEBUG cookie-session ' + JSON.stringify(st1));
       if (st1.exportToggle || st1.emailShown) {
-        const themes = await scrape(p1);
+        const themes = await scrapeStable(p1);
         await b1.close();
         emit(themes);
         return;
@@ -180,7 +200,7 @@ function emit(themes) {
     authFailed('Brand Analytics не подтвердил вход: интерфейс аккаунта недоступен');
   }
   saveCookies(cookieFile, LOGIN, await p.cookies());
-  const themes = await scrape(p);
+  const themes = await scrapeStable(p);
   emit(themes);
   await b.close();
 })().catch(e => { console.error('ERR ' + (e && e.message)); process.exit(1); });

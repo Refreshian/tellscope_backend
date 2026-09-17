@@ -8,7 +8,7 @@
 («Подключите свой аккаунт Brand Analytics»), а не работают под чужой учёткой.
 """
 from __future__ import annotations
-import json, os, re, shutil, subprocess, threading, uuid
+import json, os, re, shutil, subprocess, threading, time, uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional
@@ -113,6 +113,71 @@ def require_account(user_id: str) -> dict:
 def user_themes(user_id: str) -> dict:
     """Темы конкретного пользователя (пер-пользовательский снапшот)."""
     return load_themes(str(user_id))
+
+
+# ---------------------------------------------------------------------------
+# Автозагрузка тем: подключение есть, а снапшота тем ещё нет
+# ---------------------------------------------------------------------------
+# Раньше GET /ba/themes в таком случае отдавал пустой список без объяснения: пользователь
+# с настроенным подключением видел «тем нет» и не понимал, что делать (снапшот может
+# отсутствовать у того, кто подключился до появления пер-пользовательских снапшотов, или
+# после отключения/повторного подключения аккаунта). Теперь темы подтягиваются сами:
+# запрос в BA идёт в фоне (~40 с), эндпоинт сразу отдаёт состояние themes_loading=true,
+# а интерфейс опрашивает его и показывает «загружаю темы».
+#
+# Ограничение частоты (THEMES_AUTOFETCH_COOLDOWN) не даёт долбить BA: после неудачной
+# попытки автозагрузка для этого пользователя молчит кулдаун, дальше — только «Обновить».
+# Параллельные запросы не плодят входы в BA: на пользователя одновременно одна попытка.
+_THEMES_FETCH_LOCK = threading.Lock()
+_THEMES_FETCH = {}  # uid -> {"status": "loading"|"done"|"error", "started": float, "finished": float, "error": str}
+THEMES_AUTOFETCH_COOLDOWN = 120.0
+
+
+def themes_fetch_state(user_id: str) -> dict:
+    """Состояние автозагрузки тем пользователя (без запуска новых попыток)."""
+    with _THEMES_FETCH_LOCK:
+        return dict(_THEMES_FETCH.get(str(user_id)) or {})
+
+
+def _themes_autofetch_worker(uid: str):
+    err = ""
+    try:
+        cc = account_creds(uid)
+        if not cc.get("configured"):
+            err = NO_ACCOUNT_HINT
+        else:
+            themes = fetch_ba_themes(login=cc["BA_LOGIN"], passw=cc["BA_PASS"], user_id=uid)
+            account_touch(uid, status=STATUS_VERIFIED, error="", themes_count=len(themes))
+    except Exception as exc:
+        err = str(exc)[:400]
+        try:
+            account_touch(uid, status=STATUS_ERROR, error=err)
+        except Exception:
+            pass
+    with _THEMES_FETCH_LOCK:
+        prev = dict(_THEMES_FETCH.get(uid) or {})
+        prev.update({"status": "error" if err else "done", "finished": time.time(), "error": err})
+        _THEMES_FETCH[uid] = prev
+
+
+def start_themes_autofetch(user_id: str) -> dict:
+    """Запускает фоновую загрузку тем, если её ещё нет и не истёк кулдаун.
+
+    Возвращает текущее состояние: ``loading`` — уже загружаем, ``done``/``error`` — результат
+    последней попытки, ``{}`` — попытка не запускалась (снапшот уже есть).
+    """
+    uid = str(user_id)
+    now = time.time()
+    with _THEMES_FETCH_LOCK:
+        st = dict(_THEMES_FETCH.get(uid) or {})
+        if st.get("status") == "loading":
+            return st
+        if st.get("started") and (now - float(st["started"])) < THEMES_AUTOFETCH_COOLDOWN:
+            return st
+        st = {"status": "loading", "started": now, "finished": 0.0, "error": ""}
+        _THEMES_FETCH[uid] = st
+    threading.Thread(target=_themes_autofetch_worker, args=(uid,), daemon=True).start()
+    return dict(st)
 
 
 def ensure_theme_folders(user_id: str):
@@ -314,14 +379,20 @@ def job_status(job_id: str, user: CurrentUser = None):
 
 @router.get("/themes")
 def themes(user_id: str = "", refresh: int = 0, user: CurrentUser = None):
-    """Темы СВОЕГО аккаунта BA (пер-пользовательский снапшот) + статус подключения."""
+    """Темы СВОЕГО аккаунта BA (пер-пользовательский снапшот) + статус подключения.
+
+    Если подключение настроено, а снапшота тем нет, темы подтягиваются автоматически в
+    фоне: ответ приходит сразу с ``themes_loading=true`` и понятным hint, интерфейс
+    показывает «загружаю темы» и опрашивает эндпоинт, пока снапшот не появится.
+    Явный ``refresh=1`` («Обновить» в интерфейсе) работает как раньше и ждёт результат.
+    """
     uid = _owner_for(user_id, user)
     st = account_status(uid)
     snapshot = user_themes(uid)
     if not st["configured"]:
         return {"themes": [], "account_configured": False, "account_status": "none",
                 "login_masked": "", "account_error": "", "verified_at": "",
-                "hint": NO_ACCOUNT_HINT}
+                "themes_loading": False, "hint": NO_ACCOUNT_HINT}
     refresh_error = ""
     if refresh:
         cc = account_creds(uid)
@@ -332,6 +403,12 @@ def themes(user_id: str = "", refresh: int = 0, user: CurrentUser = None):
             refresh_error = str(exc)[:400]
             account_touch(uid, status=STATUS_ERROR, error=refresh_error)
         st = account_status(uid)
+    auto = {}
+    if not refresh and not snapshot:
+        auto = start_themes_autofetch(uid)
+        if auto.get("status") == "done":
+            snapshot = user_themes(uid)
+            st = account_status(uid)
     regs = load_registry()
     last = {}
     for r in regs:
@@ -341,11 +418,22 @@ def themes(user_id: str = "", refresh: int = 0, user: CurrentUser = None):
         if not cur or r.get("created", "") > cur.get("created", ""):
             last[r["theme_id"]] = r
     items = [{"theme_id": k, "title": v, "last_import": last.get(k)} for k, v in snapshot.items()]
+    loading = bool(auto.get("status") == "loading")
     out = {"themes": items, "account_configured": True, "account_status": st["status"],
            "login_masked": st["login_masked"], "account_error": st["error"],
-           "verified_at": st["verified_at"], "themes_count": len(items)}
+           "verified_at": st["verified_at"], "themes_count": len(items),
+           "themes_loading": loading,
+           "themes_fetch_status": (auto.get("status") or ("cached" if items else ""))}
     if not items:
-        out["hint"] = "В вашем аккаунте Brand Analytics темы не найдены — проверьте логин/пароль и нажмите «Обновить»"
+        if loading:
+            out["hint"] = ("Загружаю список тем из вашего аккаунта Brand Analytics — "
+                           "это занимает до минуты, список появится здесь автоматически")
+        elif auto.get("error"):
+            out["hint"] = ("Не удалось загрузить темы автоматически: %s — нажмите «Обновить»"
+                           % auto["error"])
+        else:
+            out["hint"] = ("В вашем аккаунте Brand Analytics темы не найдены — проверьте "
+                           "логин/пароль и нажмите «Обновить»")
     if refresh_error:
         out["refresh_error"] = refresh_error
     return out

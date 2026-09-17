@@ -80,6 +80,11 @@ async function ensureLogin(page) {
   await sleep(10000);
   await page.goto(BA + '/summary', { waitUntil: 'domcontentloaded', timeout: 600000 }).catch(()=>{});
   await sleep(5000);
+  // Интерфейс аккаунта подгружается не мгновенно: даём вторую попытку, иначе единичная
+  // медленная отрисовка выглядела как «не принял логин» и выгрузка падала зря.
+  if (!(await isAuthed(page))) {
+    await sleep(8000);
+  }
   if (!(await isAuthed(page))) {
     throw new Error('BA_AUTH_FAILED: Brand Analytics не принял логин или пароль');
   }
@@ -102,18 +107,33 @@ async function ensureLogin(page) {
   await ensureLogin(page);
   const qs = tsf && tst ? '?tsf=' + tsf + '&tst=' + tst : '';
   await page.goto(BA + '/report/' + themeId + '/summary' + qs, { waitUntil:'domcontentloaded', timeout: 600000 });
-  await sleep(9000);
+  // Ждём появления кнопки Export. Тема могла быть удалена в Brand Analytics — тогда страница
+  // отдаёт 404, и раньше это выглядело как непонятное «toggle failed». Теперь ошибка явная.
+  let toggleReady = false;
+  for (let i = 0; i < 10; i++) {
+    const st = await page.evaluate(() => ({
+      tg: !!document.querySelector('[data-testid="export-selector-toggle"]'),
+      nf: /404|page not found/i.test(document.title),
+    }));
+    if (st.tg) { toggleReady = true; break; }
+    if (st.nf) {
+      throw new Error('BA_THEME_UNAVAILABLE: тема ' + themeId + ' недоступна в Brand Analytics '
+        + '(возможно, она удалена в аккаунте) — обновите список тем кнопкой «Обновить»');
+    }
+    await sleep(3000);
+  }
+  if (!toggleReady) throw new Error('BA_EXPORT_UI: страница отчёта Brand Analytics не отдала кнопку экспорта (тема ' + themeId + ')');
   const a = await page.evaluate(() => {
     const t=document.querySelector('[data-testid="export-selector-toggle"]');
     if(!t) return 'no-toggle'; t.click(); return 'opened';
   });
-  if (a !== 'opened') throw new Error('toggle failed');
+  if (a !== 'opened') throw new Error('BA_EXPORT_UI: не удалось открыть меню экспорта Brand Analytics');
   await sleep(2500);
   const b = await page.evaluate(() => {
     const j=document.querySelector('[data-testid="export-selector-messages-json"]');
     if(!j) return 'no-json'; j.click(); return 'json';
   });
-  if (b !== 'json') throw new Error('json item failed');
+  if (b !== 'json') throw new Error('BA_EXPORT_UI: в меню экспорта Brand Analytics нет пункта «full text messages → JSON»');
   let ready=false;
   for (let i=0;i<45;i++){
     await sleep(3000);
