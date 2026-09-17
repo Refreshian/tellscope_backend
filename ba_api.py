@@ -5,13 +5,39 @@ from __future__ import annotations
 import json, os, re, shutil, subprocess, threading, uuid
 from datetime import datetime
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi_users import FastAPIUsers
 from pydantic import BaseModel, Field
+
+from auth.auth import auth_backend
+from auth.database import User as AuthUser
+from auth.manager import get_user_manager
 
 import redis
 from ba_import import BE, DATA, THEMES, creds, slug, run_ba_export, register_dataset, load_indexes, fetch_ba_themes
 
 router = APIRouter(prefix="/ba", tags=["brand analytics"])
+
+# Свой экземпляр зависимостей fastapi-users: у модуля собственный APIRouter,
+# поэтому «кто зовёт» нужно получать здесь, а не в main.py.
+_ba_users = FastAPIUsers[AuthUser, int](get_user_manager, [auth_backend])
+require_user = _ba_users.current_user()
+
+
+def _owner_for(requested, user) -> str:
+    """Владелец данных Brand Analytics: всегда свой id.
+
+    Чужой ``user_id`` принимается только от суперпользователя (админские операции).
+    Раньше ``user_id`` приходил от клиента без проверки: любой новый пользователь мог
+    прочитать темы и реестр импортов другого пользователя и перезаписать его креды BA.
+    """
+    me = str(getattr(user, "id", "") or "")
+    want = str(requested or "").strip()
+    if getattr(user, "is_superuser", False):
+        return want or me
+    if not want or want == me:
+        return me
+    raise HTTPException(status_code=403, detail="Нет доступа к данным Brand Analytics другого пользователя")
 REDIS = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
 ARCHIVE_DIR = DATA / "ba_archive"
 REGISTRY = ARCHIVE_DIR / "imports.jsonl"
@@ -199,7 +225,7 @@ def _run_import(job_id: str, body: ImportBody):
     folder = body.folder or safe_folder(THEMES.get(body.theme_id, "BA theme"))
     cc = account_creds(body.user_id)
     try:
-        _jid(job_id, status="running", message="Экспорт данных", progress="10", started=datetime.now().isoformat())
+        _jid(job_id, status="running", message="Экспорт данных", progress="10", started=datetime.now().isoformat(), owner=str(body.user_id))
         run_dir = Path("/tmp") / ("ba_run_" + job_id)
         raw = run_ba_export(body.theme_id, run_dir, body.date_from, body.date_to, login=cc["BA_LOGIN"], passw=cc["BA_PASS"])
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -239,7 +265,8 @@ def _run_import(job_id: str, body: ImportBody):
         shutil.rmtree(Path("/tmp") / ("ba_run_" + job_id), ignore_errors=True)
 
 @router.post("/import")
-async def import_data(body: ImportBody):
+async def import_data(body: ImportBody, user: AuthUser = Depends(require_user)):
+    body.user_id = _owner_for(body.user_id, user)
     if body.theme_id not in THEMES:
         raise HTTPException(400, "Неизвестная тема: %s (допустимые: %s)" % (body.theme_id, ", ".join(THEMES)))
     if not body.force and not _range_includes_today(body.date_to):
@@ -247,12 +274,13 @@ async def import_data(body: ImportBody):
             if rec.get("theme_id") == body.theme_id and rec.get("user_id") == str(body.user_id) and rec.get("date_from", "") == body.date_from and rec.get("date_to", "") == body.date_to:
                 raise HTTPException(409, "Данные за этот период уже выгружены (файл %s). Для уже завершившихся дней повторная загрузка не выполняется; если период включает текущий день, запустите ещё раз — свежие сообщения добавятся." % rec.get("file"))
     job_id = uuid.uuid4().hex[:12]
-    _jid(job_id, status="queued", message="Экспорт данных", progress="0")
+    _jid(job_id, status="queued", message="Экспорт данных", progress="0", owner=str(body.user_id))
     threading.Thread(target=_run_import, args=(job_id, body), daemon=True).start()
     return {"job_id": job_id}
 
 @router.post("/account")
-async def save_account(body: AccountBody):
+async def save_account(body: AccountBody, user: AuthUser = Depends(require_user)):
+    body.user_id = _owner_for(body.user_id, user)
     accounts = load_accounts()
     if not body.login.strip():
         raise HTTPException(400, "Введите логин Brand Analytics")
@@ -264,10 +292,13 @@ async def save_account(body: AccountBody):
     return {"status": "ok", "configured": bool(acc.get("BA_LOGIN")), "themes": len(THEMES)}
 
 @router.get("/jobs/{job_id}")
-def job_status(job_id: str):
+def job_status(job_id: str, user: AuthUser = Depends(require_user)):
     data = _jget(job_id)
     if not data:
         raise HTTPException(404, "Задача не найдена")
+    owner = str(data.get("owner") or "")
+    if owner and owner != str(getattr(user, "id", "")) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к задаче другого пользователя")
     out = {"job_id": job_id, "status": data.get("status"), "message": data.get("message"),
            "progress": data.get("progress"), "summary": None}
     if data.get("summary"):
@@ -276,7 +307,8 @@ def job_status(job_id: str):
     return out
 
 @router.get("/themes")
-def themes(user_id: str = "1", refresh: int = 0):
+def themes(user_id: str = "", refresh: int = 0, user: AuthUser = Depends(require_user)):
+    user_id = _owner_for(user_id, user)
     regs = load_registry()
     last = {}
     for r in regs:
@@ -304,7 +336,10 @@ def themes(user_id: str = "1", refresh: int = 0):
     return out
 
 @router.get("/registry")
-def registry():
+def registry(user: AuthUser = Depends(require_user)):
     regs = load_registry()
+    if not getattr(user, "is_superuser", False):
+        me = str(getattr(user, "id", ""))
+        regs = [r for r in regs if str(r.get("user_id") or "") == me]
     regs.reverse()
     return {"imports": regs}

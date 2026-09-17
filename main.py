@@ -3597,6 +3597,8 @@ async def get_configs_page():
 
 @app.get("/create-data-projector/{user_id}/{folder_name}/{file_name}")
 async def create_data_projector(user_id: str, folder_name: str, file_name: str, user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
     # Путь к файлу с темами 
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
@@ -6056,10 +6058,26 @@ async def reset_gpu_status():
 
 
 # Обработка LLM задач
+async def _forbid_foreign_body_user(request: Request, user: User = Depends(current_user)):
+    """403, если в теле запроса указан чужой user_id (иначе задача читала бы чужие данные)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return
+    uid = payload.get("user_id")
+    if uid in (None, "") :
+        return
+    if str(uid) != str(getattr(user, "id", "")) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
+
+
 @app.post("/llm-run/", tags=['ai analytics'])
 async def llm_run(
     analysis_request: AnalysisRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    _own_user: None = Depends(_forbid_foreign_body_user)
 ):
     try:
         task_id = str(uuid.uuid4())
@@ -6308,7 +6326,9 @@ async def reset_queue():
     
 
 @app.get("/llm-analyze", tags=['ai analytics'])
-async def llm_analyze(user_id: int, folder_name: str, file_name: str):
+async def llm_analyze(user_id: int, folder_name: str, file_name: str, user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
 
     print(f'llm_analyze: folder_name: {folder_name}, file_name: {file_name}')
 
@@ -6615,7 +6635,9 @@ async def llm_analyze(user_id: int, folder_name: str, file_name: str):
 
 
 @app.delete("/delete-theme-files", tags=['ai analytics'])
-async def delete_theme_files(user_id: int, folder_name: str, file_name: str):
+async def delete_theme_files(user_id: int, folder_name: str, file_name: str, user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к файлам тем другого пользователя")
     import logging
     logging.warning(f"Delete requested: {user_id=} {folder_name=} {file_name=}")
 
@@ -6957,7 +6979,9 @@ async def refresh_token(
 ################################################ new token ################################################
 
 @app.get("/history_llm_search/{user_id}", tags=['data & folders'])
-async def history_search(user_id: int):
+async def history_search(user_id: int, user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к истории запросов другого пользователя")
 
     os.chdir('/home/dev/tellscope_app/tellscope_backend/data')
     
@@ -7282,7 +7306,9 @@ async def check_task_status(task_id: str):
     return response_data
 
 @app.get("/check-files/{user_id}/{folder_name}", tags=["data & folders"])
-async def check_files(user_id: str, folder_name: str):
+async def check_files(user_id: str, folder_name: str, user: User = Depends(current_user)):
+    # Чужой список файлов папки не отдаём: только своя папка, расшаренная или суперпользователь.
+    _folder_guard(user_id, folder_name or "", user)
     try:
         synced = await sync_files_with_redis(user_id, folder_name)
         user_folders_data = await redis_db.hget(user_id, "json_files_directory")
@@ -8353,7 +8379,10 @@ async def get_embedding(session: AsyncSession, user_id: int, file_name: str):
 @app.get("/text_clusters/", tags=['ai analytics'])
 async def get_text_clusters(user_id: int, folder_name: str, file_name: str,
                             session: AsyncSession = Depends(get_db),
-                            threshold: float = 0.8):
+                            threshold: float = 0.8,
+                            user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
     if user_id < 1:
         raise HTTPException(status_code=400, detail="user_id must be a positive integer.")
 
@@ -8637,7 +8666,10 @@ class Embedding(Base):
 from fastapi import APIRouter, HTTPException, Query
 
 @app.get("/llm-analyze-excel", tags=['files'])
-async def llm_analyze_excel(user_id: int, folder_name: str, file_name: str, all_table: bool = Query(True)):
+async def llm_analyze_excel(user_id: int, folder_name: str, file_name: str, all_table: bool = Query(True),
+                            user: User = Depends(current_user)):
+    if str(user.id) != str(user_id) and not getattr(user, "is_superuser", False):
+        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
     global full_data_store, aggregated_data_store
 
     user_data = await redis_db.hgetall(str(user_id))  # Получаем данные пользователя из Redis
@@ -10350,9 +10382,10 @@ async def delete_qdrant_collection(collection_name: str):
         )
 
 @app.get("/csv-files")
-async def list_csv_files():
+async def list_csv_files(user_id: Optional[str] = None, user: User = Depends(current_user)):
     """Список доступных CSV файлов"""
-    base_dir = "/home/dev/tellscope_app/tellscope_backend/data/1/bertopic_files_directory/test"
+    owner = str(user_id) if (getattr(user, "is_superuser", False) and user_id) else str(user.id)
+    base_dir = f"/home/dev/tellscope_app/tellscope_backend/data/{owner}/bertopic_files_directory"
     
     try:
         files = []
@@ -10378,7 +10411,7 @@ async def list_csv_files():
         
         return {
             'files': files,
-            'default': DEFAULT_CSV_PATH,
+            'default': (files[0]['path'] if files else ''),
             'total': len(files)
         }
     except Exception as e:
@@ -10986,9 +11019,10 @@ def load_csv_data(file_path: str) -> pd.DataFrame:
         raise HTTPException(500, f"Ошибка чтения CSV: {str(e)}")
 
 @app.get("/csv-files")
-async def list_csv_files():
+async def list_csv_files(user_id: Optional[str] = None, user: User = Depends(current_user)):
     """Список доступных CSV файлов на сервере"""
-    base_dir = "/home/dev/tellscope_app/tellscope_backend/data/1/bertopic_files_directory/test"
+    owner = str(user_id) if (getattr(user, "is_superuser", False) and user_id) else str(user.id)
+    base_dir = f"/home/dev/tellscope_app/tellscope_backend/data/{owner}/bertopic_files_directory"
     
     try:
         files = []
@@ -11003,7 +11037,7 @@ async def list_csv_files():
                         'relative_path': rel_path
                     })
         
-        return {'files': files, 'default': DEFAULT_CSV_PATH}
+        return {'files': files, 'default': (files[0]['path'] if files else '')}
     except Exception as e:
         raise HTTPException(500, str(e))
 
