@@ -214,6 +214,16 @@ PUBLIC_EXACT = {"/", "/health", "/mlops/ready", "/mlops/health", "/models", "/ch
                 "/auth/login", "/auth/refresh", "/auth/logout", "/auth/session"}
 PUBLIC_PREFIXES = ("/auth/jwt/", "/static/", "/favicon")
 
+# Служебные маршруты MLOps: валидного токена мало — нужен сервисный токен
+# (Prometheus собирает /mlops/metrics с X-Service-Token) либо администратор.
+# /mlops/ready и /mlops/health остаются публичными (см. PUBLIC_EXACT выше), а
+# /mlops/lock, /mlops/jobs, /mlops/busy достаточно обычного залогиненного пользователя.
+SERVICE_ONLY_EXACT = {"/mlops/prompts", "/mlops/drain", "/mlops/metrics"}
+
+
+def _service_only_path(path: str) -> bool:
+    return path in SERVICE_ONLY_EXACT
+
 
 def _public_path(path: str) -> bool:
     return path in PUBLIC_EXACT or path.startswith(PUBLIC_PREFIXES)
@@ -272,6 +282,7 @@ class AuthGate:
                         break
 
         ok = False
+        via_service = False
         if token:
             try:
                 import jwt as _jwt
@@ -281,13 +292,19 @@ class AuthGate:
             except Exception:
                 ok = False
         if not ok:
-            service_token = headers.get("x-service-token", "").strip()
-            if service_token:
+            # Сервисный токен: штатно в X-Service-Token, но тот же токен принимаем и
+            # как Authorization: Bearer (так его шлёт Prometheus в scrape_configs.authorization).
+            for candidate in (headers.get("x-service-token", "").strip(), token):
+                if not candidate:
+                    continue
                 try:
                     from agent_engine.service_api import match_service_token
-                    ok = bool(match_service_token(service_token))
+                    if match_service_token(candidate):
+                        ok = True
+                        via_service = True
+                        break
                 except Exception:
-                    ok = False
+                    continue
 
         if not ok and not _known_route(path):
             # такого маршрута нет — пусть роутер ответит 404, а не 401
@@ -305,6 +322,33 @@ class AuthGate:
             })
             await send({"type": "http.response.body", "body": body})
             return
+
+        # Служебные маршруты MLOps: сервисный токен или администратор, не любой логин.
+        if _service_only_path(path) and not via_service:
+            allowed = False
+            if token:
+                try:
+                    from access_guard import user_from_token as _user_from_token
+                    _owner = await _user_from_token(token)
+                    allowed = bool(_owner is not None and getattr(_owner, "is_superuser", False))
+                except Exception:
+                    allowed = False
+            if not allowed:
+                body = json.dumps(
+                    {"detail": "Доступно только администратору или сервисному токену"},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 403,
+                    "headers": [
+                        (b"content-type", b"application/json; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+
         return await self.app(scope, receive, send)
 
 
@@ -742,32 +786,21 @@ async def current_user_any(request: Request):
 
     Нужен для файлов, которые открываются обычной навигацией браузера
     (скачивание артефактов): там нет заголовка Authorization, но есть cookie.
+    Сама проверка живёт в access_guard — там же остальные уровни доступа
+    (администратор, сервисный токен), чтобы не дублировать логику.
     """
-    import jwt as _jwt
-    from sqlalchemy import select as _select
-    from auth.auth import SECRET as _SECRET
+    from access_guard import current_user_any as _guard_user_any
 
-    token = ""
-    auth_header = request.headers.get("authorization", "")
-    if auth_header[:7].lower() == "bearer ":
-        token = auth_header[7:].strip()
-    if not token:
-        token = (request.cookies.get("token")
-                 or request.cookies.get("access_token")
-                 or request.cookies.get("tellscope_refresh_token")
-                 or "")
-    if not token:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        user_id = int(payload.get("sub"))
-    except Exception:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    async with async_session_maker() as session:
-        user = (await session.execute(_select(AuthUser).where(AuthUser.id == user_id))).scalars().first()
-    if user is None or not getattr(user, "is_active", False):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
+    return await _guard_user_any(request)
+
+
+# Уровни доступа для приватных и деструктивных маршрутов (см. access_guard):
+# любой залогиненный (заголовок или cookie), администратор, сервисный токен.
+from access_guard import (  # noqa: E402
+    current_service_or_superuser,
+    current_superuser_any,
+    current_user_or_service,
+)
 
 # indexes = {1: "rosbank_01.02.2024-07.02.2024", 2: "skillfactory_zaprosy_na_obuchenie_15.01.2024-21.01.2024", 3:'rosbank_19.02.2024-29.02.2024', 
 #            4: "rosbank_14.03.2024-14.03.2024_fullday", 5: "r_13.03.2024-14.03.2024_full", 6: "rosbank_22.03.2024-24.03.2024", 
@@ -2552,7 +2585,10 @@ class CompetitorsModel(BaseModel):
 
 
 @app.post('/competitors', response_model=CompetitorsModel, tags=['data analytics'])
-async def competitors(query: QueryCompetitors): # , user: User = Depends(current_user)
+async def competitors(query: QueryCompetitors, user: User = Depends(current_user_any)):
+    # Наборы данных доступны только владельцу (или тому, с кем папку расшарили).
+    for _theme_index in (query.themes_ind or []):
+        _guard_index_access(user, _theme_index)
     # Путь к файлу с темами
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
@@ -2865,7 +2901,7 @@ METAPHOR_DEM_STATS: Dict[str, Dict[str, Dict]] = {}
 
 
 @app.get("/metaphor-taxonomy", tags=['ai analytics'])
-async def get_metaphor_taxonomy():
+async def get_metaphor_taxonomy(user: User = Depends(current_user_any)):
     """
     Возвращает полную типологию метафор (типы и подтипы),
     чтобы фронтенд мог показывать все варианты, независимо от результатов LCA.
@@ -2983,7 +3019,7 @@ def _load_metaphor_dem_stats() -> Dict[str, Dict]:
 
 
 @app.get("/metaphor-dominant-demographics", tags=['ai analytics'])
-async def get_metaphor_dominant_demographics(frame_type: str):
+async def get_metaphor_dominant_demographics(frame_type: str, user: User = Depends(current_user_any)):
     """
     Возвращает наиболее частое сочетание пола и возрастной группы
     для заданного типа метафор (по данным patriotism_text_clusters.xlsx),
@@ -3051,6 +3087,7 @@ async def get_metaphor_demographics(
     frame_type: str,
     author_gender: Optional[str] = None,
     author_age_group: Optional[str] = None,
+    user: User = Depends(current_user_any),
 ):
     """
     Возвращает процент сообщений в заданном типе метафор,
@@ -3125,7 +3162,7 @@ async def get_metaphor_demographics(
 
 
 @app.post("/lca-examples", tags=['ai analytics'])
-async def get_lca_examples(query: LCAExamplesRequest):
+async def get_lca_examples(query: LCAExamplesRequest, user: User = Depends(current_user_any)):
     """
     Возвращает сгенерированные примеры сообщений по результатам LCA-кластеризации.
     Источником служит файл patriotism_lca_synthetic_examples.json, который создаётся
@@ -3577,7 +3614,7 @@ async def get_lca_examples(query: LCAExamplesRequest):
 
 
 @app.get("/configs", tags=['utils'], response_class=HTMLResponse)
-async def get_configs_page():
+async def get_configs_page(user: User = Depends(current_user_any)):
     """
     Отдаёт HTML-страницу с конфигами сервисов.
     Файл лежит в фронтенд-проекте: src/components/configs.html.
@@ -6033,7 +6070,7 @@ import redis.asyncio
 
 
 @app.get("/is_gpu_busy", tags=['metrics'])
-async def is_gpu_busy() -> bool:
+async def is_gpu_busy(user: User = Depends(current_user_any)) -> bool:
     try:
         status = await redis_db.get("gpu:status")
         if status is None:
@@ -6058,7 +6095,16 @@ async def reset_gpu_status():
 
 
 # Обработка LLM задач
-async def _forbid_foreign_body_user(request: Request, user: User = Depends(current_user)):
+def _guard_user_id(user, value, what: str = "данных") -> None:
+    """403, если запрошен чужой ``user_id`` (суперпользователю можно любой)."""
+    if value in (None, ""):
+        return
+    if str(value) == str(getattr(user, "id", "")) or getattr(user, "is_superuser", False):
+        return
+    raise HTTPException(status_code=403, detail=f"Нет доступа к {what} другого пользователя")
+
+
+async def _forbid_foreign_body_user(request: Request, user: User = Depends(current_user_any)):
     """403, если в теле запроса указан чужой user_id (иначе задача читала бы чужие данные)."""
     try:
         payload = await request.json()
@@ -6066,11 +6112,7 @@ async def _forbid_foreign_body_user(request: Request, user: User = Depends(curre
         payload = {}
     if not isinstance(payload, dict):
         return
-    uid = payload.get("user_id")
-    if uid in (None, "") :
-        return
-    if str(uid) != str(getattr(user, "id", "")) and not getattr(user, "is_superuser", False):
-        raise HTTPException(status_code=403, detail="Нет доступа к данным другого пользователя")
+    _guard_user_id(user, payload.get("user_id"))
 
 
 @app.post("/llm-run/", tags=['ai analytics'])
@@ -6221,7 +6263,7 @@ async def process_task(task_id: str, task_data: dict, background_tasks: Backgrou
 
 
 @app.post("/reset-queue/", tags=['ai analytics'])
-async def reset_queue():
+async def reset_queue(admin: User = Depends(current_superuser_any)):
     try:
         # Очищаем очередь задач из Redis
         await redis_db.delete("queue:tasks")
@@ -6256,8 +6298,29 @@ async def reset_queue():
         )
 
 
+def _guard_task_owner(task: dict, user) -> None:
+    """403, если задача в Redis принадлежит другому пользователю.
+
+    Задачи, у которых владелец не записан (созданы старым кодом или служебным
+    вызовом), доступны любому залогиненному: идентификатор задачи — uuid4.
+    """
+    if not task:
+        return
+    owner = task.get("user_id")
+    if owner is None:
+        owner = task.get(b"user_id")
+    if isinstance(owner, bytes):
+        owner = owner.decode("utf-8", "replace")
+    owner = str(owner or "").strip()
+    if not owner:
+        return
+    if owner == str(getattr(user, "id", "")) or getattr(user, "is_superuser", False):
+        return
+    raise HTTPException(status_code=403, detail="Нет доступа к задаче другого пользователя")
+
+
 @app.get("/status/{task_id}", tags=['ai analytics'])
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, user: User = Depends(current_user_any)):
     # Ожидаем асинхронный вызов метода hgetall
     task_data = await redis_db.hgetall(f"task:{task_id}")
 
@@ -6266,6 +6329,8 @@ async def get_task_status(task_id: str):
     # Проверяем, существует ли задача
     if not task_data:
         raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    _guard_task_owner(task_data, user)
 
     # Декодируем ключи и значения 
     decoded_task_data = {key.decode("utf-8"): value.decode("utf-8") for key, value in task_data.items()}
@@ -6276,11 +6341,13 @@ async def get_task_status(task_id: str):
     return cleaned_task_data
 
 @app.get("/task-status/{task_id}", tags=['tasks'])
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, user: User = Depends(current_user_any)):
     task_info = await redis_db.hgetall(f"task:{task_id}")
     
     if not task_info:
         raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    _guard_task_owner(task_info, user)
     
     # Преобразование байтов в строки
     result = {k.decode("utf-8"): v.decode("utf-8") for k, v in task_info.items()}
@@ -6292,7 +6359,7 @@ async def get_task_status(task_id: str):
 logger = logging.getLogger("uvicorn.error")  # Используем логгер Uvicorn для ошибок
 
 @app.post("/reset-queue/", tags=['ai analytics'])
-async def reset_queue():
+async def reset_queue(admin: User = Depends(current_superuser_any)):
     try:
         # Очищаем очередь задач из Redis
         await redis_db.delete("queue:tasks")
@@ -7287,10 +7354,12 @@ async def add_file(
 
 
 @app.get("/check-task-status/{task_id}")
-async def check_task_status(task_id: str):
+async def check_task_status(task_id: str, user: User = Depends(current_user_any)):
     task_info = await redis_db.hgetall(f"task:{task_id}")
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    _guard_task_owner(task_info, user)
 
     response_data = {
         "status": task_info.get(b"status", b"unknown").decode(),
@@ -7880,17 +7949,20 @@ THINK_PREFIXES = [
 @app.post("/llm-run-multiple/", tags=['ai analytics'])
 async def llm_run_multiple(
     analysis_request: MultipleTextRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    _own_user: None = Depends(_forbid_foreign_body_user)
 ):
     logging.info(f"[MULTI] got request with {len(analysis_request.texts)} texts")
     try:
         task_id = str(uuid.uuid4())
 
-        # Инициализируем статус задачи на "0"
+        # Инициализируем статус задачи на "0"; владельца пишем сразу, чтобы чужой
+        # пользователь не мог прочитать тексты и ответы по /task-status/{task_id}.
         await redis_db.hset(f"task:{task_id}", mapping={
             "status": "0",
             "completed_texts": "0",
-            "progress": "0"
+            "progress": "0",
+            "user_id": str(analysis_request.user_id)
         })
         
         # Запуск обработки текстов в фоновом режиме
@@ -8296,7 +8368,7 @@ async def process_multiple_texts_task(task_id: str, task_data: dict):
 ########################################### Monitoring ###############################################
 
 @app.get("/gpu_metrics", tags=['metrics'])
-async def get_gpu_metrics(): 
+async def get_gpu_metrics(user: User = Depends(current_service_or_superuser)): 
     try:
         result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.free', '--format=csv,noheader,nounits'], 
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -8307,7 +8379,7 @@ async def get_gpu_metrics():
         return {"error": str(e)}
 
 @app.get("/server_metrics", tags=['metrics'])
-async def get_metrics():
+async def get_metrics(user: User = Depends(current_service_or_superuser)):
     cpu_usage = psutil.cpu_percent(interval=1)
     memory_info = psutil.virtual_memory()
     return {
@@ -8963,7 +9035,11 @@ async def get_text_clusters(
     file_name: str,
     text_input: TextInput,  # Изменяем параметр на text_input
     session: AsyncSession = Depends(get_db),
-    threshold: float = 0.8):
+    threshold: float = 0.8,
+    user: User = Depends(current_user_any)):
+
+    # Эмбеддинги читаем только у себя: чужой user_id — 403.
+    _guard_user_id(user, user_id, what="эмбеддингов")
 
     # Получаем эмбеддинги из базы данных
     embedding = await get_embedding(session, user_id, file_name)
@@ -9072,7 +9148,7 @@ async def get_text_clusters(
 
 
 @app.post("/ai-question", tags=['data analytics'])
-def ai_question():
+def ai_question(user: User = Depends(current_user_any)):
 
     return f'Да, пришел запрос, вот мой ответ!'
 
@@ -9094,7 +9170,7 @@ def _dashboard_prompt(lock_name: str, default_id: str) -> str:
 
 # Вариант 2: Если вы не знаете структуру данных заранее 
 @app.post("/ai-question-raw", tags=['data analytics'])
-async def ai_question_raw(request: Request):
+async def ai_question_raw(request: Request, user: User = Depends(current_user_any)):
     from mlops.dashboard_qa import handle_question_raw
     return await handle_question_raw(request)
     # Получаем тело запроса в виде байтов
@@ -9335,7 +9411,7 @@ qdrant_client = QdrantClient(
 )
 
 @app.post("/ai-question-information-graph", tags=['data analytics'])
-async def ai_question_information_graph(request: Request):
+async def ai_question_information_graph(request: Request, user: User = Depends(current_user_any)):
     from mlops.dashboard_qa import handle_question_information
     return await handle_question_information(request)
     # Получаем тело запроса в виде байтов
@@ -9578,7 +9654,7 @@ async def ai_question_information_graph(request: Request):
 
 
 @app.post("/ai-question-media-rating", tags=['data analytics'])
-async def ai_question_media_rating(request: Request):
+async def ai_question_media_rating(request: Request, user: User = Depends(current_user_any)):
     from mlops.dashboard_qa import handle_question_media
     return await handle_question_media(request)
     # Получаем тело запроса в виде байтов
@@ -9654,7 +9730,7 @@ def format_percent(n, total):
     return f"{percent}% ({n})"
 
 @app.post("/ai-question-voice", tags=['data analytics'])
-async def ai_question_voice(request: Request):
+async def ai_question_voice(request: Request, user: User = Depends(current_user_any)):
     try:
         body_bytes = await request.body()
         body_json = json.loads(body_bytes)
@@ -10108,7 +10184,7 @@ from io import BytesIO
 from transliterate import translit, detect_language
 
 @app.post("/convert-file-mlg")
-async def convert_file_mlg(file: UploadFile = File(...)):
+async def convert_file_mlg(file: UploadFile = File(...), user: User = Depends(current_user_any)):
     try:
         def safe_filename(filename):
             # Транслитерация кириллицы (если строка на русском)
@@ -10127,12 +10203,17 @@ async def convert_file_mlg(file: UploadFile = File(...)):
             return filename
 
         # Применяем safe_filename ко всему имени файла (включая расширение)
-        original_filename = file.filename
+        original_filename = str(file.filename or "upload.xlsx")
         safe_name = safe_filename(original_filename.replace('.xlsx', ''))
         safe_output_filename = f"converted_{safe_name}.json"
 
         contents = await file.read()
-        temp_file_path = f"/home/dev/tellscope_app/tellscope_backend/data/temp/{original_filename}"
+        # Имя файла приходит от клиента: оставляем только basename, иначе «../» в имени
+        # писал бы файл за пределами каталога data/temp.
+        temp_dir = "/home/dev/tellscope_app/tellscope_backend/data/temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        upload_name = os.path.basename(original_filename.replace("\\", "/")).strip() or "upload.xlsx"
+        temp_file_path = os.path.join(temp_dir, upload_name)
 
         with open(temp_file_path, "wb") as f:
             f.write(contents)
@@ -10158,7 +10239,7 @@ async def convert_file_mlg(file: UploadFile = File(...)):
 
 
 @app.post("/ai-question-analysis", tags=['data analytics'])
-async def ai_question_analysis(request: Request):
+async def ai_question_analysis(request: Request, user: User = Depends(current_user_any)):
     from mlops.ai_bot_rag import handle_question_analysis
     return await handle_question_analysis(
         request,
@@ -10175,7 +10256,7 @@ async def ai_question_analysis(request: Request):
 
 
 @app.post("/ai-bot/corpus-summary", tags=['data analytics'])
-async def ai_bot_corpus_summary(request: Request):
+async def ai_bot_corpus_summary(request: Request, user: User = Depends(current_user_any)):
     from mlops.ai_bot_rag import handle_corpus_summary
     return await handle_corpus_summary(
         request,
@@ -10186,7 +10267,7 @@ async def ai_bot_corpus_summary(request: Request):
 
 
 @app.post("/ai-bot/deep-brief", tags=['data analytics'])
-async def ai_bot_deep_brief(request: Request):
+async def ai_bot_deep_brief(request: Request, user: User = Depends(current_user_any)):
     from mlops.ai_bot_rag import handle_deep_brief
     return await handle_deep_brief(
         request,
@@ -10197,7 +10278,7 @@ async def ai_bot_deep_brief(request: Request):
 
 
 @app.get("/ai-bot/deep-brief", tags=['data analytics'])
-async def ai_bot_deep_brief_status(request: Request):
+async def ai_bot_deep_brief_status(request: Request, user: User = Depends(current_user_any)):
     from mlops.ai_bot_rag import handle_deep_brief_status
     return await handle_deep_brief_status(request)
 
@@ -10247,7 +10328,7 @@ async def get_models():
     }
 
 @app.get("/test-collection/{collection_name}")
-async def test_collection(collection_name: str):
+async def test_collection(collection_name: str, admin: User = Depends(current_superuser_any)):
     """Диагностика коллекции"""
     try:
         # 1. Инфо о коллекции
@@ -10295,7 +10376,7 @@ async def test_collection(collection_name: str):
 
 
 @app.get("/qdrant/collections", tags=['qdrant'])
-async def get_qdrant_collections():
+async def get_qdrant_collections(admin: User = Depends(current_superuser_any)):
     """Получить список всех коллекций из Qdrant"""
     try:
         collections = qdrant_client.get_collections()
@@ -10330,8 +10411,8 @@ async def get_qdrant_collections():
 
 
 @app.delete("/qdrant/collections/{collection_name}", tags=['qdrant'])
-async def delete_qdrant_collection(collection_name: str):
-    """Удалить коллекцию из Qdrant"""
+async def delete_qdrant_collection(collection_name: str, admin: User = Depends(current_superuser_any)):
+    """Удалить коллекцию из Qdrant (только администратор)"""
     try:
         # Проверяем существование коллекции
         collections = qdrant_client.get_collections()
@@ -11083,6 +11164,33 @@ def _compute_topic_similarity_hybrid(self, topics_list: list) -> np.ndarray:
     return hybrid_sim
 
 
+def _user_data_root(user) -> str:
+    """Каталог данных пользователя: ``data/<uid>/`` (администратору — весь ``data/``)."""
+    base = "/home/dev/tellscope_app/tellscope_backend/data"
+    if getattr(user, "is_superuser", False):
+        return base
+    return os.path.join(base, str(getattr(user, "id", "")))
+
+
+def _resolve_own_path(user, raw_path: str) -> str:
+    """Путь к файлу внутри каталога пользователя (иначе 403).
+
+    Клиент присылает полный серверный путь, поэтому одной проверки «внутри data/»
+    мало: иначе любой пользователь читал бы датасеты соседа. Разрешаем только
+    ``data/<uid>/...`` (администратору — любой путь внутри ``data/``).
+    """
+    candidate = (raw_path or "").strip()
+    if not candidate:
+        raise HTTPException(400, "Пустой путь к файлу")
+    if "\x00" in candidate:
+        raise HTTPException(400, "Недопустимый символ в пути")
+    real = os.path.realpath(candidate)
+    root = os.path.realpath(_user_data_root(user))
+    if real != root and not real.startswith(root.rstrip("/") + "/"):
+        raise HTTPException(403, "Доступ к файлам вне своего каталога запрещён")
+    return real
+
+
 @app.post("/build-from-csv")
 async def build_graph_from_csv(
     graph_type: str = Form('author'),
@@ -11090,23 +11198,20 @@ async def build_graph_from_csv(
     file: Optional[UploadFile] = File(None),
     similarity_threshold: Optional[float] = Form(None),
     similarity_method: str = Form('tfidf'),
-    min_common_words: int = Form(1)
+    min_common_words: int = Form(1),
+    user: User = Depends(current_user_any)
 ):
     try:
         # Загружаем данные
         if file:
             df = pd.read_csv(file.file)
         elif csv_path:
-            # ✅ Проверяем, что файл существует и принадлежит пользователю
-            if not os.path.exists(csv_path):
+            # ✅ Путь обязан быть внутри каталога данных этого пользователя
+            csv_real = _resolve_own_path(user, csv_path)
+            if not os.path.isfile(csv_real):
                 raise HTTPException(404, f"CSV file not found: {csv_path}")
-            
-            # ✅ Дополнительная проверка безопасности
-            base_data_dir = '/home/dev/tellscope_app/tellscope_backend/data/'
-            if not os.path.abspath(csv_path).startswith(base_data_dir):
-                raise HTTPException(403, "Access denied")
-            
-            df = pd.read_csv(csv_path)
+
+            df = pd.read_csv(csv_real)
         else:
             raise HTTPException(400, "No CSV file provided")
         
@@ -11172,6 +11277,9 @@ async def build_graph_from_csv(
         
         return result
         
+    except HTTPException:
+        # 403/404 из проверок доступа (чужой путь к csv_path) не прячем в 500.
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -11183,7 +11291,7 @@ async def build_graph_from_csv(
         raise HTTPException(500, str(e))
 
 @app.post("/build")
-async def build_graph(data: dict):
+async def build_graph(data: dict, user: User = Depends(current_user_any)):
     """Построение графа из данных (старый эндпойнт)"""
     try:
         df = pd.DataFrame(data['records'])
@@ -11217,7 +11325,7 @@ async def build_graph(data: dict):
         raise HTTPException(500, str(e))
 
 @app.post("/analyze")
-async def analyze_graph(query: GraphQuery):
+async def analyze_graph(query: GraphQuery, user: User = Depends(current_user_any)):
     from mlops.dashboard_qa import handle_analyze_graph
     return await handle_analyze_graph(query.question, query.graph_data)
     """AI анализ графа"""
@@ -11428,12 +11536,36 @@ async def run_agent_task(task_id: str, user_query: str, input_file: str, user_id
         await asyncio.sleep(1)
 
 
+def _smart_task_owned(task: dict, user) -> bool:
+    """Доступ к задаче smart-agent: своя задача, задача без владельца или админ.
+
+    ``user`` — объект пользователя или словарь вида ``{"id": ...}`` (для WebSocket,
+    где пользователь известен только по идентификатору из токена).
+    """
+    owner = str((task or {}).get("user_id") or "").strip()
+    if not owner:
+        return True
+    if isinstance(user, dict):
+        uid = user.get("id")
+        is_super = bool(user.get("is_superuser"))
+    else:
+        uid = getattr(user, "id", "")
+        is_super = bool(getattr(user, "is_superuser", False))
+    if is_super:
+        return True
+    return owner == str(uid)
+
+
 @app.post("/run-smart-agent", tags=['smart agent'])
 async def run_smart_agent(
     background_tasks: BackgroundTasks,
-    request: SmartAgentRequest
+    request: SmartAgentRequest,
+    user: User = Depends(current_user_any)
 ):
     """Запуск умного агента для анализа данных"""
+    # Чужой user_id в теле и чужой набор данных — 403 (иначе агент читал бы чужие данные).
+    _guard_user_id(user, request.user_id)
+    _guard_index_access(user, request.index)
     try:
         from mlops.runtime import GpuBusy, assert_can_start
         assert_can_start("smart-agent")
@@ -11453,7 +11585,7 @@ async def run_smart_agent(
         "report_path": None,
         "error": None,
         "created_at": time.time(),
-        "user_id": request.user_id  # <-- сохраняем user_id
+        "user_id": str(request.user_id or user.id)  # <-- владелец задачи (для проверки доступа)
     }
     
     try:
@@ -11478,7 +11610,7 @@ async def run_smart_agent(
         active_tasks[task_id]["status"] = "pending"
         try:
             from mlops.runtime import register_smart_agent
-            register_smart_agent(task_id, request.user_query, "pending", user_id=str(request.user_id or ""))
+            register_smart_agent(task_id, request.user_query, "pending", user_id=str(request.user_id or user.id))
         except Exception:
             pass
         
@@ -11488,7 +11620,7 @@ async def run_smart_agent(
             task_id, 
             request.user_query, 
             str(input_file),
-            request.user_id  # <-- добавили
+            str(request.user_id or user.id)  # <-- добавили
         )
         
         return {"task_id": task_id, "status": "started"}
@@ -11507,8 +11639,16 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     """
     WebSocket для получения прогресса выполнения агента.
     Эта версия использует неблокирующий цикл для отправки обновлений и keep-alive сообщений.
+
+    WebSocket не проходит через гейт авторизации, поэтому токен проверяем здесь
+    (cookie или query-параметр ``token``), а задачу отдаём только её владельцу.
     """
     print(f"WebSocket connection attempt for task_id: {task_id}")
+
+    ws_user_id = _agent_ws_user_id(websocket)
+    if ws_user_id is None:
+        await websocket.close(code=1008, reason="Требуется авторизация")
+        return
 
     # 1. Ждем, пока задача будет создана в active_tasks
     # Увеличиваем время ожидания, чтобы решить race condition
@@ -11524,6 +11664,11 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
     if not task_found:
         print(f"Task {task_id} not found after {max_wait_time}s. Closing connection.")
         await websocket.close(code=1008, reason="Task not found or timed out.")
+        return
+
+    # 1b. Чужую задачу не показываем: прогресс и отчёт принадлежат её владельцу.
+    if not _smart_task_owned(active_tasks.get(task_id), {"id": ws_user_id}):
+        await websocket.close(code=1008, reason="Нет доступа к задаче")
         return
 
     # 2. Принимаем и регистрируем соединение
@@ -11587,12 +11732,14 @@ async def websocket_endpoint(websocket: WebSocket, task_id: str):
 
 
 @app.get("/download-report/{task_id}", tags=['smart agent'])
-async def download_report(task_id: str):
-    """Скачивание готового отчета"""
+async def download_report(task_id: str, user: User = Depends(current_user_any)):
+    """Скачивание готового отчета (только владельцу задачи)"""
     if task_id not in active_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
     task = active_tasks[task_id]
+    if not _smart_task_owned(task, user):
+        raise HTTPException(status_code=403, detail="Нет доступа к отчёту другого пользователя")
     report_path = task.get("report_path")
     
     if not report_path or not Path(report_path).exists():
@@ -11605,12 +11752,14 @@ async def download_report(task_id: str):
     )
 
 @app.get("/agent-status/{task_id}", tags=['smart agent'])
-async def get_agent_status(task_id: str):
-    """Получить статус задачи агента"""
+async def get_agent_status(task_id: str, user: User = Depends(current_user_any)):
+    """Получить статус задачи агента (только владельцу задачи)"""
     if task_id not in active_tasks:
         return {"error": "Task not found"}
     
     task = active_tasks[task_id]
+    if not _smart_task_owned(task, user):
+        raise HTTPException(status_code=403, detail="Нет доступа к задаче другого пользователя")
     return {
         "status": task["status"],
         "error": task.get("error"),
@@ -11619,7 +11768,7 @@ async def get_agent_status(task_id: str):
     
 
 from mosinform_api import router as mosinform_router
-app.include_router(mosinform_router)
+app.include_router(mosinform_router, dependencies=[Depends(current_user_any)])
 from mlops_api import router as mlops_router
 app.include_router(mlops_router)
 
@@ -11642,12 +11791,12 @@ from file_origin_api import router as file_origin_router
 app.include_router(file_origin_router)
 
 @app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
-async def graph_cluster_summary(request: Request):
+async def graph_cluster_summary(request: Request, user: User = Depends(current_user_any)):
     from mlops.author_graph import handle_cluster_summary
     return await handle_cluster_summary(request)
 
 @app.get("/graph-analysis/cluster-summary/status", tags=['data analytics'])
-async def graph_cluster_summary_status(request: Request):
+async def graph_cluster_summary_status(request: Request, user: User = Depends(current_user_any)):
     from mlops.author_graph import handle_cluster_summary_status
     return await handle_cluster_summary_status(request)
 
@@ -12910,8 +13059,12 @@ def _agent_public_base_url(request: Request) -> str:
 
 
 @app.get("/agent/openapi.json", tags=["agent mode"])
-async def agent_openapi_spec(request: Request):
-    """OpenAPI-описание инструментов Tellscope: импортируется в Dify как Custom Tool."""
+async def agent_openapi_spec(request: Request, user: User = Depends(current_user_or_service)):
+    """OpenAPI-описание инструментов Tellscope: импортируется в Dify как Custom Tool.
+
+    Доступ — пользовательский токен (заголовок или cookie) либо сервисный токен:
+    само описание инструментов наружу без авторизации не отдаём.
+    """
     from agent_engine.service_api import openapi_spec
 
     return JSONResponse(openapi_spec(_agent_public_base_url(request)))
