@@ -10079,6 +10079,7 @@ def medialogia_record_to_export(row, idx):
         "duplicateCount": safe_int(row.get("duplicateCount"), 1),
         "massMediaAudience": safe_int(row.get("massMediaAudience")),
         "toneMark": toneMark_val,
+        "tone_source": toneMark_val,
         "role": safe_str(row.get("role")),
         "aggression": safe_str(row.get("aggression")),
         "country": safe_str(row.get("country") or row.get("Страна")),

@@ -112,6 +112,13 @@ MAX_EXAMPLES = 25
 # По умолчанию разрешаем «полностью» до 300 000 сообщений: дальше нужен срез по датам.
 MAX_FULL_DOCS = int(os.environ.get("TELLSCOPE_TONE_FULL_LIMIT") or 300000)
 
+# Перенос разметки в тональность сообщений («считать по обновлённой разметке»): идём страницами,
+# чтобы обрыв связи или перезапуск сервиса не рушил работу — следующая страница продолжит с места.
+TONE_MODE_PAGE = int(os.environ.get("TELLSCOPE_TONE_MODE_PAGE") or 2000)
+TONE_MODE_WORKERS: Dict[str, Any] = {}
+TONE_MODE_LOCK = threading.Lock()
+TONE_MODE_FILE_LOCK = threading.Lock()
+
 # Перепроверка на 32B в разы медленнее первого прохода, но по умолчанию её доля НЕ ограничена:
 # все спорные случаи уходят на уточняющую проверку (PASS2_MAX_SHARE = 1.0). Для очень большого
 # датасета долю можно ограничить переменной окружения TELLSCOPE_TONE_PASS2_MAX_SHARE (например
@@ -777,7 +784,7 @@ def _search_page(job: Dict[str, Any], size: int, cursor: Optional[List[Any]],
     query = _active_query(job, marker)
     text_field = _text_field(name)
     id_field = _id_field(name)
-    source = ["toneMark", "timeCreate", "hub", "hubtype", "type", "url", "title",
+    source = ["toneMark", "tone_source", "timeCreate", "hub", "hubtype", "type", "url", "title",
               "review_rating", "id", text_field] + list(extra_source)
     source = sorted(set(source))
     kwargs: Dict[str, Any] = {
@@ -830,7 +837,7 @@ def _doc_from_hit(hit: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
         "_id": str(hit.get("_id") or ""),
         "id": src.get("id"),
         "text": text,
-        "toneMark": src.get("toneMark"),
+        "toneMark": _source_tone(src),
         "timeCreate": src.get("timeCreate"),
         "hub": src.get("hub") or "",
         "hubtype": src.get("hubtype") or "",
@@ -1052,7 +1059,7 @@ def _records_from(parsed: Dict[str, Dict[str, Any]], docs: List[Dict[str, Any]],
         base = {
             "_id": doc["_id"],
             "id": doc.get("id"),
-            "toneMark": doc.get("toneMark"),
+            "toneMark": _source_tone(doc),
             "timeCreate": doc.get("timeCreate"),
             "hub": doc.get("hub") or "",
             "hubtype": doc.get("hubtype") or "",
@@ -1072,7 +1079,7 @@ def _records_from(parsed: Dict[str, Dict[str, Any]], docs: List[Dict[str, Any]],
         else:
             # Вердикта нет: не выдаём чужое решение за наше, но и не теряем документ.
             try:
-                guess = int(doc.get("toneMark"))
+                guess = int(_source_tone(doc))
             except (TypeError, ValueError):
                 guess = 0
             base.update({
@@ -2304,6 +2311,242 @@ def _dataset_folders(me: str, allow_any: bool) -> Dict[str, str]:
     return out
 
 
+def _source_tone(doc: Dict[str, Any]) -> Any:
+    """Тональность ИСТОЧНИКА: поле ``tone_source``, если оно есть, иначе ``toneMark``.
+
+    Нужно после включения «считать по обновлённой разметке»: наша разметка переносится в
+    ``toneMark`` (его читают все разделы платформы), а исходное значение остаётся в
+    ``tone_source`` — поэтому сверка с источником всегда идёт с настоящим источником.
+    """
+    value = doc.get("tone_source")
+    if value is None:
+        value = doc.get("toneMark")
+    return value
+
+
+def _source_tone_int(doc: Dict[str, Any]) -> Optional[int]:
+    try:
+        return int(_source_tone(doc))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tone_mode_effective(name: str, state: Dict[str, Any], stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Актуальный статус переключения считаем по данным, а не по id задачи Elasticsearch.
+
+    Идентификатор задачи приходит не всегда (и теряется при перезапуске сервиса), поэтому
+    смотрим на сами счётчики: сколько сообщений уже помечено перенесёнными. Так состояние
+    само «дозревает» до готового, и переключатель не залипает в «идёт переключение».
+    """
+    mode = str(state.get("mode") or "source")
+    labeled = int(stats.get("labeled") or 0)
+    applied = int(stats.get("applied") or 0)
+    status = str(state.get("status") or "idle")
+    if mode == "relabeled":
+        if labeled > 0 and applied >= labeled:
+            status = "done"
+        elif applied > 0:
+            status = "running"
+        else:
+            status = "running" if status == "running" else "idle"
+    else:
+        status = "running" if applied > 0 else ("done" if status in ("running", "done") else "idle")
+    state["status"] = status
+    return state
+
+
+def _tone_mode_path(name: str) -> str:
+    """Файл состояния переключателя для набора (состояние общее: данные одни на всех)."""
+    safe = re.sub(r"[^0-9A-Za-zА-Яа-я_.\-]+", "_", str(name or ""))[:120]
+    return os.path.join(STATE_DIR, "tone_mode_%s.json" % safe)
+
+
+def _tone_mode_load(name: str) -> Dict[str, Any]:
+    path = _tone_mode_path(name)
+    empty = {"mode": "source", "applied": 0, "applied_at": None, "task_id": "", "status": "idle"}
+    if not os.path.isfile(path):
+        return dict(empty)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            empty.update(data)
+            return empty
+    except Exception:
+        pass
+    return dict(empty)
+
+
+def _tone_mode_save(name: str, data: Dict[str, Any]) -> None:
+    path = _tone_mode_path(name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Один и тот же файл пишут и поток переноса, и обработчики запросов: без замка временный файл
+    # успевал исчезнуть и запись падала с «No such file or directory».
+    with TONE_MODE_FILE_LOCK:
+        tmp = "%s.%d.tmp" % (path, threading.get_ident())
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+
+
+async def _ubq(index: str, query: Dict[str, Any], script: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Одна страница переноса: синхронный update_by_query ограниченного размера.
+
+    Именно страницами, а не одной длинной асинхронной задачей: обрыв связи с Elasticsearch
+    (например, перезапуск сервиса) не рушит всю работу — следующая страница продолжает с того
+    же места, потому что запросы идемпотентны («ещё не перенесено» / «уже перенесено»).
+    """
+    body = {
+        "query": query,
+        "script": {"source": script, "lang": "painless", "params": params},
+        "conflicts": "proceed",
+        "max_docs": TONE_MODE_PAGE,
+    }
+    res = await asyncio.to_thread(
+        lambda: _es().update_by_query(index=index, body=body, wait_for_completion=True,
+                                      refresh=True, requests_per_second=-1))
+    data = res if isinstance(res, dict) else {}
+    return {"updated": int(data.get("updated") or 0), "total": int(data.get("total") or 0)}
+
+
+def _tone_mode_run(name: str, mode: str) -> None:
+    """Переносит разметку страницами и сам продолжает после перезапуска сервиса."""
+    try:
+        # 1) разметка источника сохраняется один раз — из неё всегда можно вернуться назад
+        for _ in range(10000):
+            page = _es().update_by_query(
+                index=name, wait_for_completion=True, refresh=True, requests_per_second=-1,
+                body={"query": _no_source_query(), "max_docs": TONE_MODE_PAGE,
+                      "script": {"source": ("if (ctx._source.toneMark != null) "
+                                            "{ ctx._source.tone_source = ctx._source.toneMark; }")}})
+            if int((page or {}).get("updated") or 0) <= 0:
+                break
+        if mode == "relabeled":
+            query = {"bool": {"must": [_relabeled_query()],
+                              "must_not": [{"exists": {"field": "tone_applied_at"}}]}}
+            script = ("if (ctx._source.tone_llm != null) { ctx._source.toneMark = ctx._source.tone_llm; } "
+                      "else if (ctx._source.tone_msg_llm != null) "
+                      "{ ctx._source.toneMark = ctx._source.tone_msg_llm; } "
+                      "ctx._source.tone_applied_at = params.ts;")
+            params: Dict[str, Any] = {"ts": int(time.time())}
+        else:
+            query = _applied_query()
+            script = ("if (ctx._source.tone_source != null) "
+                      "{ ctx._source.toneMark = ctx._source.tone_source; } "
+                      "ctx._source.remove('tone_applied_at');")
+            params = {}
+        while not _cancelled_mode(name):
+            page = _es().update_by_query(
+                index=name, wait_for_completion=True, refresh=True, requests_per_second=-1,
+                body={"query": query, "max_docs": TONE_MODE_PAGE,
+                      "script": {"source": script, "lang": "painless", "params": params},
+                      "conflicts": "proceed"})
+            if int((page or {}).get("updated") or 0) <= 0:
+                break
+        state = _tone_mode_load(name)
+        state["status"] = "done"
+        state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        state["applied"] = int(_tone_mode_stats(name).get("applied") or 0)
+        _tone_mode_save(name, state)
+        _tone_mode_log(name, "готово: %s" % mode)
+    except Exception as exc:  # noqa: BLE001
+        state = _tone_mode_load(name)
+        state["status"] = "error"
+        state["error"] = str(exc)[:300]
+        _tone_mode_save(name, state)
+        _tone_mode_log(name, "ошибка: %s" % str(exc)[:200])
+    finally:
+        with TONE_MODE_LOCK:
+            TONE_MODE_WORKERS.pop(name, None)
+
+
+def _cancelled_mode(name: str) -> bool:
+    """Просьба остановить перенос (пользователь переключил режим заново)."""
+    state = _tone_mode_load(name)
+    return str(state.get("status") or "") == "cancelled"
+
+
+def _tone_mode_start(name: str, mode: str, user_id: str) -> Dict[str, Any]:
+    """Ставит перенос в фоновый поток и сразу отдаёт состояние — работа идёт на сервере."""
+    state = _tone_mode_load(name)
+    stats = _tone_mode_stats(name)
+    state.update({
+        "mode": mode,
+        "status": "running",
+        "error": "",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "applied_from": int(stats.get("applied") or 0) if mode == "source" else 0,
+        "applied_at": datetime.now().isoformat(timespec="seconds") if mode == "relabeled" else None,
+        "by": str(user_id),
+    })
+    _tone_mode_save(name, state)
+    _tone_mode_log(name, "переключатель: %s" % ("наша разметка" if mode == "relabeled" else "источник"))
+    thread = threading.Thread(target=_tone_mode_run, args=(name, mode),
+                              name="tone-mode-%s" % name[:20], daemon=True)
+    with TONE_MODE_LOCK:
+        TONE_MODE_WORKERS[name] = thread
+    thread.start()
+    return state
+
+
+def _tone_mode_worker_alive(name: str) -> bool:
+    with TONE_MODE_LOCK:
+        thread = TONE_MODE_WORKERS.get(name)
+    return bool(thread and thread.is_alive())
+
+
+def _es_task_status(task_id: str) -> Dict[str, Any]:
+    if not task_id:
+        return {}
+    try:
+        res = _es().tasks.get(task_id=task_id, wait_for_completion=False) or {}
+        task = res.get("task") or {}
+        status = task.get("status") or {}
+        return {
+            "completed": bool(res.get("completed")),
+            "total": int(status.get("total") or 0),
+            "updated": int(status.get("updated") or 0),
+            "created": int(status.get("created") or 0),
+            "batches": int(status.get("batches") or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _relabeled_query() -> Dict[str, Any]:
+    """Сообщения, у которых есть наша разметка: обычная (tone_llm) или по объектам (tone_msg_llm)."""
+    return {"bool": {"should": [{"exists": {"field": "tone_llm"}},
+                                {"exists": {"field": "tone_msg_llm"}}],
+                     "minimum_should_match": 1}}
+
+
+def _applied_query() -> Dict[str, Any]:
+    """Сообщения, в которые уже перенесена наша разметка."""
+    return {"exists": {"field": "tone_applied_at"}}
+
+
+def _no_source_query() -> Dict[str, Any]:
+    """Сообщения без сохранённой разметки источника (для их наборов это обычное состояние)."""
+    return {"bool": {"must_not": [{"exists": {"field": "tone_source"}}]}}
+
+
+def _tone_mode_stats(name: str) -> Dict[str, Any]:
+    """Счётчики для интерфейса: сколько сообщений, сколько размечено, сколько перенесено."""
+    out: Dict[str, Any] = {"docs": 0, "labeled": 0, "applied": 0, "with_source": 0}
+    try:
+        out["docs"] = int(_es().count(index=name).get("count") or 0)
+    except Exception:
+        pass
+    for key, query in (("labeled", _relabeled_query()),
+                       ("applied", _applied_query()),
+                       ("with_source", {"exists": {"field": "tone_source"}})):
+        try:
+            out[key] = int(_es().count(index=name, query=query).get("count") or 0)
+        except Exception:
+            pass
+    return out
+
+
 def _dataset_file_owner(me: str, name: str, allow_any: bool) -> Tuple[str, str, str]:
     """Где лежит запись о наборе в списках файлов: (владелец, папка, файл).
 
@@ -2428,6 +2671,102 @@ def delete_dataset(spec: str, user: Any = Depends(current_user_any)):
             "orphan": not folder,
             "note": ("Запись в списке файлов не найдена — удалены только данные набора."
                      if not folder else "")}
+
+
+class ToneModeBody(BaseModel):
+    index: str = Field(description="набор данных, для которого меняем режим тональности")
+    mode: str = Field(default="source", description="source — разметка источника, relabeled — наша разметка")
+
+
+@router.get("/tone-mode")
+def tone_mode(index: str = Query(..., description="набор данных"), user: Any = Depends(current_user_any)):
+    """Как сейчас считается тональность набора и что можно переключить.
+
+    Выключено — все разделы читают разметку источника. Включено — в тональность сообщений
+    переносится наша разметка (там, где она есть), а исходные значения остаются в
+    ``tone_source``: их читает эта же проверка и по ним можно вернуть всё назад.
+    """
+    key, name = _guard_dataset(user, index)
+    state = _tone_mode_load(name)
+    stats = _tone_mode_stats(name)
+    state = _tone_mode_effective(name, state, stats)
+    _tone_mode_save(name, state)
+    # Сервис мог перезапуститься посреди переноса: продолжаем сами, без действий пользователя.
+    if state.get("status") == "running" and not _tone_mode_worker_alive(name):
+        _tone_mode_log(name, "продолжаю перенос после перезапуска сервиса")
+        _tone_mode_start(name, str(state.get("mode") or "source"), str(getattr(user, "id", "")))
+        state = _tone_mode_load(name)
+        stats = _tone_mode_stats(name)
+        state = _tone_mode_effective(name, state, stats)
+    es_task = _es_task_status(str(state.get("task_id") or ""))
+    if state.get("status") == "done":
+        state["applied"] = int(stats.get("applied") or 0)
+    mode = str(state.get("mode") or "source")
+    if mode == "relabeled" and not int(stats.get("labeled") or 0):
+        mode = "source"
+    return {
+        "index_key": key,
+        "name": name,
+        "label": _pretty_label(name),
+        "mode": mode,
+        "status": state.get("status") or "idle",
+        "applied_at": state.get("applied_at"),
+        "stats": stats,
+        "task": es_task,
+        "progress": ({"done": int(stats.get("applied") or 0), "total": int(stats.get("labeled") or 0)}
+                     if mode == "relabeled" else
+                     {"done": max(0, int(state.get("applied_from") or 0) - int(stats.get("applied") or 0)),
+                      "total": int(state.get("applied_from") or 0)}),
+        "coverage": round(float(stats.get("labeled") or 0) / max(1, int(stats.get("docs") or 0)), 4),
+    }
+
+
+@router.post("/tone-mode")
+async def tone_mode_set(body: ToneModeBody, user: Any = Depends(current_user_any)):
+    """Включить или выключить «считать по обновлённой разметке» для набора.
+
+    Включение: сначала сохраняем разметку источника в ``tone_source`` (один раз), затем
+    переносим нашу разметку в ``toneMark`` — то поле, которое читают таблицы, графики,
+    аналитика и конструктор отчётов. Выключение возвращает ``toneMark`` из ``tone_source``.
+    Работа идёт на стороне Elasticsearch и не зависит от браузера.
+    """
+    mode = str(body.mode or "").strip().lower()
+    if mode not in ("source", "relabeled"):
+        raise HTTPException(status_code=400, detail="Режим: source или relabeled")
+    key, name = _guard_dataset(user, body.index)
+    if not _es().indices.exists(index=name):
+        raise HTTPException(status_code=404, detail="Данные набора не найдены — возможно, он удалён")
+
+    state = _tone_mode_load(name)
+    stats = _tone_mode_stats(name)
+    state = _tone_mode_effective(name, state, stats)
+    if str(state.get("status") or "") == "running" and _tone_mode_worker_alive(name):
+        raise HTTPException(status_code=409, detail="Переключение уже идёт — дождитесь окончания")
+    if mode == "relabeled" and not int(stats.get("labeled") or 0):
+        raise HTTPException(status_code=409,
+                            detail="В этом наборе ещё нет нашей разметки — сначала выполните проверку тональности")
+
+    state = _tone_mode_start(name, mode, str(getattr(user, "id", "")))
+    return {
+        "index_key": key,
+        "name": name,
+        "mode": mode,
+        "status": state.get("status"),
+        "stats": stats,
+        "labeled": int(stats.get("labeled") or 0),
+        "docs": int(stats.get("docs") or 0),
+    }
+
+
+def _tone_mode_log(name: str, message: str) -> None:
+    """Короткий журнал переключений — чтобы было видно, что и когда менялось."""
+    path = os.path.join(STATE_DIR, "tone_mode.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write("%s | %s | %s\n" % (datetime.now().strftime("%d.%m.%Y %H:%M:%S"), name, message))
+    except Exception:
+        pass
 
 
 @router.get("/jobs")
@@ -3191,7 +3530,7 @@ def _aspect_records_from(parsed: Dict[str, Dict[str, Any]], docs: List[Dict[str,
         out.append({
             "_id": doc["_id"],
             "id": doc.get("id"),
-            "toneMark": doc.get("toneMark"),
+            "toneMark": _source_tone(doc),
             "timeCreate": doc.get("timeCreate"),
             "hub": doc.get("hub") or "",
             "hubtype": doc.get("hubtype") or "",
