@@ -126,6 +126,10 @@ WORK_REPORT_END = 96
 # шаге записи в ES), помечены другой версией — их залипший процент пересчитывается честно.
 PROGRESS_SCHEMA = 2
 
+# Потолок полей индекса: у датасетов с динамическим маппингом 3000 полей уже выбраны
+# на загрузке данных, и без поднятия лимита наши поля физически не создать.
+TOTAL_FIELDS_LIMIT = int(os.environ.get("TELLSCOPE_TONE_FIELD_LIMIT") or 4000)
+
 STAGE_LABELS = {
     "preparing": "подготовка",
     "pass1": "размечаю выборку",
@@ -222,12 +226,47 @@ def _ensure_mapping(name: str) -> None:
         "tone_llm_by": {"type": "keyword"},
         "tone_llm_reason": {"type": "text"},
         "tone_llm_at": {"type": "long"},
+        # Аспектная разметка: отношение к объекту, а не тон сообщения целиком.
+        "tone_aspect": {"type": "nested", "properties": {
+            "object": {"type": "keyword"},
+            "tone": {"type": "long"},
+            "confidence": {"type": "float"},
+            "reason": {"type": "text"},
+            "quote": {"type": "text"},
+            "by": {"type": "keyword"},
+        }},
+        "tone_aspect_objects": {"type": "keyword"},
+        "tone_aspect_at": {"type": "long"},
+        "tone_aspect_by": {"type": "keyword"},
+        # Общий тон сообщения из аспектного прохода: отдельные поля, чтобы не смешивать
+        # происхождение с tone_llm* и не блокировать обычный режим.
+        "tone_msg_llm": {"type": "long"},
+        "tone_msg_conf": {"type": "float"},
+        "tone_msg_by": {"type": "keyword"},
+        "tone_msg_reason": {"type": "text"},
     }
     try:
         _es().indices.put_mapping(index=name, properties=props)
         _mapping_cache.pop(name, None)
+        return
     except Exception as exc:  # noqa: BLE001 — маппинг уже мог быть создан или поле конфликтует
-        _log_line("маппинг полей тональности не применён: %s" % str(exc)[:200], level="warning")
+        text = str(exc)
+        if "Limit of total fields" not in text:
+            _log_line("маппинг полей тональности не применён: %s" % text[:200], level="warning")
+            return
+    # Индексы с динамическим маппингом (например kfc_* с 2,9 млн сообщений) выбирают лимит
+    # полей (3000) ещё на загрузке данных, и тогда put_mapping падает целиком: разметка не
+    # записалась бы вообще, а проход молча крутился бы на месте. Поднимаем потолок и повторяем.
+    try:
+        _es().indices.put_settings(
+            index=name,
+            settings={"index": {"mapping": {"total_fields": {"limit": TOTAL_FIELDS_LIMIT}}}})
+        _es().indices.put_mapping(index=name, properties=props)
+        _mapping_cache.pop(name, None)
+        _log_line("у индекса %s выбран лимит полей — поднял его до %d, чтобы записать поля разметки"
+                  % (name, TOTAL_FIELDS_LIMIT), level="warning")
+    except Exception as exc2:  # noqa: BLE001
+        _log_line("маппинг полей тональности не применён: %s" % str(exc2)[:200], level="error")
 
 
 # --------------------------------------------------------------------------- #
@@ -653,34 +692,52 @@ def _base_query(job: Dict[str, Any]) -> Dict[str, Any]:
     tone = job.get("tone_int")
     if tone is not None:
         filters.append({"term": {"toneMark": int(tone)}})
+    # ---- область проверки: объект / инфоповод-тема / площадка / автор ----
+    objects_query = _object_query(job.get("objects"))
+    if objects_query:
+        filters.append(objects_query)
+    theme_query = _theme_query(job.get("theme"))
+    if theme_query:
+        filters.append(theme_query)
+    hub = _flat(job.get("hub"))
+    if hub:
+        filters.append({"term": {"hub": hub}})
+    author = _flat(job.get("author"))
+    if author:
+        filters.append({"match_phrase": {"authorObject.fullname": author}})
     if not filters:
         return {"match_all": {}}
     return {"bool": {"filter": filters}}
 
 
-def _unlabeled_query(base: Dict[str, Any]) -> Dict[str, Any]:
-    """Только ещё не размеченные нашей моделью документы — это и есть точка возобновления."""
+def _unlabeled_query(base: Dict[str, Any], marker: str = "tone_llm") -> Dict[str, Any]:
+    """Только ещё не размеченные нашей моделью документы — это и есть точка возобновления.
+
+    ``marker`` — поле-отметка прохода: обычный режим пишет ``tone_llm``, аспектный —
+    ``tone_aspect_at``. Так два режима не мешают друг другу на одном датасете.
+    """
     if not base or "match_all" in base:
-        return {"bool": {"must_not": [{"exists": {"field": "tone_llm"}}]}}
+        return {"bool": {"must_not": [{"exists": {"field": marker}}]}}
     inner = list(base.get("bool", {}).get("filter") or [])
-    return {"bool": {"filter": inner, "must_not": [{"exists": {"field": "tone_llm"}}]}}
+    return {"bool": {"filter": inner, "must_not": [{"exists": {"field": marker}}]}}
 
 
-def _active_query(job: Dict[str, Any]) -> Dict[str, Any]:
+def _active_query(job: Dict[str, Any], marker: str = "tone_llm") -> Dict[str, Any]:
     """Рабочая выборка задачи: при relabel размечаем заново, иначе — только ещё не размеченное."""
     base = _base_query(job)
     if job.get("relabel"):
         return base
-    return _unlabeled_query(base)
+    return _unlabeled_query(base, marker)
 
 
-def _search_page(job: Dict[str, Any], size: int, cursor: Optional[List[Any]]) -> List[Dict[str, Any]]:
+def _search_page(job: Dict[str, Any], size: int, cursor: Optional[List[Any]],
+                 marker: str = "tone_llm", extra_source: Tuple[str, ...] = ()) -> List[Dict[str, Any]]:
     name = job["index_name"]
-    query = _active_query(job)
+    query = _active_query(job, marker)
     text_field = _text_field(name)
     id_field = _id_field(name)
     source = ["toneMark", "timeCreate", "hub", "hubtype", "type", "url", "title",
-              "review_rating", text_field]
+              "review_rating", "id", text_field] + list(extra_source)
     source = sorted(set(source))
     kwargs: Dict[str, Any] = {
         "index": name,
@@ -738,6 +795,7 @@ def _doc_from_hit(hit: Dict[str, Any], job: Dict[str, Any]) -> Dict[str, Any]:
         "hubtype": src.get("hubtype") or "",
         "type": src.get("type") or "",
         "url": src.get("url") or "",
+        "author": _author_name(src.get("authorObject")),
         "sort": list(hit.get("sort") or []),
     }
 
@@ -1062,6 +1120,9 @@ async def _run_job(jid: str) -> None:
     job = _job_load(jid)
     if not job:
         return
+    if str(job.get("label_mode") or "message") == "aspect":
+        # Аспектная разметка — отдельная ветка: свой промпт, свои поля, свой отчёт.
+        return await _run_aspect_job(jid)
     name = job["index_name"]
     ctx = _Ctx(jid)
     started = time.time()
@@ -1966,6 +2027,13 @@ class ToneCheckBody(BaseModel):
     parallel: int = Field(default=0, ge=0, le=32)
     pass2_parallel: int = Field(default=0, ge=0, le=16)
     relabel: bool = Field(default=False, description="размечать заново, даже если поля уже заполнены")
+    # ---- область проверки ----
+    label_mode: str = Field(default="message", description="message (тон сообщения) | aspect (отношение к объекту)")
+    objects: List[str] = Field(default_factory=list, description="объекты аспектной разметки: бренд, продукт, конкурент")
+    theme: str = Field(default="", description="инфоповод/тема датасета: подсказка модели и текстовый фильтр")
+    hub: str = Field(default="", description="площадка (поле hub), точное совпадение")
+    author: str = Field(default="", description="автор (authorObject.fullname), поиск по фразе")
+    preset: str = Field(default="", description="имя пресета, если запуск из сохранённого набора")
 
 
 def _human_sec(value: Optional[float]) -> str:
@@ -2062,6 +2130,14 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
         "has_report": bool(report),
         "report_files": job.get("report_files") or {},
         "log": (job.get("log") or [])[-12:],
+        "label_mode": str(job.get("label_mode") or "message"),
+        "objects": _object_terms(job.get("objects")),
+        "theme": job.get("theme") or "",
+        "hub": job.get("hub") or "",
+        "author": job.get("author") or "",
+        "preset": job.get("preset") or "",
+        "scope": _scope_public(job),
+        "scope_text": _scope_text(job),
     }
     if report:
         summary = report.get("summary") or {}
@@ -2072,6 +2148,10 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
             "mismatches": summary.get("mismatches"),
             "pass2_share": summary.get("pass2_share"),
         }
+        if summary.get("objects"):
+            # Аспектный отчёт: у него своя сводка — по объектам, а не согласие с источником.
+            out["aspect_objects"] = summary.get("objects")
+            out["source_note"] = report.get("source_note") or ""
         out["recommendation"] = report.get("recommendation") or ""
         out["conclusions"] = (report.get("conclusions") or [])[:7]
     return out
@@ -2148,6 +2228,12 @@ def start(body: ToneCheckBody, user: Any = Depends(current_user_any)):
     if not _es().indices.exists(index=name):
         raise HTTPException(status_code=404, detail="Индекс %s не найден в Elasticsearch" % name)
     tone_int = _tone_filter(body.tone)
+    label_mode = str(body.label_mode or "message").strip().lower()
+    if label_mode not in ("message", "aspect"):
+        raise HTTPException(status_code=400, detail="Режим разметки: message или aspect")
+    objects = _object_terms(body.objects)
+    if label_mode == "aspect" and not objects:
+        raise HTTPException(status_code=400, detail="Для аспектной разметки укажите хотя бы один объект")
     jid = uuid.uuid4().hex[:12]
     job = {
         "id": jid,
@@ -2166,6 +2252,12 @@ def start(body: ToneCheckBody, user: Any = Depends(current_user_any)):
         "parallel": int(body.parallel or 0),
         "pass2_parallel": int(body.pass2_parallel or 0),
         "relabel": bool(body.relabel),
+        "label_mode": label_mode,
+        "objects": objects,
+        "theme": _flat(body.theme),
+        "hub": _flat(body.hub),
+        "author": _flat(body.author),
+        "preset": _flat(body.preset),
         "seed": int(time.time()) % 2147483647,
         "status": "queued",
         "stage": "preparing",
@@ -2191,8 +2283,150 @@ def start(body: ToneCheckBody, user: Any = Depends(current_user_any)):
             except Exception:
                 pass
     _start_job(jid)
-    _log_line("[%s] запуск: %s (%s, %s), владелец %s" % (jid, name, mode, body.sample_size, job["owner"]))
-    return {"job_id": jid, "status": "queued", "index_name": name, "mode": mode}
+    _log_line("[%s] запуск: %s (%s, %s, %s), владелец %s"
+              % (jid, name, mode, label_mode, ", ".join(objects) or "без объектов", job["owner"]))
+    return {"job_id": jid, "status": "queued", "index_name": name, "mode": mode,
+            "label_mode": label_mode, "objects": objects, "scope": _scope_public(job)}
+
+
+@router.get("/scope")
+def scope_preview(index: str = Query(description="ключ датасета из indexes.pkl или имя индекса"),
+                  objects: str = Query(default="", description="объекты через запятую"),
+                  theme: str = Query(default=""), hub: str = Query(default=""),
+                  author: str = Query(default=""), tone: str = Query(default=""),
+                  min_date: Optional[int] = None, max_date: Optional[int] = None,
+                  label_mode: str = Query(default="message"),
+                  user: Any = Depends(current_user_any)):
+    """Объём проверки под заданной областью — до запуска.
+
+    Интерфейс показывает это число и человеческое описание области («проверяю: объект
+    «Rostic's», тема «качество еды», период 01–31.07.2026, площадка 2gis.ru»), чтобы
+    запуск был осознанным, а не «на весь датасет».
+    """
+    _, name = _guard_dataset(user, index)
+    job = {
+        "index_name": name,
+        "label_mode": str(label_mode or "message").strip().lower(),
+        "objects": _object_terms(objects),
+        "theme": _flat(theme),
+        "hub": _flat(hub),
+        "author": _flat(author),
+        "min_date": min_date,
+        "max_date": max_date,
+        "tone_int": _tone_filter(tone),
+    }
+    query = _base_query(job)
+    marker = ASPECT_MARKER if job["label_mode"] == "aspect" else "tone_llm"
+    try:
+        count = int(_es().count(index=name, query=query).get("count") or 0)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Не удалось посчитать объём: %s" % str(exc)[:200])
+    done = 0
+    try:
+        done = int(_es().count(index=name, query={
+            "bool": {"filter": [query], "must": [{"exists": {"field": marker}}]}}).get("count") or 0)
+    except Exception:
+        done = 0
+    return {
+        "index_name": name,
+        "index_key": _resolve_dataset(index)[0],
+        "label": _pretty_label(name),
+        "label_mode": job["label_mode"],
+        "count": count,
+        "labeled": done,
+        "remaining": max(0, count - done),
+        "objects": job["objects"],
+        "scope": _scope_public(job),
+        "scope_text": _scope_text(job),
+        "by_tone": _cat_counts(name, "toneMark", query, 5),
+        "by_hub": _cat_counts(name, "hub", query, 8),
+    }
+
+
+@router.get("/scope-options")
+def scope_options(index: str = Query(description="ключ датасета или имя индекса"),
+                  limit: int = Query(default=30, ge=5, le=80),
+                  user: Any = Depends(current_user_any)):
+    """Подсказки для области проверки: темы датасета, частые термины, площадки, авторы."""
+    _, name = _guard_dataset(user, index)
+    base = _base_query({"index_name": name})
+    return {
+        "index_name": name,
+        "index_key": _resolve_dataset(index)[0],
+        "label": _pretty_label(name),
+        "docs": int(_es().count(index=name).get("count") or 0),
+        "themes": _theme_catalog(user, name),
+        "objects": _term_suggestions(name, base, limit),
+        "hubs": _cat_counts(name, "hub", None, 20),
+        "authors": _author_suggestions(name, base, 15),
+    }
+
+
+class PresetBody(BaseModel):
+    name: str = Field(min_length=1, max_length=120, description="имя набора, например «KFC → Rostic's, еда, лето 2026»")
+    index: str
+    label_mode: str = "message"
+    mode: str = "sample"
+    sample_size: int = Field(default=1000, ge=1, le=MAX_FULL_DOCS)
+    min_date: Optional[int] = None
+    max_date: Optional[int] = None
+    tone: str = ""
+    objects: List[str] = Field(default_factory=list)
+    theme: str = ""
+    hub: str = ""
+    author: str = ""
+    conf_threshold: float = Field(default=DEFAULT_CONF, ge=0.0, le=1.0)
+
+
+@router.get("/presets")
+def presets_list(user: Any = Depends(current_user_any)):
+    """Сохранённые наборы «датасет + объекты + тема + период + площадка + режим»."""
+    items = _presets_load(getattr(user, "id", ""))
+    for item in items:
+        item["note"] = _preset_note(item)
+    return {"presets": items}
+
+
+@router.post("/presets")
+def preset_save(body: PresetBody, user: Any = Depends(current_user_any)):
+    """Сохранить или перезаписать набор по имени (запуск из списка — в один клик)."""
+    uid = getattr(user, "id", "")
+    record = {
+        "name": _flat(body.name)[:120],
+        "index": str(body.index),
+        "label_mode": str(body.label_mode or "message").strip().lower(),
+        "mode": str(body.mode or "sample").strip().lower(),
+        "sample_size": int(body.sample_size),
+        "min_date": body.min_date,
+        "max_date": body.max_date,
+        "tone": _flat(body.tone),
+        "objects": _object_terms(body.objects),
+        "theme": _flat(body.theme),
+        "hub": _flat(body.hub),
+        "author": _flat(body.author),
+        "conf_threshold": float(body.conf_threshold),
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    items = [item for item in _presets_load(uid) if _norm_key(item.get("name")) != _norm_key(record["name"])]
+    items.insert(0, record)
+    items = items[:50]
+    _presets_save(uid, items)
+    record["note"] = _preset_note(record)
+    for item in items:
+        item["note"] = _preset_note(item)
+    return {"saved": record, "presets": items}
+
+
+@router.delete("/presets/{name}")
+def preset_delete(name: str, user: Any = Depends(current_user_any)):
+    """Удалить набор по имени."""
+    uid = getattr(user, "id", "")
+    items = _presets_load(uid)
+    left = [item for item in items if _norm_key(item.get("name")) != _norm_key(name)]
+    _presets_save(uid, left)
+    for item in left:
+        item["note"] = _preset_note(item)
+    return {"deleted": len(items) - len(left), "presets": left}
 
 
 @router.get("/{job_id}")
@@ -2256,3 +2490,1324 @@ def report_file(job_id: str, fmt: str = Query(default="docx"), user: Any = Depen
     media = ("application/pdf" if fmt == "pdf" else
              "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     return FileResponse(path, media_type=media, filename=os.path.basename(path))
+
+
+# =========================================================================== #
+# Область проверки: объект / инфоповод-тема / площадка / автор
+#
+# Зачем: «весь датасет» — почти всегда не тот вопрос. Маркетингу нужно «что думают
+# про Rostic's», «что говорят про крылышки в отзывах 2ГИС за июль». Поэтому у задачи
+# есть область проверки, она видна в интерфейсе, показывает объём ДО запуска и попадает
+# в отчёт. Фильтры работают в обоих режимах разметки.
+# =========================================================================== #
+
+PRESETS_FILE = "tone_check_presets.json"
+MAX_OBJECTS = 6
+SCOPE_OPTIONS_DOCS = 800
+
+STOPWORDS = frozenset("""
+и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только
+ее мне было вот от меня еще нет о из ему теперь когда даже ну вдруг ли если уже или ни
+быть был него до вас нибудь опять уж вам ведь там потом себя ничего ей может они тут где
+есть надо ней для мы тебя их чем была сам чтоб без будто чего раз тоже себе под будет ж
+тогда кто этот того потому этого какой совсем ним здесь этом один почти мой тем чтобы нее
+сейчас были куда зачем всех никогда можно при наконец два об другой хоть после над больше
+тот через эти нас про всего них какая много разве три эту моя впрочем хорошо свою этой
+перед иногда лучше чуть том нельзя такой им более всегда конечно всю между это который
+также свою есть если того чтобы меня тебе нами вами ими себе весь вся всё оно эти эта
+этот таких такой также очень просто либо весь кого кому чему чем тем тех тех этих
+""".split())
+
+
+def _flat(value: Any) -> str:
+    """Однострочный текст без лишних пробелов."""
+    return " ".join(str(value if value is not None else "").split())
+
+
+def _norm_key(value: Any) -> str:
+    """Ключ сравнения: регистр, пробелы и пунктуация не важны."""
+    return re.sub(r"[^0-9a-zа-яё]+", "", _flat(value).lower())
+
+
+def _author_name(value: Any) -> str:
+    """Имя автора из поля authorObject (объект, список или строка)."""
+    if isinstance(value, dict):
+        for key in ("fullname", "name", "title"):
+            if _flat(value.get(key)):
+                return _flat(value[key])
+        return ""
+    if isinstance(value, (list, tuple)) and value:
+        return _author_name(value[0])
+    return _flat(value)
+
+
+def _object_terms(raw: Any) -> List[str]:
+    """Объекты аспектной разметки из массива или строки «KFC, Rostic's»."""
+    if raw is None:
+        return []
+    items = list(raw) if isinstance(raw, (list, tuple)) else re.split(r"[,\n;]+", str(raw))
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        text = _flat(item).strip(" \"'«»")
+        key = _norm_key(text)
+        if not text or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out[:MAX_OBJECTS]
+
+
+def _object_query(objects: Any) -> Optional[Dict[str, Any]]:
+    """Сужающий фильтр «в тексте упомянут хотя бы один из объектов».
+
+    Поле ``text`` в части индексов размечено русским анализатором, поэтому склонения
+    («крылышки»/«крылышек») находятся одной фразой. Плюс то же по заголовку.
+    """
+    terms = _object_terms(objects)
+    if not terms:
+        return None
+    should: List[Dict[str, Any]] = []
+    for term in terms:
+        should.append({"match_phrase": {"text": term}})
+        should.append({"match_phrase": {"title": term}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
+
+
+def _theme_query(theme: Any) -> Optional[Dict[str, Any]]:
+    """Инфоповод/тема датасета как текстовый фильтр по значимым словам названия."""
+    text = _flat(theme)
+    if not text:
+        return None
+    words = [word for word in re.split(r"[^0-9A-Za-zА-Яа-яЁё'\-]+", text) if len(word) > 2]
+    if not words:
+        return None
+    should: List[Dict[str, Any]] = []
+    for word in words[:6]:
+        should.append({"match_phrase": {"text": word}})
+        should.append({"match_phrase": {"title": word}})
+    return {"bool": {"should": should, "minimum_should_match": 1}}
+
+
+def _fmt_date(value: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(value)).strftime("%d.%m.%Y")
+    except Exception:
+        return ""
+
+
+def _scope_text(job: Dict[str, Any]) -> str:
+    """Человеческое описание области проверки для интерфейса и отчёта."""
+    parts: List[str] = []
+    objects = _object_terms(job.get("objects"))
+    aspect = str(job.get("label_mode") or "message") == "aspect"
+    if objects:
+        if aspect:
+            parts.append("объект%s: %s" % ("ы" if len(objects) > 1 else "",
+                                           ", ".join("«%s»" % item for item in objects)))
+        else:
+            parts.append("в тексте есть: %s" % ", ".join("«%s»" % item for item in objects))
+    if _flat(job.get("theme")):
+        parts.append("тема «%s»" % _flat(job["theme"]))
+    lo, hi = job.get("min_date"), job.get("max_date")
+    if lo or hi:
+        left = _fmt_date(lo) or "начало"
+        right = _fmt_date(hi) or "сегодня"
+        parts.append("период %s — %s" % (left, right))
+    if _flat(job.get("hub")):
+        parts.append("площадка %s" % _flat(job["hub"]))
+    if _flat(job.get("author")):
+        parts.append("автор %s" % _flat(job["author"]))
+    return ", ".join(parts) if parts else "весь датасет без дополнительных фильтров"
+
+
+def _scope_public(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "label_mode": str(job.get("label_mode") or "message"),
+        "objects": _object_terms(job.get("objects")),
+        "theme": _flat(job.get("theme")),
+        "hub": _flat(job.get("hub")),
+        "author": _flat(job.get("author")),
+        "min_date": job.get("min_date"),
+        "max_date": job.get("max_date"),
+        "text": _scope_text(job),
+    }
+
+
+def _cat_counts(name: str, field: str, query: Optional[Dict[str, Any]],
+                size: int = 20) -> List[Dict[str, Any]]:
+    """Частоты по keyword-полю (площадки, тональность источника)."""
+    body: Dict[str, Any] = {"size": 0, "aggs": {"v": {"terms": {"field": field, "size": size}}}}
+    if query:
+        body["query"] = query
+    try:
+        res = _es().search(index=name, body=body)
+        return [{"key": bucket.get("key"), "count": bucket.get("doc_count")}
+                for bucket in res["aggregations"]["v"]["buckets"]]
+    except Exception:
+        return []
+
+
+def _theme_catalog(user: Any, index_name: str, limit: int = 60) -> List[Dict[str, Any]]:
+    """Темы датасета из уже собранных итогов (``<ГГГГ-ММ>_summary.json``)."""
+    import glob
+
+    root = os.path.join(DATA_DIR, str(getattr(user, "id", "")), REPORTS_DIR_NAME)
+    stem = _norm_name(index_name).lower()
+    items: List[Dict[str, Any]] = []
+    seen = set()
+    try:
+        paths = glob.glob(os.path.join(root, "**", "*_summary.json"), recursive=True)
+    except Exception:
+        paths = []
+    for path in sorted(paths):
+        folder = os.path.basename(os.path.dirname(path)).lower()
+        if stem and stem not in folder and stem not in os.path.basename(path).lower():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            continue
+        period = _flat(data.get("period")) or os.path.basename(path)[:7]
+        for topic in (data.get("topics") or [])[:25]:
+            if not isinstance(topic, dict):
+                continue
+            name = _flat(topic.get("name"))
+            key = (_norm_key(name), period)
+            if not name or key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "name": name,
+                "count": topic.get("count"),
+                "tone": _flat(topic.get("tone")),
+                "category": _flat(topic.get("category")),
+                "period": period,
+                "source": os.path.basename(path),
+            })
+    items.sort(key=lambda item: -(int(item.get("count") or 0)))
+    return items[:limit]
+
+
+def _term_suggestions(index_name: str, query: Dict[str, Any], limit: int = 30) -> List[Dict[str, Any]]:
+    """Частотные слова из сэмпла сообщений — подсказки для объектов и продуктов."""
+    try:
+        res = _es().search(index=index_name, size=SCOPE_OPTIONS_DOCS, query=query,
+                           source_includes=[_text_field(index_name), "title"])
+    except Exception:
+        return []
+    counter: Dict[str, int] = {}
+    for hit in ((res.get("hits") or {}).get("hits") or []):
+        src = hit.get("_source") or {}
+        text = "%s %s" % (_flat(src.get(_text_field(index_name))), _flat(src.get("title")))
+        for word in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё\-]{3,}", text.lower()):
+            word = word.strip("-'")
+            if len(word) < 4 or word in STOPWORDS:
+                continue
+            counter[word] = counter.get(word, 0) + 1
+    rows = sorted(counter.items(), key=lambda item: -item[1])[:limit]
+    return [{"term": word, "count": count} for word, count in rows if count > 1]
+
+
+def _author_suggestions(index_name: str, query: Dict[str, Any], limit: int = 15) -> List[Dict[str, Any]]:
+    """Частые авторы: агрегация по keyword-подполю authorObject.fullname."""
+    rows = _cat_counts(index_name, "authorObject.fullname.keyword", query, limit)
+    return [{"name": row["key"], "count": row["count"]} for row in rows if row.get("key")]
+
+
+# --------------------------------------------------------------------------- #
+# Пресеты: «KFC → Rostic's, качество еды, лето 2026»
+# --------------------------------------------------------------------------- #
+
+def _presets_path(user_id: Any) -> str:
+    return os.path.join(DATA_DIR, str(user_id), PRESETS_FILE)
+
+
+def _presets_load(user_id: Any) -> List[Dict[str, Any]]:
+    path = _presets_path(user_id)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return [item for item in (data.get("presets") or []) if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
+def _presets_save(user_id: Any, items: List[Dict[str, Any]]) -> None:
+    path = _presets_path(user_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump({"presets": items}, handle, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _preset_note(record: Dict[str, Any]) -> str:
+    """Короткая подпись пресета: «KFC → Rostic's, качество еды, лето 2026»."""
+    pieces: List[str] = []
+    if record.get("objects"):
+        pieces.append(", ".join(record["objects"]))
+    if record.get("theme"):
+        pieces.append(record["theme"])
+    lo, hi = record.get("min_date"), record.get("max_date")
+    if lo or hi:
+        pieces.append("%s — %s" % (_fmt_date(lo) or "…", _fmt_date(hi) or "…"))
+    if record.get("hub"):
+        pieces.append(record["hub"])
+    if record.get("label_mode") == "aspect":
+        pieces.append("аспектная разметка")
+    return ", ".join(pieces)
+
+
+# =========================================================================== #
+# Аспектная разметка: отношение к объекту, а не тон сообщения целиком
+#
+# Обычный режим отвечает на вопрос «совпадает ли разметка источника с моделью».
+# Аспектный — на вопрос «что люди думают про ЭТОТ объект»: «сеть ругают, но новый
+# продукт хвалят». Поэтому отдельный промпт, отдельные поля в Elasticsearch
+# (tone_aspect*, маркер прохода tone_aspect_at) и отдельный отчёт без сравнения
+# с источником как с эталоном: toneMark размечен на уровне сообщения.
+# =========================================================================== #
+
+ASPECT_MARKER = "tone_aspect_at"
+ASPECT_FIELDS = ("tone_aspect", "tone_aspect_objects", "tone_aspect_at", "tone_aspect_by",
+                 "tone_msg_llm", "tone_msg_conf", "tone_msg_by", "tone_msg_reason")
+
+ASPECT_BATCH = 8
+ASPECT_PARALLEL = 10
+ASPECT_MESSAGE_CHARS = 420
+ASPECT_CHAR_BUDGET = 6000
+ASPECT_MAX_TOKENS = 2600
+ASPECT_PASS2_BATCH = 6
+ASPECT_PASS2_MAX_TOKENS = 2200
+
+ASPECT_SYSTEM = ("Ты аналитик репутации. Оцениваешь отношение автора К КОНКРЕТНОМУ ОБЪЕКТУ "
+                 "(бренду, продукту, конкуренту), а не общий тон сообщения. "
+                 "Отвечай строго JSON, без пояснений вокруг.")
+
+ASPECT_INSTRUCTION = """Оцени, как автор каждого сообщения относится ИМЕННО к указанным объектам.
+
+Объекты: {objects}
+{theme_line}Правила:
+- объект считается упомянутым, только если он реально назван в тексте или однозначно подразумевается (учитывай склонения, латиницу и кириллицу, сокращения); иначе mentioned=false;
+- если объект упомянут — оцени отношение автора К ЭТОМУ ОБЪЕКТУ: negative, neutral или positive;
+- общий тон сообщения может быть другим: сеть могут ругать в целом, но конкретный продукт хвалить — это нормальный случай, оценивай именно объект;
+- реклама, анонс, нейтральный факт без оценки, бессмысленный текст — neutral с низкой уверенностью;
+- quote — ДОСЛОВНЫЙ короткий фрагмент (до 120 знаков) из текста, на котором основано решение по этому объекту; объект не упомянут — пустая строка;
+- message_tone — тон всего сообщения целиком (отдельное поле, не путать с отношением к объекту);
+- reason — до 100 знаков, по-русски, коротко.
+
+Верни СТРОГО JSON такой формы:
+{{"results": [{{"id": "<id>", "message_tone": "negative|neutral|positive", "objects": [{{"object": "<объект из списка>", "mentioned": true, "tone": "negative|neutral|positive", "confidence": 0.0, "reason": "...", "quote": "..."}}]}}]}}
+В ответе должны быть ВСЕ {count} сообщений, и для каждого — ВСЕ объекты из списка (даже если mentioned=false).
+
+{hint}Сообщения:
+{messages}"""
+
+
+def _parse_aspect_results(text: str, finish: str,
+                          objects: List[str]) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Разбор ответа аспектной разметки: {_id: {message_tone, objects: {ключ: вердикт}}}."""
+    from agent_engine.tools_llm import _extract_json
+
+    if finish == "length":
+        return None
+    parsed = _extract_json(text)
+    if not isinstance(parsed, dict):
+        return None
+    items = parsed.get("results")
+    if not isinstance(items, list) or not items:
+        return None
+    wanted = {_norm_key(name): name for name in objects}
+    out: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("id") or "").strip()
+        if not key:
+            continue
+        message_tone = str(item.get("message_tone") or "").strip().lower()
+        if message_tone not in TONE_TO_INT:
+            message_tone = ""
+        entries = item.get("objects")
+        per: Dict[str, Dict[str, Any]] = {}
+        for entry in (entries if isinstance(entries, list) else []):
+            if not isinstance(entry, dict):
+                continue
+            name_key = _norm_key(entry.get("object"))
+            if name_key not in wanted:
+                # Модель могла вернуть объект в другом падеже/регистре — ищем по вхождению.
+                name_key = next((k for k in wanted if k and (k in name_key or name_key in k)), "")
+                if not name_key:
+                    continue
+            tone = str(entry.get("tone") or "").strip().lower()
+            mentioned = bool(entry.get("mentioned")) and tone in TONE_TO_INT
+            try:
+                conf = float(entry.get("confidence"))
+            except (TypeError, ValueError):
+                conf = 0.5
+            conf = max(0.0, min(1.0, conf))
+            per[name_key] = {
+                "mentioned": mentioned,
+                "tone": TONE_TO_INT[tone] if mentioned else None,
+                "confidence": round(conf, 3) if mentioned else 0.0,
+                "reason": _flat(entry.get("reason"))[:100],
+                "quote": _flat(entry.get("quote"))[:160],
+            }
+        out[key] = {"message_tone": message_tone, "objects": per}
+    return out or None
+
+
+async def _read_aspect_batch(ctx: _Ctx, docs: List[Dict[str, Any]], *, objects: List[str],
+                             theme: str, hint: str, sem: asyncio.Semaphore,
+                             batch_chars: int, max_tokens: int,
+                             vllm_cfg: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    """Одна аспектная пачка: строгий JSON, повторы, деление пачки при обрыве по лимиту."""
+    from agent_engine.tools_llm import _qwen
+
+    async with sem:
+        if ctx.cancelled():
+            return {}, "остановлено"
+
+    theme_line = ("Инфоповод/тема: «%s» — учитывай её, если она относится к объекту.\n" % theme) \
+        if theme else ""
+
+    async def _call(lines: List[str], depth: int) -> Dict[str, Dict[str, Any]]:
+        prompt = ASPECT_INSTRUCTION.format(count=len(lines), objects=", ".join(objects),
+                                           theme_line=theme_line, hint=hint,
+                                           messages="\n".join(lines))
+        last = "нет ответа модели"
+        for attempt in range(2 if depth == 0 else 1):
+            meta: Dict[str, Any] = {}
+            try:
+                text, _tokens = await _qwen(ctx, prompt, system=ASPECT_SYSTEM, max_tokens=max_tokens,
+                                            temperature=0.0, vllm_cfg=vllm_cfg, meta=meta)
+            except Exception as exc:  # noqa: BLE001 — пачка не должна ломать весь проход
+                last = "%s: %s" % (type(exc).__name__, str(exc)[:160])
+                await asyncio.sleep(1.0 + attempt)
+                continue
+            parsed = _parse_aspect_results(text, str(meta.get("finish_reason") or ""), objects)
+            if parsed:
+                return parsed
+            finish = str(meta.get("finish_reason") or "")
+            last = ("ответ обрезан по лимиту %d токенов" % max_tokens) if finish == "length" \
+                else "в ответе нет корректного списка results"
+        raise RuntimeError(last)
+
+    async def _split(lines: List[str], depth: int) -> Dict[str, Dict[str, Any]]:
+        try:
+            return await _call(lines, depth)
+        except Exception as exc:  # noqa: BLE001
+            if len(lines) <= 2 or depth >= 2:
+                raise
+            half = len(lines) // 2
+            out: Dict[str, Dict[str, Any]] = {}
+            for part in (lines[:half], lines[half:]):
+                try:
+                    out.update(await _split(part, depth + 1))
+                except Exception as inner:  # noqa: BLE001
+                    _log_line("аспектная пачка (%d) не разобрана: %s" % (len(part), str(inner)[:120]))
+            if not out:
+                raise exc
+            return out
+
+    lines = [_message_line(doc, batch_chars) for doc in docs]
+    try:
+        return await _split(lines, 0), ""
+    except Exception as exc:  # noqa: BLE001
+        return {}, str(exc)[:200]
+
+
+def _aspect_records_from(parsed: Dict[str, Dict[str, Any]], docs: List[Dict[str, Any]],
+                         source: str, model: str,
+                         objects: List[str]) -> List[Dict[str, Any]]:
+    """Записи для журнала и ES: вердикт по каждому объекту + общий тон сообщения."""
+    wanted = [(_norm_key(name), name) for name in objects]
+    out: List[Dict[str, Any]] = []
+    for doc in docs:
+        verdict = parsed.get(doc["_id"])
+        aspect: List[Dict[str, Any]] = []
+        for key, display in wanted:
+            info = ((verdict or {}).get("objects") or {}).get(key) if verdict else None
+            aspect.append({
+                "object": display,
+                "mentioned": bool(info and info.get("mentioned")),
+                "tone": (info or {}).get("tone"),
+                "confidence": float((info or {}).get("confidence") or 0.0),
+                "reason": (info or {}).get("reason") or "",
+                "quote": (info or {}).get("quote") or "",
+                "by": (source if (info and info.get("mentioned")) else "none"),
+            })
+        message_tone = None
+        if verdict and verdict.get("message_tone"):
+            message_tone = TONE_TO_INT.get(verdict["message_tone"])
+        by = source if verdict else "none"
+        out.append({
+            "_id": doc["_id"],
+            "id": doc.get("id"),
+            "toneMark": doc.get("toneMark"),
+            "timeCreate": doc.get("timeCreate"),
+            "hub": doc.get("hub") or "",
+            "hubtype": doc.get("hubtype") or "",
+            "type": doc.get("type") or "",
+            "url": doc.get("url") or "",
+            "author": doc.get("author") or "",
+            "text": " ".join(str(doc.get("text") or "").split())[:1200],
+            "chars": len(str(doc.get("text") or "")),
+            "model": model,
+            "tone_aspect": aspect,
+            "tone_aspect_objects": [entry["object"] for entry in aspect if entry["mentioned"]],
+            "tone_aspect_by": by,
+            "tone_msg_llm": message_tone,
+            "tone_msg_conf": round(float(min([entry["confidence"] for entry in aspect
+                                              if entry["mentioned"]] or [0.0])), 3),
+            "tone_msg_by": by,
+            "tone_msg_reason": _flat((verdict or {}).get("message_tone_reason"))[:100],
+        })
+    return out
+
+
+def _aspect_needs_pass2(rec: Dict[str, Any], threshold: float) -> bool:
+    """Спорный случай аспектного прохода: нет вердикта, низкая уверенность или нет цитаты."""
+    if rec.get("tone_aspect_by") in (None, "", "none"):
+        return True
+    if rec.get("tone_aspect_by") == "32b":
+        return False
+    if rec.get("tone_msg_llm") is None:
+        return True
+    for entry in rec.get("tone_aspect") or []:
+        if not entry.get("mentioned") or entry.get("by") == "32b":
+            continue
+        if float(entry.get("confidence") or 0.0) < threshold:
+            return True
+        if not _flat(entry.get("quote")):
+            return True
+    return False
+
+
+def _aspect_worst_conf(rec: Dict[str, Any]) -> float:
+    values = [float(entry.get("confidence") or 0.0) for entry in (rec.get("tone_aspect") or [])
+              if entry.get("mentioned") and entry.get("by") != "32b"]
+    return min(values) if values else 0.0
+
+
+_LAST_WRITE_ERROR = ""
+
+
+def _bulk_write_aspect(job: Dict[str, Any], records: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Пакетная запись аспектной разметки. toneMark и поля tone_llm* не трогаем."""
+    name = job["index_name"]
+    stamp = int(time.time())
+    written = 0
+    errors = 0
+    for start in range(0, len(records), BULK_CHUNK):
+        chunk = records[start:start + BULK_CHUNK]
+        operations: List[Dict[str, Any]] = []
+        for rec in chunk:
+            if not rec.get("_id"):
+                continue
+            mentioned = [entry for entry in (rec.get("tone_aspect") or []) if entry.get("mentioned")]
+            operations.append({"update": {"_index": name, "_id": rec["_id"], "retry_on_conflict": 3}})
+            operations.append({"doc": {
+                "tone_aspect": [{"object": entry["object"], "tone": entry.get("tone"),
+                                 "confidence": entry.get("confidence"),
+                                 "reason": entry.get("reason") or "",
+                                 "quote": entry.get("quote") or "",
+                                 "by": entry.get("by") or ""} for entry in mentioned],
+                "tone_aspect_objects": rec.get("tone_aspect_objects") or [],
+                "tone_aspect_at": stamp,
+                "tone_aspect_by": rec.get("tone_aspect_by") or "",
+                "tone_msg_llm": rec.get("tone_msg_llm"),
+                "tone_msg_conf": rec.get("tone_msg_conf"),
+                "tone_msg_by": rec.get("tone_msg_by") or "",
+                "tone_msg_reason": rec.get("tone_msg_reason") or "",
+            }})
+        if not operations:
+            continue
+        try:
+            res = _es().bulk(operations=operations, refresh="wait_for")
+            failed = 0
+            for item in (res.get("items") or []):
+                problem = (item.get("update") or {}).get("error")
+                if not problem:
+                    continue
+                failed += 1
+                if failed == 1:
+                    # Причина первой ошибки важна: без неё видно только «не записалось».
+                    global _LAST_WRITE_ERROR
+                    _LAST_WRITE_ERROR = str(json.dumps(problem, ensure_ascii=False))[:300]
+                    _log_line("аспектная разметка не записывается: %s" % _LAST_WRITE_ERROR, level="error")
+            errors += failed
+            written += len(chunk) - failed
+        except Exception as exc:  # noqa: BLE001
+            errors += len(chunk)
+            _LAST_WRITE_ERROR = str(exc)[:300]
+            _log_line("пакетная запись аспектной разметки не удалась: %s" % str(exc)[:200], level="error")
+    return written, errors
+
+
+async def _run_aspect_job(jid: str) -> None:
+    """Фоновый аспектный проход: 4B по объектам, спорные — на 32B, затем отчёт по объектам."""
+    job = _job_load(jid)
+    if not job:
+        return
+    name = job["index_name"]
+    objects = _object_terms(job.get("objects"))
+    if not objects:
+        _set(jid, status="error", stage="error", stage_label=STAGE_LABELS["error"], worker_pid=0,
+             error="Аспектная разметка требует хотя бы один объект")
+        return
+    theme = _flat(job.get("theme"))
+    ctx = _Ctx(jid)
+    started = time.time()
+    try:
+        _set(jid, status="running", stage="preparing", stage_label="готовлю аспектную разметку",
+             progress_schema=PROGRESS_SCHEMA, worker_pid=os.getpid(), writing=False,
+             started=job.get("started") or datetime.now().isoformat(timespec="seconds"),
+             objects=objects, scope=_scope_public(job),
+             log="старт аспектной разметки: %s, объекты %s" % (name, ", ".join(objects)))
+        _ensure_mapping(name)
+        results = _journal_load(jid)
+        remaining = int(_es().count(index=name, query=_active_query(job, ASPECT_MARKER)).get("count") or 0)
+        total = len(results) + remaining
+        if job.get("mode") == "sample":
+            total = min(int(job.get("sample_size") or 1000), total)
+        elif total > MAX_FULL_DOCS:
+            raise RuntimeError(
+                "Полная аспектная разметка этого датасета — %d сообщений, больше лимита %d. "
+                "Сузьте область проверки (период, площадка, объект) или поднимите "
+                "TELLSCOPE_TONE_FULL_LIMIT." % (total, MAX_FULL_DOCS))
+        _set(jid, total=total, processed=len(results), errors=0)
+        _log_line("[%s] аспектная разметка: к обработке %d сообщений, уже размечено %d, объекты %s"
+                  % (jid, total, len(results), ", ".join(objects)))
+
+        # ------------------------------ проход 1: быстрая 4B ------------------------------
+        _set(jid, stage="pass1", stage_label="оцениваю отношение к объектам", phase="pass1")
+        bulk = _bulk_profile()
+        batch_size = int(job.get("batch_size") or ASPECT_BATCH)
+        parallel = int(job.get("parallel") or ASPECT_PARALLEL)
+        model_label = bulk.get("model") or "Qwen/Qwen3-32B-FP8"
+        source_label = "4b" if bulk else "32b"
+        sem = asyncio.Semaphore(max(1, parallel))
+        cursor = job.get("cursor")
+        stall = 0
+        seen_before = set(results)
+        while len(results) < total and not _cancelled(jid):
+            want = min(PAGE_SIZE, total - len(results))
+            hits = _search_page(job, want, cursor, marker=ASPECT_MARKER,
+                                extra_source=("authorObject",))
+            if not hits:
+                if cursor:
+                    cursor = None
+                    job["cursor"] = None
+                    continue
+                break
+            docs = [_doc_from_hit(hit, job) for hit in hits]
+            batches = _make_batches(docs, batch_size, ASPECT_CHAR_BUDGET, ASPECT_MESSAGE_CHARS)
+            tasks = [
+                asyncio.create_task(_read_aspect_batch(
+                    ctx, batch, objects=objects, theme=theme, hint="",
+                    sem=sem, batch_chars=ASPECT_MESSAGE_CHARS,
+                    max_tokens=int(bulk.get("max_tokens") or ASPECT_MAX_TOKENS) if bulk else ASPECT_MAX_TOKENS,
+                    vllm_cfg=bulk.get("vllm_cfg")))
+                for batch in batches
+            ]
+            batch_of = {task: batch for task, batch in zip(tasks, batches)}
+            records: List[Dict[str, Any]] = []
+            pending = set(tasks)
+            while pending:
+                finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in finished:
+                    batch = batch_of[task]
+                    parsed, error = task.result()
+                    if error and error != "остановлено":
+                        _log_line("[%s] аспектная пачка из %d не разобрана: %s"
+                                  % (jid, len(batch), error))
+                    recs = _aspect_records_from(parsed, batch, source_label, model_label, objects)
+                    for rec in recs:
+                        results[rec["_id"]] = rec
+                    records.extend(recs)
+                    _journal_append(jid, recs)
+                _set(jid, processed=len(results), total=total)
+            fresh = len([rec for rec in records if rec["_id"] not in seen_before])
+            if not fresh:
+                stall += 1
+                if stall >= 3:
+                    _log_line("[%s] выборка перестала давать новые документы — останавливаю проход"
+                              % jid, level="warning")
+                    break
+            else:
+                stall = 0
+            seen_before.update(rec["_id"] for rec in records)
+            if job.get("mode") == "full" and docs and docs[-1].get("sort"):
+                cursor = docs[-1]["sort"]
+                job["cursor"] = cursor
+            _set(jid, writing=True, stage="writing", stage_label=STAGE_LABELS["writing"])
+            written, werrors = _bulk_write_aspect(job, records)
+            job["errors"] = int(job.get("errors") or 0) + werrors
+            job["bulk_written"] = int(job.get("bulk_written") or 0) + written
+            if records and not written and werrors:
+                # Ничего не записалось — разметка физически не сохраняется. Честно падаем
+                # с причиной, а не крутимся на месте до срабатывания детектора застоя.
+                raise RuntimeError("разметка не записывается в Elasticsearch: %s"
+                                   % (_LAST_WRITE_ERROR or "пакетные обновления отклонены"))
+            _set(jid, writing=False, stage="pass1", stage_label="оцениваю отношение к объектам",
+                 processed=len(results), total=total, cursor=job.get("cursor"),
+                 bulk_written=job["bulk_written"], errors=job["errors"])
+        _set(jid, processed=len(results), total=total)
+
+        # ------------------------- проход 2: перепроверка на 32B -------------------------
+        threshold = float(job.get("conf_threshold") or DEFAULT_CONF)
+        disputed = [rec for rec in results.values() if _aspect_needs_pass2(rec, threshold)]
+        pass2 = {"available": True, "skipped": False, "reason": "", "targets": len(disputed),
+                 "decided": 0, "failed": 0}
+        disputed_total = len(disputed)
+        # Тот же лимит доли второго прохода, что и в обычном режиме: 32B в разы медленнее.
+        pass2_limit = int(max(1, total) * PASS2_MAX_SHARE)
+        pass2_capped = 0
+        if disputed_total > pass2_limit:
+            disputed.sort(key=_aspect_worst_conf)
+            pass2_capped = disputed_total - max(1, pass2_limit)
+            disputed = disputed[:max(1, pass2_limit)]
+            _log_line("[%s] аспектных спорных %d — больше лимита %.0f%%: перепроверяю %d самых "
+                      "неуверенных, остальные %d остаются решением 4B"
+                      % (jid, disputed_total, PASS2_MAX_SHARE * 100, len(disputed), pass2_capped),
+                      level="warning")
+        pass2["candidates"] = disputed_total
+        pass2["capped"] = pass2_capped
+        pass2["max_share"] = PASS2_MAX_SHARE
+        pass2["share"] = round(disputed_total / float(max(1, total)), 4)
+        if not _cancelled(jid) and disputed:
+            from mlops.lock import generate_cfg
+
+            gen = generate_cfg() or {}
+            base_url = str(gen.get("base_url") or "")
+            if not await _model_up(base_url):
+                pass2.update({"available": False, "skipped": True,
+                              "reason": "модель перепроверки недоступна (%s)" % (base_url or "не задана")})
+                _log_line("[%s] 32B недоступна: перепроверка аспектов не выполнена" % jid, level="warning")
+            else:
+                _set(jid, stage="pass2", stage_label="перепроверяю спорные на 32B", phase="pass2",
+                     pass2_total=len(disputed), pass2_done=0)
+                p2_batch = int(job.get("pass2_batch") or ASPECT_PASS2_BATCH)
+                p2_parallel = int(job.get("pass2_parallel") or DEFAULT_PARALLEL_PASS2)
+                p2_sem = asyncio.Semaphore(max(1, p2_parallel))
+                done = 0
+                for start in range(0, len(disputed), PAGE_SIZE):
+                    if _cancelled(jid):
+                        break
+                    window = disputed[start:start + PAGE_SIZE]
+                    by_id = {rec["_id"]: rec for rec in window}
+                    docs = [{"_id": rec["_id"], "id": rec.get("id"), "text": rec.get("text") or "",
+                             "hub": rec.get("hub") or "", "timeCreate": rec.get("timeCreate"),
+                             "toneMark": rec.get("toneMark"), "hubtype": rec.get("hubtype"),
+                             "type": rec.get("type"), "url": rec.get("url"),
+                             "author": rec.get("author")} for rec in window]
+                    batches = _make_batches(docs, p2_batch, ASPECT_CHAR_BUDGET, ASPECT_MESSAGE_CHARS)
+                    tasks = [
+                        asyncio.create_task(_read_aspect_batch(
+                            ctx, batch, objects=objects, theme=theme,
+                            hint="Это спорные случаи: посмотри внимательно и реши окончательно.\n",
+                            sem=p2_sem, batch_chars=ASPECT_MESSAGE_CHARS,
+                            max_tokens=ASPECT_PASS2_MAX_TOKENS, vllm_cfg=None))
+                        for batch in batches
+                    ]
+                    batch_of = {task: batch for task, batch in zip(tasks, batches)}
+                    changed: List[Dict[str, Any]] = []
+                    seen = 0
+                    pending = set(tasks)
+                    while pending:
+                        finished, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in finished:
+                            batch = batch_of[task]
+                            seen += len(batch)
+                            parsed, error = task.result()
+                            if error and error != "остановлено":
+                                pass2["failed"] += len(batch)
+                                _log_line("[%s] аспектная пачка 32B из %d не разобрана: %s"
+                                          % (jid, len(batch), error))
+                            recs = _aspect_records_from(parsed, batch, "32b",
+                                                        "Qwen/Qwen3-32B-FP8", objects)
+                            batch_recs: List[Dict[str, Any]] = []
+                            for rec in recs:
+                                if rec["_id"] not in by_id or rec["tone_aspect_by"] != "32b":
+                                    # 32B не ответила — оставляем решение 4B, не подменяем пустышкой.
+                                    continue
+                                results[rec["_id"]] = rec
+                                batch_recs.append(rec)
+                                pass2["decided"] += 1
+                            if batch_recs:
+                                _journal_append(jid, batch_recs)
+                                changed.extend(batch_recs)
+                            _set(jid, stage="pass2", stage_label="перепроверяю спорные на 32B",
+                                 pass2_done=done + seen, pass2_total=len(disputed),
+                                 processed=len(results), total=total)
+                    if changed:
+                        _set(jid, writing=True, stage="writing", stage_label=STAGE_LABELS["writing"])
+                        written, werrors = _bulk_write_aspect(job, changed)
+                        job["errors"] = int(job.get("errors") or 0) + werrors
+                        job["bulk_written"] = int(job.get("bulk_written") or 0) + written
+                    done += len(window)
+                    _set(jid, writing=False, stage="pass2", stage_label="перепроверяю спорные на 32B",
+                         pass2_done=done, pass2_total=len(disputed),
+                         processed=len(results), total=total, errors=job.get("errors") or 0,
+                         bulk_written=job.get("bulk_written") or 0)
+
+        # -------------------------------- отчёт --------------------------------
+        cancelled = _cancelled(jid)
+        _set(jid, status="running", stage="report", stage_label="собираю отчёт по объектам",
+             phase="report", processed=len(results), total=total,
+             percent_before_report=int(job.get("percent") or 0),
+             bulk_written=job.get("bulk_written") or 0, errors=job.get("errors") or 0)
+        report = _build_aspect_report(job, results, pass2)
+        report["elapsed_sec"] = round(time.time() - started, 1)
+        report["bulk_written"] = int(job.get("bulk_written") or 0)
+        report["write_errors"] = int(job.get("errors") or 0)
+        with open(_report_path(jid), "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=1)
+        files = _write_aspect_report_files(job, report)
+        report["files"] = files
+        with open(_report_path(jid), "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=1)
+        rate = round(len(results) / max(1e-6, report["elapsed_sec"]) * 60.0, 1)
+        _set(jid, status="cancelled" if cancelled else "done",
+             stage="cancelled" if cancelled else "done", worker_pid=0, writing=False,
+             stage_label=STAGE_LABELS["cancelled" if cancelled else "done"],
+             processed=len(results), total=total,
+             percent=(int((_job_load(jid) or {}).get("percent_before_report")
+                          or (_job_load(jid) or {}).get("percent") or 0) if cancelled else 100),
+             finished=datetime.now().isoformat(timespec="seconds"),
+             elapsed_sec=report["elapsed_sec"], rate_per_min=rate,
+             pass2_share=report["summary"]["pass2_share"], report_files=files,
+             log="аспектная разметка готова: сообщений %d, объектов %d"
+                 % (len(results), len(objects)))
+    except Exception as exc:  # noqa: BLE001
+        _log_line("[%s] аспектная разметка: ошибка: %s" % (jid, str(exc)[:300]), level="error")
+        _set(jid, status="error", stage="error", stage_label=STAGE_LABELS["error"], worker_pid=0,
+             error=str(exc)[:500], finished=datetime.now().isoformat(timespec="seconds"))
+
+
+# --------------------------------------------------------------------------- #
+# Отчёт аспектного режима
+# --------------------------------------------------------------------------- #
+
+def _share(part: Any, whole: Any) -> float:
+    try:
+        whole = float(whole)
+        return round(float(part) / whole, 4) if whole else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]],
+                         pass2: Dict[str, Any]) -> Dict[str, Any]:
+    """Распределение отношения по объектам, динамика, площадки, авторы и расхождения."""
+    objects = _object_terms(job.get("objects"))
+    all_recs = list(results.values())
+    usable = [rec for rec in all_recs if rec.get("tone_aspect_by") not in (None, "", "none")]
+    unresolved = len(all_recs) - len(usable)
+
+    buckets: Dict[str, Dict[str, Any]] = {
+        name: {"object": name, "mentions": 0, "negative": 0, "neutral": 0, "positive": 0,
+               "by_32b": 0, "conf_sum": 0.0} for name in objects}
+    months: Dict[Tuple[str, str], List[int]] = {}
+    hubs: Dict[Tuple[str, str], List[int]] = {}
+    authors: Dict[str, Dict[str, List[int]]] = {}
+    divergence: List[Dict[str, Any]] = []
+    divergence_by_object: Dict[str, int] = {}
+    messages_with_mention = 0
+    source_mismatch = 0
+
+    for rec in usable:
+        try:
+            month = datetime.fromtimestamp(float(rec.get("timeCreate"))).strftime("%Y-%m") \
+                if rec.get("timeCreate") else "—"
+        except Exception:
+            month = "—"
+        hub = _flat(rec.get("hub")) or "—"
+        author = _flat(rec.get("author")) or "—"
+        message_tone = rec.get("tone_msg_llm")
+        try:
+            source_tone = int(rec.get("toneMark"))
+        except (TypeError, ValueError):
+            source_tone = None
+        if message_tone is not None and source_tone is not None and int(message_tone) != source_tone:
+            source_mismatch += 1
+        mentioned_here = False
+        for entry in rec.get("tone_aspect") or []:
+            name = entry.get("object")
+            bucket = buckets.get(name)
+            if bucket is None or not entry.get("mentioned") or entry.get("tone") is None:
+                continue
+            tone = int(entry["tone"])
+            conf = float(entry.get("confidence") or 0.0)
+            mentioned_here = True
+            bucket["mentions"] += 1
+            bucket["conf_sum"] += conf
+            if entry.get("by") == "32b":
+                bucket["by_32b"] += 1
+            if tone < 0:
+                bucket["negative"] += 1
+            elif tone > 0:
+                bucket["positive"] += 1
+            else:
+                bucket["neutral"] += 1
+            cell = months.setdefault((month, name), [0, 0, 0])
+            cell[0] += 1
+            if tone < 0:
+                cell[1] += 1
+            elif tone > 0:
+                cell[2] += 1
+            spot = hubs.setdefault((name, hub), [0, 0, 0])
+            spot[0] += 1
+            if tone < 0:
+                spot[1] += 1
+            elif tone > 0:
+                spot[2] += 1
+            author_cell = authors.setdefault(name, {}).setdefault(author, [0, 0, 0])
+            author_cell[0] += 1
+            if tone < 0:
+                author_cell[1] += 1
+            elif tone > 0:
+                author_cell[2] += 1
+            # Самая ценная находка: общий тон сообщения и отношение к объекту расходятся.
+            if message_tone is not None and int(message_tone) != tone:
+                text = _flat(rec.get("text"))
+                divergence_by_object[name] = divergence_by_object.get(name, 0) + 1
+                divergence.append({
+                    "object": name,
+                    "message_tone": TONE_RU.get(int(message_tone), "—"),
+                    "message_tone_int": int(message_tone),
+                    "object_tone": TONE_RU.get(tone, "—"),
+                    "object_tone_int": tone,
+                    "source_tone": TONE_RU.get(source_tone, "—"),
+                    "confidence": conf,
+                    "decided_by": entry.get("by") or "",
+                    "reason": entry.get("reason") or "—",
+                    "quote": _flat(entry.get("quote")) or text[:220],
+                    "text": text[:320],
+                    "url": rec.get("url") or "",
+                    "hub": hub,
+                    "date": _fmt_date(rec.get("timeCreate")),
+                    "author": author,
+                })
+        if mentioned_here:
+            messages_with_mention += 1
+
+    object_rows: List[Dict[str, Any]] = []
+    for name in objects:
+        bucket = buckets[name]
+        mentions = int(bucket["mentions"])
+        row = {
+            "object": name,
+            "mentions": mentions,
+            "share_of_checked": _share(mentions, len(usable)),
+            "negative": int(bucket["negative"]),
+            "neutral": int(bucket["neutral"]),
+            "positive": int(bucket["positive"]),
+            "negative_share": _share(bucket["negative"], mentions),
+            "neutral_share": _share(bucket["neutral"], mentions),
+            "positive_share": _share(bucket["positive"], mentions),
+            "mean_confidence": round(bucket["conf_sum"] / mentions, 3) if mentions else 0.0,
+            "by_32b": int(bucket["by_32b"]),
+        }
+        row["tone_index"] = round(row["positive_share"] - row["negative_share"], 4)
+        object_rows.append(row)
+    object_rows.sort(key=lambda row: (row["tone_index"], -row["mentions"]))
+
+    month_rows: List[Dict[str, Any]] = []
+    for (month, name), cell in months.items():
+        month_rows.append({"month": month, "object": name, "mentions": cell[0],
+                           "negative": cell[1], "positive": cell[2],
+                           "neutral": cell[0] - cell[1] - cell[2],
+                           "negative_share": _share(cell[1], cell[0]),
+                           "positive_share": _share(cell[2], cell[0])})
+    month_rows.sort(key=lambda row: (row["month"], row["object"]))
+
+    hub_rows: List[Dict[str, Any]] = []
+    for (name, hub), cell in hubs.items():
+        hub_rows.append({"object": name, "hub": hub, "mentions": cell[0],
+                         "negative": cell[1], "positive": cell[2],
+                         "negative_share": _share(cell[1], cell[0]),
+                         "positive_share": _share(cell[2], cell[0])})
+    hub_rows.sort(key=lambda row: (row["object"], -row["mentions"]))
+    by_object_hubs: List[Dict[str, Any]] = []
+    for name in objects:
+        rows = [row for row in hub_rows if row["object"] == name]
+        if not rows:
+            continue
+        # Одна жалоба на площадке даёт «негатив 100%»: сначала площадки, где упоминаний
+        # достаточно для доли, и только если таких нет — все остальные.
+        solid = [row for row in rows if row["mentions"] >= 3]
+        pool = solid or rows
+        worst = sorted(pool, key=lambda row: (-row["negative_share"], -row["mentions"]))[:5]
+        best = sorted(pool, key=lambda row: (-row["positive_share"], -row["mentions"]))[:5]
+        by_object_hubs.append({"object": name, "worst": worst, "best": best})
+
+    author_rows: List[Dict[str, Any]] = []
+    for name in objects:
+        rows = [{"author": author, "mentions": cell[0], "negative": cell[1], "positive": cell[2],
+                 "negative_share": _share(cell[1], cell[0])}
+                for author, cell in (authors.get(name) or {}).items()]
+        rows.sort(key=lambda row: (-row["mentions"], -row["negative_share"]))
+        author_rows.append({"object": name, "authors": rows[:8]})
+
+    # Полезнее показать разнообразие направлений, а не 25 однотипных «нейтрал → позитив».
+    seen_pairs = set()
+    ordered: List[Dict[str, Any]] = []
+    for item in sorted(divergence, key=lambda row: (-float(row.get("confidence") or 0),
+                                                    -len(row.get("text") or ""))):
+        pair = (item.get("object"), item.get("message_tone_int"), item.get("object_tone_int"))
+        if pair in seen_pairs and len(ordered) < MAX_EXAMPLES - 6:
+            continue
+        seen_pairs.add(pair)
+        ordered.append(item)
+    divergence = ordered
+    examples = divergence[:MAX_EXAMPLES]
+
+    pass2_share = (sum(1 for rec in all_recs if rec.get("tone_aspect_by") == "32b")
+                   / float(len(all_recs)) if all_recs else 0.0)
+    summary = {
+        "dataset": job.get("dataset_label") or job.get("index_name"),
+        "index_name": job.get("index_name"),
+        "index_key": job.get("index_key"),
+        "mode": job.get("mode"),
+        "label_mode": "aspect",
+        "sample_size": job.get("sample_size"),
+        "checked": len(all_recs),
+        "evaluated": len(usable),
+        "unresolved": unresolved,
+        "messages_with_mention": messages_with_mention,
+        "objects": object_rows,
+        "divergence_total": len(divergence),
+        "source_message_mismatch": source_mismatch,
+        "pass2_share": round(pass2_share, 4),
+        "pass2_decided": int(pass2.get("decided") or 0),
+        "pass2_available": bool(pass2.get("available", True)),
+        "pass2_reason": str(pass2.get("reason") or ""),
+        "threshold": float(job.get("conf_threshold") or DEFAULT_CONF),
+        "bulk_written": int(job.get("bulk_written") or 0),
+        "write_errors": int(job.get("errors") or 0),
+        "elapsed_sec": job.get("elapsed_sec"),
+        "rate_per_min": job.get("rate_per_min"),
+        "scope_text": _scope_text(job),
+        "objects_requested": objects,
+        "divergence_by_object": divergence_by_object,
+    }
+    conclusions = _aspect_conclusions(summary, object_rows, by_object_hubs, month_rows)
+    recommendation = _aspect_recommendation(summary, object_rows, by_object_hubs)
+    return {
+        "job_id": job.get("id"),
+        "created": job.get("created"),
+        "finished": datetime.now().isoformat(timespec="seconds"),
+        "dataset": job.get("dataset_label") or job.get("index_name"),
+        "index_name": job.get("index_name"),
+        "label_mode": "aspect",
+        "period": _period_label(job),
+        "scope": _scope_public(job),
+        "scope_text": _scope_text(job),
+        "preset": job.get("preset") or "",
+        "source_note": ("Разметка источника (toneMark) сделана на уровне сообщения целиком, а не "
+                        "по объекту. Поэтому в аспектном режиме она показана только как контекст "
+                        "и НЕ используется как эталон точности: сравнивать отношение к объекту "
+                        "с общей разметкой сообщения нельзя."),
+        "method": {
+            "pass1_model": "qwen3-4b-fast (vLLM, 127.0.0.1:8001, профиль texts_bulk)",
+            "pass2_model": "Qwen/Qwen3-32B-FP8 (vLLM, 127.0.0.1:8000)",
+            "batch_size": int(job.get("batch_size") or ASPECT_BATCH),
+            "parallel": int(job.get("parallel") or ASPECT_PARALLEL),
+            "conf_threshold": float(job.get("conf_threshold") or DEFAULT_CONF),
+            "objects": objects,
+            "fields": list(ASPECT_FIELDS),
+            "source_field": "toneMark (не изменяется, только контекст)",
+            "pass2": dict(pass2),
+        },
+        "summary": summary,
+        "by_object": object_rows,
+        "by_month": month_rows,
+        "by_object_hubs": by_object_hubs,
+        "top_authors": author_rows,
+        "examples": examples,
+        "conclusions": conclusions,
+        "recommendation": recommendation,
+    }
+
+
+def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
+                        by_hubs: List[Dict[str, Any]],
+                        month_rows: List[Dict[str, Any]]) -> List[str]:
+    """5–8 выводов человеческим языком — главное, что читает пользователь."""
+    out: List[str] = []
+    checked = int(summary.get("checked") or 0)
+    with_mention = int(summary.get("messages_with_mention") or 0)
+    out.append("Проверено %s по области: %s. Объект упомянут в %s из них."
+               % (_plural(checked, "сообщение", "сообщения", "сообщений"),
+                  summary.get("scope_text") or "весь датасет без дополнительных фильтров",
+                  _plural(with_mention, "сообщении", "сообщениях", "сообщениях")))
+    mentioned = [row for row in rows if row["mentions"] >= 3]
+    if mentioned:
+        worst = max(mentioned, key=lambda row: row["negative_share"])
+        best = min(mentioned, key=lambda row: row["negative_share"])
+        out.append("Хуже всего отношение к «%s»: негатив %s при %s."
+                   % (worst["object"], _pct(float(worst["negative_share"])),
+                      _plural(int(worst["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
+        if best["object"] != worst["object"]:
+            out.append("Лучше всего — «%s»: негатив %s, позитив %s (%s)."
+                       % (best["object"], _pct(float(best["negative_share"])),
+                          _pct(float(best["positive_share"])),
+                          _plural(int(best["mentions"]), "упоминание", "упоминания", "упоминаний")))
+    divergent = int(summary.get("divergence_total") or 0)
+    if divergent:
+        worst_obj = max(rows, key=lambda row: row["mentions"]) if rows else None
+        out.append("В %s общий тон сообщения расходится с отношением к объекту — это те случаи, "
+                   "где оценка «по сообщению целиком» даёт неверную картину."
+                   % _plural(divergent, "случае", "случаях", "случаях"))
+        per_object_div = {}
+        for item in (summary.get("divergence_by_object") or {}).items():
+            per_object_div[item[0]] = item[1]
+        if per_object_div:
+            top_obj = max(per_object_div.items(), key=lambda pair: pair[1])
+            out.append("Больше всего расхождений вокруг «%s»: %s."
+                       % (top_obj[0], _plural(int(top_obj[1]), "случай", "случая", "случаев")))
+        elif worst_obj:
+            out.append("Больше всего таких расхождений вокруг «%s» (%s)."
+                       % (worst_obj["object"],
+                          _plural(int(worst_obj["mentions"]), "упоминание", "упоминания", "упоминаний")))
+    if month_rows:
+        months = sorted({row["month"] for row in month_rows})
+        if len(months) >= 2:
+            last = months[-1]
+            rows_last = [row for row in month_rows if row["month"] == last]
+            if rows_last:
+                top = max(rows_last, key=lambda row: row["mentions"])
+                out.append("Свежий срез — %s: у «%s» %s упоминаний, негатив %s."
+                           % (last, top["object"], top["mentions"],
+                              _pct(float(top["negative_share"]))))
+    if by_hubs:
+        worst_hub = None
+        for block in by_hubs:
+            for row in block["worst"][:1]:
+                if row["mentions"] >= 3 and (worst_hub is None or row["negative_share"] > worst_hub[2]["negative_share"]):
+                    worst_hub = (block["object"], row["hub"], row)
+        if worst_hub:
+            out.append("Худшая площадка — %s по объекту «%s»: негатив %s при %s."
+                       % (worst_hub[1], worst_hub[0], _pct(float(worst_hub[2]["negative_share"])),
+                          _plural(int(worst_hub[2]["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
+    out.append("Спорных случаев, которые решала 32B, — %s от проверенного (%s сообщений)."
+               % (_pct(float(summary.get("pass2_share") or 0.0)),
+                  int(summary.get("pass2_decided") or 0)))
+    if not summary.get("pass2_available", True):
+        out.append("ВНИМАНИЕ: 32B была недоступна — спорные случаи остались решением быстрой "
+                   "модели, окончательными их считать нельзя.")
+    if int(summary.get("unresolved") or 0):
+        out.append("Для %s модель не вернула вердикт: они помечены tone_aspect_by=none и не "
+                   "попали в распределение." % _plural(int(summary["unresolved"]), "сообщения",
+                                                       "сообщений", "сообщений"))
+    return out[:8]
+
+
+def _aspect_recommendation(summary: Dict[str, Any], rows: List[Dict[str, Any]],
+                           by_hubs: List[Dict[str, Any]]) -> str:
+    mentioned = [row for row in rows if row["mentions"] >= 3]
+    if not mentioned:
+        return ("Упоминаний выбранных объектов в области проверки почти нет — расширьте область "
+                "(период, площадки) или проверьте название объекта.")
+    worst = max(mentioned, key=lambda row: row["negative_share"])
+    best = min(mentioned, key=lambda row: row["negative_share"])
+    parts: List[str] = []
+    if float(worst["negative_share"]) >= 0.4:
+        parts.append("По объекту «%s» негатив доминирует (%s при %d упоминаниях) — это первый "
+                     "приоритет для работы с репутацией."
+                     % (worst["object"], _pct(float(worst["negative_share"])), worst["mentions"]))
+    elif float(worst["negative_share"]) >= 0.2:
+        parts.append("По объекту «%s» негатив заметен (%s) — стоит разобрать причины."
+                     % (worst["object"], _pct(float(worst["negative_share"]))))
+    if best["object"] != worst["object"]:
+        parts.append("«%s» держится лучше (негатив %s) — его аргументы можно переносить на "
+                     "проблемный объект." % (best["object"], _pct(float(best["negative_share"]))))
+    if int(summary.get("divergence_total") or 0) > max(3, int(0.03 * max(1, summary.get("evaluated") or 1))):
+        parts.append("Общий тон сообщения часто не совпадает с отношением к объекту (%s): "
+                     "для решений используйте поля tone_aspect, а не общую тональность сообщения."
+                     % _plural(int(summary.get("divergence_total") or 0),
+                                "случай", "случая", "случаев"))
+    for block in by_hubs:
+        if block["object"] == worst["object"] and block["worst"]:
+            top = block["worst"][0]
+            if top["mentions"] >= 3:
+                parts.append("Основной источник негатива — %s (%s при %d упоминаниях)."
+                             % (top["hub"], _pct(float(top["negative_share"])), top["mentions"]))
+            break
+    if not summary.get("pass2_available", True):
+        parts.append("Перепроверка на 32B не выполнялась — цифры стоит уточнить повторным прогоном.")
+    parts.append("Разметка источника в аспектном режиме не эталон: она сделана по сообщению "
+                 "целиком, поэтому итоговые цифры берите из полей tone_aspect.")
+    return " ".join(parts)
+
+
+def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Разделы аспектного отчёта для платформенного сборщика DOCX/PDF."""
+    summary = report["summary"]
+    rows = report["by_object"]
+    scope = report.get("scope") or {}
+    objects = scope.get("objects") or []
+    pass2_text = "перепроверка не выполнялась (%s)" % (pass2.get("reason") or "нет спорных случаев") \
+        if not pass2.get("available", True) else "выполнена"
+
+    object_table = {
+        "title": "Отношение по объектам",
+        "columns": ["Объект", "Упоминаний", "Доля проверенного", "Позитив", "Нейтрал", "Негатив",
+                    "Индекс тона", "Средняя уверенность"],
+        "rows": [[row["object"], row["mentions"], _pct(float(row["share_of_checked"])),
+                  _pct(float(row["positive_share"])), _pct(float(row["neutral_share"])),
+                  _pct(float(row["negative_share"])), _num(row["tone_index"]),
+                  _num(row["mean_confidence"])] for row in rows],
+        "note": "Индекс тона = доля позитива минус доля негатива (−1…1). Считается по упоминаниям, "
+                "то есть по сообщениям, где объект реально назван.",
+        "layout": "landscape",
+    }
+    absolute_table = {
+        "title": "Распределение в абсолютных числах",
+        "columns": ["Объект"] + [TONE_RU[c] for c in CLASSES] + ["Упоминаний", "Оценок от 32B"],
+        "rows": [[row["object"], row["negative"], row["neutral"], row["positive"],
+                  row["mentions"], row["by_32b"]] for row in rows],
+        "layout": "portrait",
+    }
+    months = sorted({row["month"] for row in report["by_month"]})
+    month_table = None
+    if months:
+        month_table = {
+            "title": "Динамика по месяцам: доля негатива по объектам",
+            "columns": ["Месяц"] + [row["object"] for row in rows],
+            "rows": [[month] + [
+                (lambda cell: "%s (%d)" % (_pct(float(cell["negative_share"])), cell["mentions"])
+                 if cell else "—")(next((row for row in report["by_month"]
+                                         if row["month"] == month and row["object"] == obj), None))
+                for obj in [row["object"] for row in rows]] for month in months],
+            "note": "В скобках — сколько упоминаний объекта в этом месяце.",
+            "layout": "landscape",
+        }
+    hub_tables = []
+    for block in report["by_object_hubs"]:
+        hub_tables.append({
+            "title": "Площадки по объекту «%s»: где хуже и где лучше" % block["object"],
+            "columns": ["Площадка", "Упоминаний", "Негатив", "Позитив"],
+            "note": "Сначала площадки с 3+ упоминаниями: при одном-двух сообщениях доля случайна.",
+            "rows": [["хуже: " + row["hub"], row["mentions"], _pct(float(row["negative_share"])),
+                      _pct(float(row["positive_share"]))] for row in block["worst"]] +
+                    [["лучше: " + row["hub"], row["mentions"], _pct(float(row["negative_share"])),
+                      _pct(float(row["positive_share"]))] for row in block["best"]],
+            "layout": "auto",
+        })
+    author_tables = []
+    for block in report["top_authors"]:
+        if not block["authors"]:
+            continue
+        author_tables.append({
+            "title": "Кто чаще всего пишет про «%s»" % block["object"],
+            "columns": ["Автор", "Упоминаний", "Негатив", "Позитив"],
+            "rows": [[row["author"], row["mentions"], row["negative"], row["positive"]]
+                     for row in block["authors"]],
+            "layout": "auto",
+        })
+    examples = report.get("examples") or []
+    example_table = None
+    if examples:
+        example_table = {
+            "title": "Где общий тон сообщения расходится с отношением к объекту (%d)" % len(examples),
+            "columns": ["Объект", "Площадка", "Дата", "Тон сообщения", "Отношение к объекту",
+                        "Цитата-доказательство", "Пояснение модели", "Ссылка"],
+            "rows": [[item["object"], item["hub"], item["date"], item["message_tone"],
+                      item["object_tone"], item["quote"], item["reason"], item["url"] or "—"]
+                     for item in examples],
+            "note": "Именно эти случаи ломают оценку «по сообщению целиком»: реакция на бренд "
+                    "и реакция на продукт здесь расходятся.",
+            "layout": "landscape",
+        }
+
+    sections: List[Dict[str, Any]] = [{
+        "heading": "Как проверяли",
+        "text": ("Датасет: %s. Область проверки: %s. Режим: аспектная разметка (отношение к объекту).\n"
+                 "Проверено сообщений: %d. Объектов в проверке: %d. Спорные случаи перепроверяла "
+                 "Qwen3-32B (%s). Наша разметка пишется в поля tone_aspect, tone_aspect_objects, "
+                 "tone_msg_llm; исходное toneMark не изменяется.\n%s"
+                 % (report.get("dataset") or "—", report.get("scope_text") or "—",
+                    int(summary.get("checked") or 0), len(objects), pass2_text,
+                    report.get("source_note") or "")),
+        "tables": [{
+            "title": "Ключевые цифры",
+            "columns": ["Показатель", "Значение"],
+            "rows": [
+                ["Сообщений проверено", str(summary.get("checked") or 0)],
+                ["С вердиктом модели", str(summary.get("evaluated") or 0)],
+                ["Объект упомянут хотя бы в одном сообщении", str(summary.get("messages_with_mention") or 0)],
+                ["Всего упоминаний объектов", str(sum(row["mentions"] for row in rows))],
+                ["Расхождений «тон сообщения ≠ отношение к объекту»", str(summary.get("divergence_total") or 0)],
+                ["Спорных случаев на 32B", _pct(float(summary.get("pass2_share") or 0.0))],
+                ["Решений 32B", str(summary.get("pass2_decided") or 0)],
+                ["Не разобрано моделью", str(summary.get("unresolved") or 0)],
+                ["Записано в Elasticsearch", str(summary.get("bulk_written") or 0)],
+            ],
+            "layout": "portrait",
+        }],
+    }, {
+        "heading": "Отношение к объектам",
+        "text": ("Считаются только сообщения, где объект реально назван. Один и тот же текст может "
+                 "давать разное отношение к разным объектам — это и есть смысл аспектной разметки."),
+        "tables": [object_table, absolute_table] + ([month_table] if month_table else []),
+    }]
+    if hub_tables:
+        sections.append({"heading": "Площадки: где отношение хуже, а где лучше",
+                         "text": "Срез по площадкам внутри каждого объекта.",
+                         "tables": hub_tables})
+    if author_tables:
+        sections.append({"heading": "Авторы", "text": "Кто чаще всего пишет про объекты проверки.",
+                         "tables": author_tables})
+    if example_table:
+        sections.append({
+            "heading": "Общий тон сообщения ≠ отношение к объекту",
+            "text": ("Самая ценная находка аспектного режима: сообщение в целом нейтральное или "
+                     "позитивное, а к объекту отношение другое (или наоборот)."),
+            "tables": [example_table],
+        })
+    sections.append({"heading": "Выводы", "bullets": report.get("conclusions") or []})
+    sections.append({"heading": "Рекомендация", "text": report.get("recommendation") or ""})
+    return sections
+
+
+def _write_aspect_report_files(job: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, str]:
+    """DOCX и PDF аспектного отчёта — в папку отчётов владельца."""
+    from agent_engine.tools_reports import _build_docx, _build_pdf, _safe_name
+
+    owner = str(job.get("owner") or "")
+    if not owner:
+        return {}
+    out: Dict[str, str] = {}
+    objects = _object_terms(job.get("objects"))
+    label = _safe_name(report.get("dataset") or job.get("index_name") or "датасет", 30)
+    objects_part = _safe_name(", ".join(objects), 40)
+    stamp = datetime.now().strftime("%Y-%m-%d %H-%M")
+    mode = "полная" if job.get("mode") == "full" else "выборка %s" % (job.get("sample_size") or "")
+    title = "Отношение к объектам: аспектная разметка"
+    subtitle = "%s → %s — %s, %s" % (label, objects_part or "объекты не заданы",
+                                     report.get("period") or "", mode)
+    meta = {
+        "dataset_label": report.get("dataset") or "",
+        "period": report.get("period") or "",
+        "author": "Tellscope, локальные модели vLLM",
+        "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    }
+    sections = _aspect_sections(report, (report.get("method") or {}).get("pass2") or {})
+    folder = _reports_dir(owner, REPORT_FOLDER)
+    base = _safe_name("%s — %s %s" % (label, objects_part or "объекты", stamp), 120)
+    for ext, builder in (("docx", _build_docx), ("pdf", _build_pdf)):
+        path = os.path.join(folder, "%s.%s" % (base, ext))
+        try:
+            builder(path, title, subtitle, sections, meta)
+            out[ext] = path
+        except Exception as exc:  # noqa: BLE001 — без файла отчёт всё равно есть в JSON
+            _log_line("[%s] не удалось собрать аспектный %s: %s"
+                      % (job.get("id"), ext.upper(), str(exc)[:200]), level="error")
+    return out
