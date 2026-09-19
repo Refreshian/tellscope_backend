@@ -2257,6 +2257,105 @@ def datasets(user: Any = Depends(current_user_any)):
     return {"datasets": items}
 
 
+def _own_dataset_file(user_id: str, name: str) -> Tuple[str, str]:
+    """Папка и файл набора в собственном списке файлов пользователя.
+
+    Пустая папка означает, что набор доступен только по подписке (чужой): удалять его нельзя.
+    """
+    stem = _norm_name(name).lower()
+    try:
+        rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        raw = rds.hget(str(user_id), "json_files_directory")
+    except Exception:
+        return "", ""
+    if not raw:
+        return "", ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    for folder, files in data.items():
+        for file_name in files or []:
+            text = str(file_name)
+            stem_of_file = text[:-5] if text.lower().endswith(".json") else text
+            if stem_of_file.lower() == stem:
+                return str(folder), text
+    return "", ""
+
+
+def _dataset_jobs_active(name: str) -> int:
+    """Сколько задач проверки тональности сейчас работают по этому набору."""
+    count = 0
+    if not os.path.isdir(STATE_DIR):
+        return 0
+    for entry in os.listdir(STATE_DIR):
+        if not entry.endswith(".json") or entry.endswith(".report.json"):
+            continue
+        job = _job_load(entry[:-5])
+        if not job or str(job.get("index_name") or "") != name:
+            continue
+        if str(job.get("status") or "") in ("queued", "running"):
+            count += 1
+    return count
+
+
+@router.delete("/datasets/{spec:path}")
+def delete_dataset(spec: str, user: Any = Depends(current_user_any)):
+    """Удаление набора данных: сообщения, разметка и запись в списке файлов.
+
+    Удалить набор может только его владелец: набор, открытый по подписке, отклоняется так же,
+    как чужой (та же проверка доступа, что при запуске проверки), а если по набору идёт
+    проверка тональности — 409, иначе удаление вырвало бы данные из-под работающего прохода.
+    Действие необратимо.
+    """
+    key, name = _guard_dataset(user, spec)
+    uid = str(getattr(user, "id", ""))
+    folder, file_name = _own_dataset_file(uid, name)
+    if not folder:
+        raise HTTPException(status_code=403,
+                            detail="Этот набор доступен вам по подписке — удалить его может только владелец")
+    if _dataset_jobs_active(name):
+        raise HTTPException(status_code=409,
+                            detail="По этому набору идёт проверка тональности — сначала остановите её")
+    try:
+        docs = int(_es().count(index=name).get("count") or 0)
+    except Exception:
+        docs = 0
+    removed = False
+    try:
+        if _es().indices.exists(index=name):
+            _es().indices.delete(index=name)
+            removed = True
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail="Не удалось удалить сообщения набора: %s" % str(exc)[:200])
+    # Запись в списке файлов пользователя: файл убираем, пустую папку не оставляем.
+    try:
+        rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        raw = rds.hget(uid, "json_files_directory")
+        data = json.loads(raw) if raw else {}
+        if isinstance(data, dict) and folder in data:
+            files = [f for f in (data.get(folder) or []) if str(f) != file_name]
+            if files:
+                data[folder] = files
+            else:
+                data.pop(folder, None)
+            rds.hset(uid, "json_files_directory", json.dumps(data))
+    except Exception:
+        pass
+    # Файл на диске — если он есть (наборы из Brand Analytics хранятся только в Elasticsearch).
+    try:
+        path = os.path.join(DATA_DIR, uid, "json_files_directory", folder, file_name)
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+    return {"deleted": True, "name": name, "label": _pretty_label(name), "docs": docs,
+            "messages_deleted": removed, "folder": folder, "index_key": key}
+
+
 @router.get("/jobs")
 def jobs(user: Any = Depends(current_user_any), limit: int = Query(default=20, ge=1, le=100)):
     """Свои задачи проверки тональности (свежие сверху)."""
