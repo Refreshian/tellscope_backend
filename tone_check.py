@@ -4109,10 +4109,9 @@ def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]
         "scope": _scope_public(job),
         "scope_text": _scope_text(job),
         "preset": job.get("preset") or "",
-        "source_note": ("Разметка источника сделана на уровне сообщения целиком, а не "
-                        "по объекту. Поэтому в аспектном режиме она показана только как контекст "
-                        "и НЕ используется как эталон точности: сравнивать отношение к объекту "
-                        "с общей разметкой сообщения нельзя."),
+        "source_note": ("Источник размечает сообщение целиком, а не отношение к объекту, поэтому "
+                        "его разметка здесь только для справки. Итоговые цифры — из колонки "
+                        "«Отношение к объекту» (наша разметка)."),
         "method": {
             "pass1_model": "первичная автоматическая разметка",
             "pass2_model": "уточняющая проверка",
@@ -4142,39 +4141,42 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
     out: List[str] = []
     checked = int(summary.get("checked") or 0)
     with_mention = int(summary.get("messages_with_mention") or 0)
-    out.append("Проверено %s по области: %s. Объект упомянут в %s из них."
-               % (_plural(checked, "сообщение", "сообщения", "сообщений"),
-                  summary.get("scope_text") or "все сообщения набора",
-                  _plural(with_mention, "сообщении", "сообщениях", "сообщениях")))
+    objects = [row["object"] for row in rows] or []
+    scope_text = summary.get("scope_text") or "все сообщения набора"
+    out.append("Проверено %s — это все сообщения области (%s), где встречается название объекта. "
+               "Отбор по слову, а не готовый вывод: слово может стоять в перечислении или в шаблоне."
+               % (_plural(checked, "сообщение", "сообщения", "сообщений"), scope_text))
+    if with_mention:
+        out.append("Модель подтвердила, что речь идёт именно об объекте, в %s (%s от проверенного) — "
+                   "доли ниже считаны только по ним."
+                   % (_plural(with_mention, "сообщении", "сообщениях", "сообщениях"),
+                      _pct(with_mention / float(max(1, checked)))))
+    left = checked - with_mention
+    if left > 0:
+        out.append("В остальных %s слово встречается, но объект не обсуждается: перечисления банков "
+                   "и подборки, реклама и шаблонные тексты, либо модель не смогла подтвердить "
+                   "упоминание цитатой. В расчёт они не вошли."
+                   % _plural(left, "сообщении", "сообщениях", "сообщениях"))
     mentioned = [row for row in rows if row["mentions"] >= 3]
     if mentioned:
-        worst = max(mentioned, key=lambda row: row["negative_share"])
-        best = min(mentioned, key=lambda row: row["negative_share"])
-        out.append("Хуже всего отношение к «%s»: негатив %s при %s."
-                   % (worst["object"], _pct(float(worst["negative_share"])),
-                      _plural(int(worst["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
-        if best["object"] != worst["object"]:
-            out.append("Лучше всего — «%s»: негатив %s, позитив %s (%s)."
-                       % (best["object"], _pct(float(best["negative_share"])),
-                          _pct(float(best["positive_share"])),
-                          _plural(int(best["mentions"]), "упоминание", "упоминания", "упоминаний")))
+        if len(mentioned) == 1:
+            only = mentioned[0]
+            out.append("Отношение к «%s»: негатив %s, нейтрал %s, позитив %s — из %s."
+                       % (only["object"], _pct(float(only["negative_share"])),
+                          _pct(float(only["neutral_share"])), _pct(float(only["positive_share"])),
+                          _plural(int(only["mentions"]), "упоминания", "упоминаний", "упоминаний")))
+        else:
+            worst = max(mentioned, key=lambda row: row["negative_share"])
+            best = min(mentioned, key=lambda row: row["negative_share"])
+            out.append("Больше всего негатива у «%s» (%s из %s), меньше всего — у «%s» (%s)."
+                       % (worst["object"], _pct(float(worst["negative_share"])),
+                          _plural(int(worst["mentions"]), "упоминания", "упоминаний", "упоминаний"),
+                          best["object"], _pct(float(best["negative_share"]))))
     divergent = int(summary.get("divergence_total") or 0)
     if divergent:
-        worst_obj = max(rows, key=lambda row: row["mentions"]) if rows else None
-        out.append("В %s общий тон сообщения расходится с отношением к объекту — это те случаи, "
-                   "где оценка «по сообщению целиком» даёт неверную картину."
+        out.append("В %s общий тон сообщения расходится с отношением к объекту: если судить по "
+                   "сообщению целиком, вывод был бы другим."
                    % _plural(divergent, "случае", "случаях", "случаях"))
-        per_object_div = {}
-        for item in (summary.get("divergence_by_object") or {}).items():
-            per_object_div[item[0]] = item[1]
-        if per_object_div:
-            top_obj = max(per_object_div.items(), key=lambda pair: pair[1])
-            out.append("Больше всего расхождений вокруг «%s»: %s."
-                       % (top_obj[0], _plural(int(top_obj[1]), "случай", "случая", "случаев")))
-        elif worst_obj:
-            out.append("Больше всего таких расхождений вокруг «%s» (%s)."
-                       % (worst_obj["object"],
-                          _plural(int(worst_obj["mentions"]), "упоминание", "упоминания", "упоминаний")))
     if month_rows:
         months = sorted({row["month"] for row in month_rows})
         if len(months) >= 2:
@@ -4190,12 +4192,13 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
         worst_hub = None
         for block in by_hubs:
             for row in block["worst"][:1]:
-                if row["mentions"] >= 3 and (worst_hub is None or row["negative_share"] > worst_hub[2]["negative_share"]):
+                # Площадка с одним-двумя упоминаниями даёт случайные 100% — такие не показываем.
+                if row["mentions"] >= 5 and (worst_hub is None or row["negative_share"] > worst_hub[2]["negative_share"]):
                     worst_hub = (block["object"], row["hub"], row)
         if worst_hub:
-            out.append("Худшая площадка — %s по объекту «%s»: негатив %s при %s."
-                       % (worst_hub[1], worst_hub[0], _pct(float(worst_hub[2]["negative_share"])),
-                          _plural(int(worst_hub[2]["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
+            out.append("Худшая площадка по объекту «%s» — %s: негатив %s из %s."
+                       % (worst_hub[0], worst_hub[1], _pct(float(worst_hub[2]["negative_share"])),
+                          _plural(int(worst_hub[2]["mentions"]), "упоминания", "упоминаний", "упоминаний")))
     out.append("Спорных случаев, прошедших уточняющую проверку, — %s от проверенного (%s)."
                % (_pct(float(summary.get("pass2_share") or 0.0)),
                   _plural(int(summary.get("pass2_decided") or 0), "сообщение", "сообщения", "сообщений")))
@@ -4229,22 +4232,22 @@ def _aspect_recommendation(summary: Dict[str, Any], rows: List[Dict[str, Any]],
         parts.append("«%s» держится лучше (негатив %s) — его аргументы можно переносить на "
                      "проблемный объект." % (best["object"], _pct(float(best["negative_share"]))))
     if int(summary.get("divergence_total") or 0) > max(3, int(0.03 * max(1, summary.get("evaluated") or 1))):
-        parts.append("Общий тон сообщения часто не совпадает с отношением к объекту (%s): "
-                     "для решений опирайтесь на оценку по объекту, а не на общую тональность "
-                     "сообщения."
+        parts.append("Тон сообщения целиком часто не совпадает с отношением к объекту (%s): "
+                     "для решений берите оценку по объекту."
                      % _plural(int(summary.get("divergence_total") or 0),
                                 "случай", "случая", "случаев"))
     for block in by_hubs:
         if block["object"] == worst["object"] and block["worst"]:
             top = block["worst"][0]
-            if top["mentions"] >= 3:
+            if top["mentions"] >= 5:
                 parts.append("Основной источник негатива — %s (%s при %d упоминаниях)."
                              % (top["hub"], _pct(float(top["negative_share"])), top["mentions"]))
             break
     if not summary.get("pass2_available", True):
         parts.append("Уточняющая проверка не выполнялась — цифры стоит уточнить повторным прогоном.")
-    parts.append("Разметка источника в аспектном режиме не эталон: она сделана по сообщению "
-                 "целиком, поэтому итоговые цифры берите из оценки по объекту.")
+    parts.append("Итоговые цифры — это оценка по объекту (наша разметка): она отвечает на вопрос "
+                 "«как относятся к «%s»». Разметка источника говорит лишь об общем тоне сообщения "
+                 "и здесь только для справки." % worst["object"])
     return " ".join(parts)
 
 
@@ -4259,7 +4262,7 @@ def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict
 
     object_table = {
         "title": "Отношение по объектам",
-        "columns": ["Объект", "Упоминаний", "Доля проверенного", "Позитив", "Нейтрал", "Негатив",
+        "columns": ["Объект", "Подтверждённых упоминаний", "Доля от проверенных", "Позитив", "Нейтрал", "Негатив",
                     "Перевес позитива", "Средняя уверенность"],
         "rows": [[row["object"], row["mentions"], _pct(float(row["share_of_checked"])),
                   _pct(float(row["positive_share"])), _pct(float(row["neutral_share"])),
