@@ -2276,12 +2276,18 @@ def _own_dataset_file(user_id: str, name: str) -> Tuple[str, str]:
         return "", ""
     if not isinstance(data, dict):
         return "", ""
+    # Сначала точное совпадение, и только потом без учёта регистра: в списке файлов бывают
+    # записи, различающиеся только регистром (KFC_...json и kfc_...json), и удалять нужно ту,
+    # которая соответствует имени набора.
+    matches: List[Tuple[str, str, bool]] = []
     for folder, files in data.items():
         for file_name in files or []:
             text = str(file_name)
             stem_of_file = text[:-5] if text.lower().endswith(".json") else text
             if stem_of_file.lower() == stem:
-                return str(folder), text
+                matches.append((str(folder), text, stem_of_file == _norm_name(name)))
+    for folder, file_name, _exact in sorted(matches, key=lambda row: not row[2]):
+        return folder, file_name
     return "", ""
 
 
