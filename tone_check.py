@@ -2237,6 +2237,7 @@ def datasets(user: Any = Depends(current_user_any)):
     reverse: Dict[str, int] = {}
     for key, value in mapping.items():
         reverse.setdefault(_norm_name(value), key)
+    folders = _dataset_folders(str(getattr(user, "id", "")), bool(getattr(user, "is_superuser", False)))
     items = []
     for name in sorted(names):
         if counts.get(name, 0) <= 0:
@@ -2252,43 +2253,99 @@ def datasets(user: Any = Depends(current_user_any)):
             "label": _pretty_label(name),
             "docs": counts.get(name, 0),
             "labeled": labeled,
+            "folder": folders.get(name.lower()) or "",
         })
     items.sort(key=lambda item: item["docs"])
     return {"datasets": items}
 
 
-def _own_dataset_file(user_id: str, name: str) -> Tuple[str, str]:
-    """Папка и файл набора в собственном списке файлов пользователя.
+def _dataset_folders(me: str, allow_any: bool) -> Dict[str, str]:
+    """Соответствие «имя набора → папка в списке файлов» (в нижнем регистре имени).
 
-    Пустая папка означает, что набор доступен только по подписке (чужой): удалять его нельзя.
+    Нужно интерфейсу: внутри папки набор этой папки подставляется сам, а рядом с названием
+    видно, откуда он.
+    """
+    out: Dict[str, str] = {}
+    try:
+        rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+    except Exception:
+        return out
+    order = [str(me)]
+    if allow_any:
+        try:
+            for key in rds.keys("*"):
+                if str(key) != str(me):
+                    order.append(str(key))
+        except Exception:
+            pass
+    for uid in order:
+        try:
+            raw = rds.hget(uid, "json_files_directory")
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for folder, files in data.items():
+            for file_name in files or []:
+                text = str(file_name)
+                stem = text[:-5] if text.lower().endswith(".json") else text
+                out.setdefault(stem.lower(), str(folder))
+    return out
+
+
+def _dataset_file_owner(me: str, name: str, allow_any: bool) -> Tuple[str, str, str]:
+    """Где лежит запись о наборе в списках файлов: (владелец, папка, файл).
+
+    Сначала ищем в своём списке, а администратору разрешаем искать и в списках остальных
+    пользователей: он видит наборы всех, поэтому и удалять должен мочь. Пустые строки
+    означают, что записи нет ни у кого — набор «осиротел» (файл убрали из списка, а данные
+    остались); такой набор администратор всё равно может удалить по индексу.
     """
     stem = _norm_name(name).lower()
     try:
         rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-        raw = rds.hget(str(user_id), "json_files_directory")
     except Exception:
-        return "", ""
-    if not raw:
-        return "", ""
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return "", ""
-    if not isinstance(data, dict):
-        return "", ""
-    # Сначала точное совпадение, и только потом без учёта регистра: в списке файлов бывают
-    # записи, различающиеся только регистром (KFC_...json и kfc_...json), и удалять нужно ту,
-    # которая соответствует имени набора.
-    matches: List[Tuple[str, str, bool]] = []
-    for folder, files in data.items():
-        for file_name in files or []:
-            text = str(file_name)
-            stem_of_file = text[:-5] if text.lower().endswith(".json") else text
-            if stem_of_file.lower() == stem:
-                matches.append((str(folder), text, stem_of_file == _norm_name(name)))
-    for folder, file_name, _exact in sorted(matches, key=lambda row: not row[2]):
-        return folder, file_name
-    return "", ""
+        return "", "", ""
+    order = [str(me)]
+    if allow_any:
+        try:
+            for key in rds.keys("*"):
+                if str(key) != str(me):
+                    order.append(str(key))
+        except Exception:
+            pass
+    for uid in order:
+        try:
+            raw = rds.hget(uid, "json_files_directory")
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        # Сначала точное совпадение, и только потом без учёта регистра: в списке файлов бывают
+        # записи, различающиеся только регистром (KFC_...json и kfc_...json), и удалять нужно ту,
+        # которая соответствует имени набора.
+        matches: List[Tuple[str, str, bool]] = []
+        for folder, files in data.items():
+            for file_name in files or []:
+                text = str(file_name)
+                stem_of_file = text[:-5] if text.lower().endswith(".json") else text
+                if stem_of_file.lower() == stem:
+                    matches.append((str(folder), text, stem_of_file == _norm_name(name)))
+        for folder, file_name, _exact in sorted(matches, key=lambda row: not row[2]):
+            return uid, folder, file_name
+    return "", "", ""
 
 
 def _dataset_jobs_active(name: str) -> int:
@@ -2311,15 +2368,16 @@ def _dataset_jobs_active(name: str) -> int:
 def delete_dataset(spec: str, user: Any = Depends(current_user_any)):
     """Удаление набора данных: сообщения, разметка и запись в списке файлов.
 
-    Удалить набор может только его владелец: набор, открытый по подписке, отклоняется так же,
-    как чужой (та же проверка доступа, что при запуске проверки), а если по набору идёт
-    проверка тональности — 409, иначе удаление вырвало бы данные из-под работающего прохода.
-    Действие необратимо.
+    Свой набор удаляет владелец; администратор может удалить любой видимый ему набор — в том
+    числе тот, чья запись в списке файлов потерялась. Набор, открытый по подписке, отклоняется
+    у обычного пользователя (403), а если по набору идёт проверка тональности — 409, иначе
+    удаление вырвало бы данные из-под работающего прохода. Действие необратимо.
     """
     key, name = _guard_dataset(user, spec)
     uid = str(getattr(user, "id", ""))
-    folder, file_name = _own_dataset_file(uid, name)
-    if not folder:
+    admin = bool(getattr(user, "is_superuser", False))
+    owner_uid, folder, file_name = _dataset_file_owner(uid, name, admin)
+    if not folder and not admin:
         raise HTTPException(status_code=403,
                             detail="Этот набор доступен вам по подписке — удалить его может только владелец")
     if _dataset_jobs_active(name):
@@ -2337,29 +2395,34 @@ def delete_dataset(spec: str, user: Any = Depends(current_user_any)):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500,
                             detail="Не удалось удалить сообщения набора: %s" % str(exc)[:200])
-    # Запись в списке файлов пользователя: файл убираем, пустую папку не оставляем.
-    try:
-        rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-        raw = rds.hget(uid, "json_files_directory")
-        data = json.loads(raw) if raw else {}
-        if isinstance(data, dict) and folder in data:
-            files = [f for f in (data.get(folder) or []) if str(f) != file_name]
-            if files:
-                data[folder] = files
-            else:
-                data.pop(folder, None)
-            rds.hset(uid, "json_files_directory", json.dumps(data))
-    except Exception:
-        pass
+    # Запись в списке файлов владельца: файл убираем, пустую папку не оставляем.
+    if folder:
+        try:
+            rds = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+            raw = rds.hget(owner_uid, "json_files_directory")
+            data = json.loads(raw) if raw else {}
+            if isinstance(data, dict) and folder in data:
+                files = [f for f in (data.get(folder) or []) if str(f) != file_name]
+                if files:
+                    data[folder] = files
+                else:
+                    data.pop(folder, None)
+                rds.hset(owner_uid, "json_files_directory", json.dumps(data))
+        except Exception:
+            pass
     # Файл на диске — если он есть (наборы из Brand Analytics хранятся только в Elasticsearch).
     try:
-        path = os.path.join(DATA_DIR, uid, "json_files_directory", folder, file_name)
-        if os.path.isfile(path):
+        path = os.path.join(DATA_DIR, owner_uid or uid, "json_files_directory", folder, file_name)
+        if folder and os.path.isfile(path):
             os.remove(path)
     except Exception:
         pass
     return {"deleted": True, "name": name, "label": _pretty_label(name), "docs": docs,
-            "messages_deleted": removed, "folder": folder, "index_key": key}
+            "messages_deleted": removed, "folder": folder, "index_key": key,
+            "owner_user_id": owner_uid or uid,
+            "orphan": not folder,
+            "note": ("Запись в списке файлов не найдена — удалены только данные набора."
+                     if not folder else "")}
 
 
 @router.get("/jobs")
