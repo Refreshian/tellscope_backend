@@ -3455,18 +3455,20 @@ def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]
         rows.sort(key=lambda row: (-row["mentions"], -row["negative_share"]))
         author_rows.append({"object": name, "authors": rows[:8]})
 
-    # Полезнее показать разнообразие направлений, а не 25 однотипных «нейтрал → позитив».
+    # Всего расхождений считаем ДО отбора примеров: иначе сводка показывала бы размер
+    # списка примеров, а не реальное число случаев.
+    divergence_total = len(divergence)
+    # Для примеров полезнее разнообразие направлений, а не 25 однотипных «нейтрал → позитив».
     seen_pairs = set()
-    ordered: List[Dict[str, Any]] = []
+    examples_pool: List[Dict[str, Any]] = []
     for item in sorted(divergence, key=lambda row: (-float(row.get("confidence") or 0),
                                                     -len(row.get("text") or ""))):
         pair = (item.get("object"), item.get("message_tone_int"), item.get("object_tone_int"))
-        if pair in seen_pairs and len(ordered) < MAX_EXAMPLES - 6:
+        if pair in seen_pairs and len(examples_pool) < MAX_EXAMPLES - 6:
             continue
         seen_pairs.add(pair)
-        ordered.append(item)
-    divergence = ordered
-    examples = divergence[:MAX_EXAMPLES]
+        examples_pool.append(item)
+    examples = examples_pool[:MAX_EXAMPLES]
 
     pass2_share = (sum(1 for rec in all_recs if rec.get("tone_aspect_by") == "32b")
                    / float(len(all_recs)) if all_recs else 0.0)
@@ -3482,7 +3484,8 @@ def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]
         "unresolved": unresolved,
         "messages_with_mention": messages_with_mention,
         "objects": object_rows,
-        "divergence_total": len(divergence),
+        "divergence_total": divergence_total,
+        "divergence_examples": len(examples),
         "source_message_mismatch": source_mismatch,
         "pass2_share": round(pass2_share, 4),
         "pass2_decided": int(pass2.get("decided") or 0),
@@ -3583,8 +3586,9 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
             rows_last = [row for row in month_rows if row["month"] == last]
             if rows_last:
                 top = max(rows_last, key=lambda row: row["mentions"])
-                out.append("Свежий срез — %s: у «%s» %s упоминаний, негатив %s."
-                           % (last, top["object"], top["mentions"],
+                out.append("Свежий срез — %s: у «%s» %s, негатив %s."
+                           % (last, top["object"],
+                              _plural(int(top["mentions"]), "упоминание", "упоминания", "упоминаний"),
                               _pct(float(top["negative_share"]))))
     if by_hubs:
         worst_hub = None
@@ -3596,9 +3600,9 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
             out.append("Худшая площадка — %s по объекту «%s»: негатив %s при %s."
                        % (worst_hub[1], worst_hub[0], _pct(float(worst_hub[2]["negative_share"])),
                           _plural(int(worst_hub[2]["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
-    out.append("Спорных случаев, которые решала 32B, — %s от проверенного (%s сообщений)."
+    out.append("Спорных случаев, которые решала 32B, — %s от проверенного (%s)."
                % (_pct(float(summary.get("pass2_share") or 0.0)),
-                  int(summary.get("pass2_decided") or 0)))
+                  _plural(int(summary.get("pass2_decided") or 0), "сообщение", "сообщения", "сообщений")))
     if not summary.get("pass2_available", True):
         out.append("ВНИМАНИЕ: 32B была недоступна — спорные случаи остались решением быстрой "
                    "модели, окончательными их считать нельзя.")
