@@ -112,11 +112,13 @@ MAX_EXAMPLES = 25
 # По умолчанию разрешаем «полностью» до 300 000 сообщений: дальше нужен срез по датам.
 MAX_FULL_DOCS = int(os.environ.get("TELLSCOPE_TONE_FULL_LIMIT") or 300000)
 
-# Перепроверка на 32B в разы медленнее первого прохода, поэтому её доля ограничена: если
-# спорных больше, чем PASS2_MAX_SHARE от объёма задачи, перепроверяем самые неуверенные
-# (сортировка по возрастанию уверенности), остальные остаются с решением 4B. Факт и размер
-# лимита попадают в отчёт (pass2_capped / pass2_max_share), молча ничего не отбрасывается.
-PASS2_MAX_SHARE = float(os.environ.get("TELLSCOPE_TONE_PASS2_MAX_SHARE") or 0.5)
+# Перепроверка на 32B в разы медленнее первого прохода, но по умолчанию её доля НЕ ограничена:
+# все спорные случаи уходят на уточняющую проверку (PASS2_MAX_SHARE = 1.0). Для очень большого
+# датасета долю можно ограничить переменной окружения TELLSCOPE_TONE_PASS2_MAX_SHARE (например
+# 0.5): тогда перепроверяем самые неуверенные (сортировка по возрастанию уверенности), остальные
+# остаются с решением 4B, а факт и размер лимита попадают в отчёт (pass2_capped / pass2_max_share).
+# Молча ничего не отбрасывается ни в одном из режимов.
+PASS2_MAX_SHARE = float(os.environ.get("TELLSCOPE_TONE_PASS2_MAX_SHARE") or 1.0)
 
 # Жёсткий предел на один вызов модели: зависший запрос не должен держать пачку и всю
 # страницу минутами. По таймауту пачка повторяется, затем делится пополам.
@@ -1240,9 +1242,9 @@ async def _run_job(jid: str) -> None:
         disputed = [rec for rec in results.values() if _needs_pass2(rec, threshold)]
         pass2 = {"available": True, "skipped": False, "reason": "", "targets": len(disputed),
                  "decided": 0, "failed": 0}
-        # 32B в разы медленнее 4B: если спорных слишком много, перепроверка съест всё время.
-        # Ограничиваем её долю и перепроверяем самые неуверенные; остальные честно остаются
-        # с решением 4B, а факт и размер лимита видны в отчёте (pass2_capped).
+        # 32B в разы медленнее 4B: по умолчанию перепроверяем все спорные (PASS2_MAX_SHARE = 1.0).
+        # Если долю ограничили вручную, перепроверяем самые неуверенные, а остальные честно
+        # остаются с решением 4B; факт и размер лимита видны в отчёте (pass2_capped).
         disputed_total = len(disputed)
         pass2_limit = int(max(1, total) * PASS2_MAX_SHARE)
         pass2_capped = 0
@@ -1258,6 +1260,9 @@ async def _run_job(jid: str) -> None:
         pass2["capped"] = pass2_capped
         pass2["max_share"] = PASS2_MAX_SHARE
         pass2["share"] = round(disputed_total / float(max(1, total)), 4)
+        if PASS2_MAX_SHARE >= 1.0 and disputed_total:
+            _log_line("[%s] доля уточняющей проверки не ограничена — уточняем все спорные (%d)"
+                      % (jid, disputed_total))
         stopped = _cancelled(jid)
         if not stopped and disputed:
             from mlops.lock import generate_cfg
@@ -3178,7 +3183,8 @@ async def _run_aspect_job(jid: str) -> None:
         pass2 = {"available": True, "skipped": False, "reason": "", "targets": len(disputed),
                  "decided": 0, "failed": 0}
         disputed_total = len(disputed)
-        # Тот же лимит доли второго прохода, что и в обычном режиме: 32B в разы медленнее.
+        # Тот же лимит доли, что и в обычном режиме: 32B в разы медленнее, но по умолчанию
+        # доля не ограничена и уточняются все спорные случаи.
         pass2_limit = int(max(1, total) * PASS2_MAX_SHARE)
         pass2_capped = 0
         if disputed_total > pass2_limit:
@@ -3193,6 +3199,9 @@ async def _run_aspect_job(jid: str) -> None:
         pass2["capped"] = pass2_capped
         pass2["max_share"] = PASS2_MAX_SHARE
         pass2["share"] = round(disputed_total / float(max(1, total)), 4)
+        if PASS2_MAX_SHARE >= 1.0 and disputed_total:
+            _log_line("[%s] доля уточняющей проверки не ограничена — уточняем все спорные (%d)"
+                      % (jid, disputed_total))
         if not _cancelled(jid) and disputed:
             from mlops.lock import generate_cfg
 
