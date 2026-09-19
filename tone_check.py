@@ -50,6 +50,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -1067,7 +1068,7 @@ async def _run_job(jid: str) -> None:
     try:
         _set(jid, status="running", stage="preparing", stage_label=STAGE_LABELS["preparing"],
              started=job.get("started") or datetime.now().isoformat(timespec="seconds"),
-             writing=False, progress_schema=PROGRESS_SCHEMA,
+             writing=False, progress_schema=PROGRESS_SCHEMA, worker_pid=os.getpid(),
              log="старт разметки: %s (%s)" % (name, job.get("mode")))
         _ensure_mapping(name)
         results = _journal_load(jid)
@@ -1299,21 +1300,80 @@ async def _run_job(jid: str) -> None:
              elapsed_sec=report["elapsed_sec"], rate_per_min=rate,
              agreement=report["summary"]["agreement"], kappa=report["summary"]["kappa"],
              pass2_share=report["summary"]["pass2_share"],
-             report_files=files,
+             report_files=files, worker_pid=0,
              log="готово: размечено %d, согласие %.1f%%, каппа %.3f"
                  % (len(results), 100 * report["summary"]["agreement"], report["summary"]["kappa"]))
     except Exception as exc:  # noqa: BLE001
         _log_line("[%s] ошибка: %s" % (jid, str(exc)[:300]), level="error")
         _set(jid, status="error", stage="error", stage_label=STAGE_LABELS["error"],
-             error=str(exc)[:500], finished=datetime.now().isoformat(timespec="seconds"))
+             error=str(exc)[:500], worker_pid=0,
+             finished=datetime.now().isoformat(timespec="seconds"))
+
+
+_ACTIVE_WORKERS: Dict[str, threading.Thread] = {}
+_workers_lock = threading.Lock()
+
+
+def _worker_alive(jid: str) -> bool:
+    """Работает ли воркер этой задачи прямо в текущем процессе."""
+    with _workers_lock:
+        thread = _ACTIVE_WORKERS.get(jid)
+    return bool(thread and thread.is_alive())
+
+
+def _owner_process_alive(job: Dict[str, Any]) -> bool:
+    """Жив ли процесс, который ведёт задачу (pid записан в файле задачи).
+
+    Статус ``running`` сам по себе не значит «прервана»: он значит, что задачу кто-то
+    ведёт прямо сейчас. Возобновлять её можно только если владелец действительно умер.
+    """
+    try:
+        pid = int(job.get("worker_pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return _worker_alive(str(job.get("id") or ""))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # Процесса нет — задача действительно прервана, её можно поднимать.
+        return False
+    except PermissionError:
+        # Процесс есть, но он чужой (например, root): сигнал не пошёл, значит владелец жив.
+        return True
+    except OSError:
+        # Неизвестная ошибка: безопаснее счесть владельца живым, чем запустить второй проход.
+        return True
+    return True
 
 
 def _start_job(jid: str) -> None:
-    threading.Thread(target=lambda: asyncio.run(_run_job(jid)), daemon=True,
-                     name="tone-check-%s" % jid).start()
+    """Запускает воркер задачи ровно один раз.
+
+    Повторный запуск для уже работающей задачи запрещён: иначе на одну задачу идут два
+    прохода сразу — двойные вызовы моделей и счётчики прогресса, «прыгающие» между
+    объёмами (это и выглядело как сломанный прогресс).
+    """
+    with _workers_lock:
+        thread = _ACTIVE_WORKERS.get(jid)
+        if thread and thread.is_alive():
+            _log_line("[%s] воркер уже работает — повторный запуск пропущен" % jid, level="warning")
+            return
+        thread = threading.Thread(target=lambda: asyncio.run(_run_job(jid)), daemon=True,
+                                  name="tone-check-%s" % jid)
+        _ACTIVE_WORKERS[jid] = thread
+    thread.start()
 
 
 def _resume_job(jid: str) -> None:
+    job = _job_load(jid) or {}
+    if _worker_alive(jid) or _owner_process_alive(job):
+        # Возобновление «по статусу running» без этой проверки поднимало второй проход на ту
+        # же задачу — например, когда модуль импортировал посторонний процесс.
+        _log_line("[%s] возобновление не нужно: задачу ведёт живой воркер" % jid, level="warning")
+        return
     _set(jid, status="running", stage="preparing", stage_label="продолжаю после перезапуска",
          interrupted=False, cancel=False, log="возобновляю после перезапуска сервиса")
     try:
@@ -1367,8 +1427,22 @@ def _delayed_recovery() -> None:
         _log_line("восстановление задач не запустилось: %s" % str(exc)[:200], level="error")
 
 
+def _looks_like_server() -> bool:
+    """Похоже ли, что модуль импортирован самим веб-приложением, а не посторонним скриптом.
+
+    Импорт модуля не должен поднимать фоновые проходы: раньше автовозобновление стартовало
+    при любом импорте, и служебный скрипт поднимал вторую копию уже идущей задачи.
+    """
+    argv = " ".join(sys.argv).lower()
+    return any(marker in argv for marker in ("uvicorn", "gunicorn", "hypercorn", "main:app", "main.py"))
+
+
 if str(os.environ.get("TELLSCOPE_TONE_NO_AUTORESUME") or "") != "1":
-    threading.Thread(target=_delayed_recovery, daemon=True, name="tone-check-autoresume").start()
+    if _looks_like_server():
+        threading.Thread(target=_delayed_recovery, daemon=True, name="tone-check-autoresume").start()
+    else:
+        _log_line("автовозобновление не запускаю: импорт не от веб-приложения (%s)"
+                  % " ".join(sys.argv)[:120])
 
 
 # --------------------------------------------------------------------------- #
