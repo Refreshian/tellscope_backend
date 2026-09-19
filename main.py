@@ -11789,6 +11789,8 @@ from reports_api import router as reports_api_router
 app.include_router(reports_api_router)
 from file_origin_api import router as file_origin_router
 app.include_router(file_origin_router)
+from tone_check import router as tone_check_router
+app.include_router(tone_check_router)
 
 @app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
 async def graph_cluster_summary(request: Request, user: User = Depends(current_user_any)):
