@@ -2259,6 +2259,9 @@ def datasets(user: Any = Depends(current_user_any)):
             ], "minimum_should_match": 1}}).get("count") or 0)
         except Exception:
             labeled = 0
+        # Режим тональности набора: по нему видно, обновлена ли тональность и применяли ли её
+        # к аналитике. Нужно, чтобы списки тем показывали это без захода в блок проверки.
+        mode_state = _tone_mode_load(name)
         items.append({
             "index": reverse.get(name),
             "name": name,
@@ -2266,6 +2269,9 @@ def datasets(user: Any = Depends(current_user_any)):
             "docs": counts.get(name, 0),
             "labeled": labeled,
             "folder": folders.get(name.lower()) or "",
+            "tone_mode": str(mode_state.get("mode") or "source"),
+            "tone_applied": int(mode_state.get("applied") or 0),
+            "tone_status": str(mode_state.get("status") or "idle"),
         })
     items.sort(key=lambda item: item["docs"])
     return {"datasets": items}
