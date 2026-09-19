@@ -539,6 +539,36 @@ def _cancelled(jid: str) -> bool:
         return False
 
 
+async def _stop_pending(jid: str, pending: Any) -> int:
+    """Немедленная остановка: перестаём ждать ответы по уже отправленным пачкам.
+
+    Без этого команда «Отменить» вступала в силу только после того, как модель ответит по
+    всей странице (до 200 сообщений в параллельном «веере») — на крупном датасете это больше
+    минуты молчания в интерфейсе. Здесь незавершённые запросы снимаются сразу, а уже
+    полученные ответы записываются обычным порядком.
+    """
+    rest = list(pending)
+    if not rest:
+        return 0
+    for task in rest:
+        task.cancel()
+    await asyncio.gather(*rest, return_exceptions=True)
+    _log_line("[%s] остановка: прекращаю ждать ответы по %d пачкам" % (jid, len(rest)))
+    return len(rest)
+
+
+def _cancelled_percent(jid: str, done: int, total: int) -> int:
+    """Процент остановленной задачи: сколько работы реально сделано.
+
+    Раньше здесь брался процент, сохранённый перед сборкой отчёта, — и остановленная задача
+    показывала «96 %», хотя размечено было 200 сообщений из 1500.
+    """
+    probe = dict(_job_load(jid) or {})
+    probe.update({"stage": "pass1", "status": "running", "processed": int(done),
+                  "total": max(1, int(total)), "pass2_total": 0, "pass2_done": 0})
+    return int(max(0, min(99, _percent(probe))))
+
+
 # --------------------------------------------------------------------------- #
 # Датасеты и права
 # --------------------------------------------------------------------------- #
@@ -1211,6 +1241,10 @@ async def _run_job(jid: str) -> None:
                 # Прогресс обновляем по готовым пачкам, а не только в конце страницы:
                 # иначе на длинном датасете полоса стоит по 20 секунд.
                 _set(jid, processed=len(results), total=total)
+                if pending and _cancelled(jid):
+                    await _stop_pending(jid, pending)
+                    pending = set()
+                    break
             fresh = len([rec for rec in records if rec["_id"] not in seen_before])
             if not fresh:
                 stall += 1
@@ -1339,12 +1373,18 @@ async def _run_job(jid: str) -> None:
                             _set(jid, stage="pass2", stage_label=STAGE_LABELS["pass2"],
                                  pass2_done=done + seen, pass2_total=len(disputed),
                                  processed=len(results), total=total)
+                        if pending and _cancelled(jid):
+                            await _stop_pending(jid, pending)
+                            pending = set()
+                            break
                     if changed:
                         _set(jid, writing=True)
                         written, werrors = _bulk_write(job, changed)
                         job["errors"] = int(job.get("errors") or 0) + werrors
                         job["bulk_written"] = int(job.get("bulk_written") or 0) + written
-                    done += len(window)
+                    # Остановка не должна завышать счётчик: считаем только те пачки, ответы
+                    # по которым реально дождались.
+                    done += seen
                     _set(jid, writing=False, stage="pass2", stage_label=STAGE_LABELS["pass2"],
                          pass2_done=done, pass2_total=len(disputed),
                          processed=len(results), total=total, errors=job.get("errors") or 0,
@@ -1369,8 +1409,7 @@ async def _run_job(jid: str) -> None:
              stage="cancelled" if cancelled else "done",
              stage_label=STAGE_LABELS["cancelled" if cancelled else "done"],
              processed=len(results), total=total,
-             percent=(int((_job_load(jid) or {}).get("percent_before_report")
-                          or (_job_load(jid) or {}).get("percent") or 0) if cancelled else 100),
+             percent=(_cancelled_percent(jid, len(results), total) if cancelled else 100),
              finished=datetime.now().isoformat(timespec="seconds"),
              elapsed_sec=report["elapsed_sec"], rate_per_min=rate,
              agreement=report["summary"]["agreement"], kappa=report["summary"]["kappa"],
@@ -2093,8 +2132,12 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
     writing = bool(job.get("writing"))
     stalled = bool(running and stale is not None and stale > STALE_AFTER)
     note = ""
+    cancelling = bool(running and job.get("cancel"))
     if running:
-        if stalled:
+        if cancelling:
+            note = ("останавливаю: завершаю текущую пачку сообщений и сохраняю уже "
+                    "размеченное — обычно это занимает меньше минуты")
+        elif stalled:
             note = "нет новых результатов %s — жду ответа модели" % _human_sec(stale)
         elif prog["stage"] == "pass2":
             # Второй проход на 32B заведомо медленнее: подпись объясняет паузу счётчика.
@@ -2136,6 +2179,7 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
         "stale_sec": int(stale) if stale is not None else None,
         "stalled": stalled,
         "writing": writing,
+        "cancelling": cancelling,
         "note": note,
         "rate_per_min": rate or float(job.get("rate_per_min") or 0),
         "rate_messages_per_min": rate or float(job.get("rate_per_min") or 0),
@@ -3150,6 +3194,10 @@ async def _run_aspect_job(jid: str) -> None:
                     records.extend(recs)
                     _journal_append(jid, recs)
                 _set(jid, processed=len(results), total=total)
+                if pending and _cancelled(jid):
+                    await _stop_pending(jid, pending)
+                    pending = set()
+                    break
             fresh = len([rec for rec in records if rec["_id"] not in seen_before])
             if not fresh:
                 stall += 1
@@ -3267,12 +3315,18 @@ async def _run_aspect_job(jid: str) -> None:
                             _set(jid, stage="pass2", stage_label="уточняю спорные случаи",
                                  pass2_done=done + seen, pass2_total=len(disputed),
                                  processed=len(results), total=total)
+                        if pending and _cancelled(jid):
+                            await _stop_pending(jid, pending)
+                            pending = set()
+                            break
                     if changed:
                         _set(jid, writing=True, stage="writing", stage_label=STAGE_LABELS["writing"])
                         written, werrors = _bulk_write_aspect(job, changed)
                         job["errors"] = int(job.get("errors") or 0) + werrors
                         job["bulk_written"] = int(job.get("bulk_written") or 0) + written
-                    done += len(window)
+                    # Остановка не должна завышать счётчик: считаем только те пачки, ответы
+                    # по которым реально дождались.
+                    done += seen
                     _set(jid, writing=False, stage="pass2", stage_label="уточняю спорные случаи",
                          pass2_done=done, pass2_total=len(disputed),
                          processed=len(results), total=total, errors=job.get("errors") or 0,
@@ -3299,8 +3353,7 @@ async def _run_aspect_job(jid: str) -> None:
              stage="cancelled" if cancelled else "done", worker_pid=0, writing=False,
              stage_label=STAGE_LABELS["cancelled" if cancelled else "done"],
              processed=len(results), total=total,
-             percent=(int((_job_load(jid) or {}).get("percent_before_report")
-                          or (_job_load(jid) or {}).get("percent") or 0) if cancelled else 100),
+             percent=(_cancelled_percent(jid, len(results), total) if cancelled else 100),
              finished=datetime.now().isoformat(timespec="seconds"),
              elapsed_sec=report["elapsed_sec"], rate_per_min=rate,
              pass2_share=report["summary"]["pass2_share"], report_files=files,
