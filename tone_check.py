@@ -83,6 +83,15 @@ TONE_TO_INT = {"negative": -1, "neutral": 0, "positive": 1}
 TONE_RU = {-1: "негатив", 0: "нейтрал", 1: "позитив"}
 CLASSES = (-1, 0, 1)
 
+# Человеческие подписи происхождения вердикта — только для отчёта, который читает
+# пользователь. В полях Elasticsearch (``tone_llm_by`` / ``tone_aspect_by``) остаются
+# технические значения «4b»/«32b»/«none».
+BY_RU = {
+    "4b": "первичная автоматическая разметка",
+    "32b": "уточняющая проверка",
+    "none": "без вердикта автоматической разметки",
+}
+
 # Модели: быстрая 4B (порт 8001, профиль texts_bulk) и общая 32B (порт 8000).
 DEFAULT_BATCH = 20
 DEFAULT_PARALLEL = 12
@@ -131,14 +140,14 @@ PROGRESS_SCHEMA = 2
 TOTAL_FIELDS_LIMIT = int(os.environ.get("TELLSCOPE_TONE_FIELD_LIMIT") or 4000)
 
 STAGE_LABELS = {
-    "preparing": "подготовка",
-    "pass1": "размечаю выборку",
-    "writing": "пишу результаты",
-    "pass2": "перепроверяю спорные на 32B",
+    "preparing": "читаю сообщения",
+    "pass1": "определяю тональность",
+    "writing": "сохраняю результат",
+    "pass2": "перепроверяю спорные случаи",
     "report": "собираю отчёт",
     "done": "готово",
     "cancelled": "остановлено",
-    "error": "ошибка",
+    "error": "не получилось",
 }
 
 LOG_TAIL = 60
@@ -622,13 +631,13 @@ def _resolve_dataset(spec: Any) -> Tuple[Optional[int], str]:
     """``index`` — числовой ключ из ``data/indexes.pkl`` либо имя индекса ES."""
     text = str(spec or "").strip()
     if not text:
-        raise HTTPException(status_code=400, detail="Не указан датасет (index)")
+        raise HTTPException(status_code=400, detail="Не выбран набор данных")
     mapping = _index_map()
     if re.fullmatch(r"\d+", text):
         key = int(text)
         name = mapping.get(key)
         if not name:
-            raise HTTPException(status_code=404, detail="Датасет не найден: ключ %s" % key)
+            raise HTTPException(status_code=404, detail="Набор данных не найден")
         return key, _norm_name(name)
     low = _norm_name(text).lower()
     for key, name in mapping.items():
@@ -636,7 +645,7 @@ def _resolve_dataset(spec: Any) -> Tuple[Optional[int], str]:
             return key, _norm_name(name)
     if _es().indices.exists(index=text):
         return None, text
-    raise HTTPException(status_code=404, detail="Датасет не найден: %s" % text)
+    raise HTTPException(status_code=404, detail="Набор данных не найден")
 
 
 def _guard_dataset(user: Any, spec: Any) -> Tuple[Optional[int], str]:
@@ -646,7 +655,7 @@ def _guard_dataset(user: Any, spec: Any) -> Tuple[Optional[int], str]:
         return key, name
     stem = _norm_name(name).lower()
     if stem not in _allowed_stems(getattr(user, "id", None)):
-        raise HTTPException(status_code=403, detail="Нет доступа к этому датасету")
+        raise HTTPException(status_code=403, detail="Нет доступа к этому набору данных")
     return key, name
 
 
@@ -1038,7 +1047,7 @@ def _records_from(parsed: Dict[str, Dict[str, Any]], docs: List[Dict[str, Any]],
                 "tone_llm": guess if guess in CLASSES else 0,
                 "tone_llm_conf": 0.0,
                 "tone_llm_by": "none",
-                "tone_llm_reason": "локальная модель не вернула вердикт",
+                "tone_llm_reason": "автоматическая разметка не дала вердикт",
             })
         out.append(base)
     return out
@@ -1141,9 +1150,9 @@ async def _run_job(jid: str) -> None:
             total = min(int(job.get("sample_size") or 1000), total)
         elif total > MAX_FULL_DOCS:
             raise RuntimeError(
-                "Полная разметка этого датасета — %d сообщений, это больше лимита %d. "
-                "Сузьте период (min_date/max_date) или уменьшите лимит переменной "
-                "TELLSCOPE_TONE_FULL_LIMIT." % (total, MAX_FULL_DOCS))
+                "Полная проверка — это %d сообщений, а за один раз мы проверяем до %d. "
+                "Сузьте период или добавьте фильтры (площадка, объект)."
+                % (total, MAX_FULL_DOCS))
         _set(jid, total=total, processed=len(results), errors=0)
         _log_line("[%s] к разметке %d сообщений, уже размечено %d" % (jid, total, len(results)))
 
@@ -1257,7 +1266,7 @@ async def _run_job(jid: str) -> None:
             base_url = str(gen.get("base_url") or "")
             if not await _model_up(base_url):
                 pass2.update({"available": False, "skipped": True,
-                              "reason": "модель перепроверки недоступна (%s)" % (base_url or "не задана")})
+                              "reason": "сервис уточняющей проверки был недоступен"})
                 _log_line("[%s] 32B недоступна: перепроверка не выполнена" % jid, level="warning")
             else:
                 _set(jid, stage="pass2", stage_label=STAGE_LABELS["pass2"],
@@ -1647,7 +1656,7 @@ def build_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]],
             "source_int": int(rec["toneMark"]),
             "model_int": int(rec["tone_llm"]),
             "confidence": float(rec.get("tone_llm_conf") or 0.0),
-            "decided_by": rec.get("tone_llm_by") or "",
+            "decided_by": BY_RU.get(rec.get("tone_llm_by") or "", rec.get("tone_llm_by") or ""),
             "reason": rec.get("tone_llm_reason") or "—",
             "chars": int(rec.get("chars") or len(text)),
         })
@@ -1696,13 +1705,13 @@ def build_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]],
         "index_name": job.get("index_name"),
         "period": _period_label(job),
         "method": {
-            "pass1_model": "qwen3-4b-fast (vLLM, 127.0.0.1:8001, профиль texts_bulk)",
-            "pass2_model": "Qwen/Qwen3-32B-FP8 (vLLM, 127.0.0.1:8000)",
+            "pass1_model": "первичная автоматическая разметка",
+            "pass2_model": "уточняющая проверка",
             "batch_size": int(job.get("batch_size") or DEFAULT_BATCH),
             "parallel": int(job.get("parallel") or DEFAULT_PARALLEL),
             "conf_threshold": float(job.get("conf_threshold") or DEFAULT_CONF),
             "fields": list(TONE_FIELDS),
-            "source_field": "toneMark (не изменяется)",
+            "source_field": "разметка источника (не изменяется)",
             "pass2": dict(pass2),
         },
         "summary": summary,
@@ -1721,7 +1730,7 @@ def build_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]],
 def _period_label(job: Dict[str, Any]) -> str:
     lo, hi = job.get("min_date"), job.get("max_date")
     if not lo and not hi:
-        return "весь период датасета"
+        return "весь период"
     fmt = lambda value: datetime.fromtimestamp(float(value)).strftime("%d.%m.%Y") if value else "…"
     return "%s — %s" % (fmt(lo), fmt(hi))
 
@@ -1735,7 +1744,7 @@ def _conclusions(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
     kappa = float(summary.get("kappa") or 0.0)
     level = ("высокое" if agreement >= 0.85 else "среднее" if agreement >= 0.7 else "низкое")
     out.append(
-        "Проверено %s: модель совпала с разметкой источника в %s случаев, "
+        "Проверено %s: наша оценка совпала с разметкой источника в %s случаев, "
         "каппа Коэна %.2f — согласие %s (каппа выше 0,6 считается хорошей, ниже 0,4 — слабой)."
         % (_plural(int(summary.get("evaluated") or 0), "сообщение", "сообщения", "сообщений"),
            _pct(agreement), kappa, level))
@@ -1763,19 +1772,19 @@ def _conclusions(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
             if count and (top_pair is None or count > top_pair[2]):
                 top_pair = (a, b, count)
     if top_pair:
-        out.append("Самая частая путаница: модель ставит «%s» там, где источник поставил «%s» — %s."
+        out.append("Самая частая путаница: наша оценка ставит «%s» там, где источник поставил «%s» — %s."
                    % (TONE_RU[top_pair[1]], TONE_RU[top_pair[0]],
                       _plural(top_pair[2], "случай", "случая", "случаев")))
 
     diff = int(summary.get("model_more_negative") or 0) - int(summary.get("model_more_positive") or 0)
     if abs(diff) >= max(3, int(0.01 * max(1, summary.get("evaluated") or 1))):
         if diff > 0:
-            out.append("Модель строже источника: она видит негатив там, где источник поставил более "
+            out.append("Наша оценка строже источника: негатив там, где источник поставил более "
                        "мягкую оценку (%s против %s) — источник часть недовольства относит к нейтрали."
                        % (_plural(int(summary.get("model_more_negative") or 0), "случай", "случая", "случаев"),
                           _plural(int(summary.get("model_more_positive") or 0), "обратного", "обратных", "обратных")))
         else:
-            out.append("Модель мягче источника: она ставит нейтраль или позитив там, где источник "
+            out.append("Наша оценка мягче источника: нейтрал или позитив там, где источник "
                        "видит негатив (%s против %s)."
                        % (_plural(int(summary.get("model_more_positive") or 0), "случай", "случая", "случаев"),
                           _plural(int(summary.get("model_more_negative") or 0), "обратного", "обратных", "обратных")))
@@ -1786,21 +1795,22 @@ def _conclusions(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
                    % (bad["key"], bad["mismatch"], bad["total"], _pct(float(bad["share"]))))
 
     share = float(summary.get("pass2_share") or 0.0)
-    out.append("Спорных случаев, которые решала 32B, — %s от выборки (%d сообщений); "
+    out.append("Спорных случаев, прошедших уточняющую проверку, — %s от выборки (%d сообщений); "
                "по ним решение окончательное." % (_pct(share), int(summary.get("pass2_decided") or 0)))
     if not summary.get("pass2_available", True):
-        out.append("ВНИМАНИЕ: модель перепроверки была недоступна — спорные случаи остались "
-                   "решением быстрой модели, окончательными их считать нельзя.")
+        out.append("ВНИМАНИЕ: уточняющая проверка была недоступна — спорные случаи остались "
+                   "результатом первичной автоматической разметки, окончательными их считать нельзя.")
     capped = int(summary.get("pass2_capped") or 0)
     if capped:
-        out.append("Спорных оказалось %d — больше лимита %.0f%% от выборки, поэтому на 32B ушли "
-                   "только %d самых неуверенных сообщений; у остальных %d осталось решение 4B."
+        out.append("Спорных оказалось %d — больше лимита %.0f%% от выборки, поэтому уточняющую "
+                   "проверку прошли только %d самых неуверенных сообщений; у остальных %d "
+                   "осталась первичная автоматическая разметка."
                    % (int(summary.get("pass2_candidates") or 0),
                       float(summary.get("pass2_max_share") or PASS2_MAX_SHARE) * 100,
                       int(summary.get("pass2_decided") or 0), capped))
     if int(summary.get("unresolved") or 0):
-        out.append("Для %d сообщений локальная модель не вернула вердикт: они помечены "
-                   "tone_llm_by=none и исключены из расчёта согласия, а не выданы за решение модели."
+        out.append("Для %d сообщений автоматическая разметка не дала вердикт: они исключены "
+                   "из расчёта согласия, а не выданы за нашу оценку."
                    % int(summary["unresolved"]))
     return out[:7]
 
@@ -1815,16 +1825,17 @@ def _recommendation(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
             weak = row
             break
     if agreement >= 0.85 and kappa >= 0.6:
-        text = ("Источнику можно доверять: разметка источника и наша модель совпадают почти всегда "
+        text = ("Источнику можно доверять: разметка источника и наша оценка совпадают почти всегда "
                 "(согласие %s, каппа %.2f). Для отчётности можно опираться на поле источника."
                 % (_pct(agreement), kappa))
         if weak:
             text += (" Оговорка: на текстах %s расхождений заметно больше (%s) — такой подпериод "
-                     "лучше считать по нашей разметке." % (weak["key"], _pct(float(weak["share"]))))
+                     "лучше считать по нашей оценке." % (weak["key"], _pct(float(weak["share"]))))
         return text
     if agreement >= 0.7:
         text = ("Источник годится для общих трендов, но не для точных цифр: согласие %s, каппа %.2f. "
-                "Для решений и публичных цифр считайте по нашей разметке (поля tone_llm*)."
+                "Для решений и публичных цифр считайте по нашим оценкам тональности "
+                "(отдельная колонка в данных)."
                 % (_pct(agreement), kappa))
         if weak:
             text += (" Основная слабость источника — %s: расхождения %s."
@@ -1833,8 +1844,9 @@ def _recommendation(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
             text += (" Хуже всего дела на площадке %s (%d расхождений из %d)."
                      % (by_hub[0]["key"], by_hub[0]["mismatch"], by_hub[0]["total"]))
         return text
-    text = ("Разметке источника доверять нельзя: согласие всего %s, каппа %.2f — источник и модель "
-            "расходятся слишком часто. Считайте по нашей разметке (tone_llm, tone_llm_conf, tone_llm_by)."
+    text = ("Разметке источника доверять нельзя: согласие всего %s, каппа %.2f — источник и наша "
+            "оценка расходятся слишком часто. Считайте по нашим оценкам тональности "
+            "(отдельная колонка в данных)."
             % (_pct(agreement), kappa))
     if weak:
         text += (" Главная причина — %s: там расхождения %s."
@@ -1849,7 +1861,7 @@ def _sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict[str, A
     """Разделы для платформенного сборщика DOCX/PDF."""
     summary = report["summary"]
     matrix = report["matrix"]
-    src_columns = ["Источник \\ модель"] + [TONE_RU[c] for c in CLASSES]
+    src_columns = ["Источник \\ наша оценка"] + [TONE_RU[c] for c in CLASSES]
     matrix_rows = []
     for a in CLASSES:
         row = [TONE_RU[a]]
@@ -1857,24 +1869,24 @@ def _sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict[str, A
             row.append(int((matrix.get(str(a)) or {}).get(str(b)) or 0))
         matrix_rows.append(row)
 
-    pass2_row = "перепроверка не выполнялась (%s)" % (pass2.get("reason") or "нет спорных случаев") \
+    pass2_row = "не выполнялась (%s)" % (pass2.get("reason") or "нет спорных случаев") \
         if not pass2.get("available", True) else "выполнена"
 
     sections: List[Dict[str, Any]] = []
     sections.append({
         "heading": "Как проверяли",
-        "text": ("Датасет: %s. Период: %s. Режим: %s. Проверено сообщений: %d.\n"
-                 "Сообщения размечала быстрая модель qwen3-4b-fast (vLLM, порт 8001) пачками по %d "
-                 "в строгий JSON; спорные случаи — там, где уверенность ниже %.2f или решение "
-                 "разошлось с полем источника toneMark — перепроверяла Qwen3-32B (порт 8000) и "
-                 "решала окончательно (%s).\n"
-                 "Наша разметка пишется в отдельные поля tone_llm, tone_llm_conf, tone_llm_by, "
-                 "tone_llm_reason; исходное toneMark не изменяется, существующая аналитика "
-                 "продолжает работать по нему."
+        "text": ("Набор данных: %s. Период: %s. Режим: %s. Проверено сообщений: %d.\n"
+                 "Сообщения размечают автоматически в два этапа: сначала идёт первичная "
+                 "автоматическая разметка всей выборки, затем спорные случаи перепроверяет более "
+                 "точная модель, и её решение окончательное. Спорным считается случай, где "
+                 "автоматическая оценка неуверенна (ниже %.2f) или расходится с разметкой источника.\n"
+                 "Уточняющая проверка: %s.\n"
+                 "Результаты проверки сохраняются отдельно от разметки источника: исходные данные "
+                 "не меняются, существующая аналитика продолжает работать по ним."
                  % (report.get("dataset") or "—", report.get("period") or "—",
                     "полная разметка" if summary.get("mode") == "full" else
                     "выборка %s сообщений" % (summary.get("sample_size") or "—"),
-                    summary.get("checked") or 0, report["method"]["batch_size"],
+                    summary.get("checked") or 0,
                     float(report["method"]["conf_threshold"]), pass2_row)),
         "tables": [{
             "title": "Ключевые цифры",
@@ -1882,48 +1894,48 @@ def _sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict[str, A
             "rows": [
                 ["Сообщений проверено", str(summary.get("checked") or 0)],
                 ["Учтено в сравнении с источником", str(summary.get("evaluated") or 0)],
-                ["Согласие модели с источником", _pct(float(summary.get("agreement") or 0.0))],
+                ["Согласие нашей оценки с источником", _pct(float(summary.get("agreement") or 0.0))],
                 ["Совпало", str(summary.get("matches") or 0)],
                 ["Расхождений", str(summary.get("mismatches") or 0)],
                 ["Каппа Коэна", "%.3f" % float(summary.get("kappa") or 0.0)],
-                ["Спорных случаев на 32B", _pct(float(summary.get("pass2_share") or 0.0))],
-                ["Решений 32B", str(summary.get("pass2_decided") or 0)],
-                ["Не разобрано моделью", str(summary.get("unresolved") or 0)],
-                ["Записано в Elasticsearch", str(summary.get("bulk_written") or 0)],
+                ["Спорных случаев (уточняющая проверка)", _pct(float(summary.get("pass2_share") or 0.0))],
+                ["Решений после уточняющей проверки", str(summary.get("pass2_decided") or 0)],
+                ["Без вердикта автоматической разметки", str(summary.get("unresolved") or 0)],
+                ["Сохранено оценок", str(summary.get("bulk_written") or 0)],
             ],
             "layout": "portrait",
         }],
     })
     sections.append({
-        "heading": "Матрица «источник → модель»",
-        "text": ("Строки — тональность источника (toneMark), столбцы — тональность нашей модели "
-                 "(tone_llm). Диагональ — совпадения."),
+        "heading": "Матрица «источник → наша оценка»",
+        "text": ("Строки — тональность источника, столбцы — наша оценка тональности. "
+                 "Диагональ — совпадения."),
         "tables": [{
-            "title": "Распределение «источник → модель»",
+            "title": "Распределение «источник → наша оценка»",
             "columns": src_columns,
             "rows": matrix_rows,
             "layout": "portrait",
         }, {
             "title": "Точность и полнота по классам (эталон — источник)",
-            "columns": ["Класс", "Точность", "Полнота", "F1", "В источнике", "Модель поставила"],
+            "columns": ["Класс", "Точность", "Полнота", "F1", "В источнике", "Наша оценка поставила"],
             "rows": [[row["label"], _num(row["precision"]), _num(row["recall"]), _num(row["f1"]),
                       row["support"], row["predicted"]] for row in report["per_class"]],
-            "note": "Точность — доля верных среди решений модели по классу, полнота — доля "
+            "note": "Точность — доля верных среди наших оценок по классу, полнота — доля "
                     "найденных сообщений этого класса источника.",
             "layout": "portrait",
         }],
     })
     sections.append({
         "heading": "Где расходимся: площадки и разделы",
-        "text": "Разбивка расхождений по площадкам, типам источников и разделам датасета.",
+        "text": "Разбивка расхождений по площадкам, типам источников и разделам набора данных.",
         "tables": [
             {"title": "Площадки", "columns": ["Площадка", "Сообщений", "Расхождений", "Доля"],
              "rows": [[row["key"], row["total"], row["mismatch"], _pct(float(row["share"]))]
                       for row in report["by_hub"]], "layout": "auto"},
-            {"title": "Тип источника (hubtype)", "columns": ["Тип", "Сообщений", "Расхождений", "Доля"],
+            {"title": "Тип источника", "columns": ["Тип", "Сообщений", "Расхождений", "Доля"],
              "rows": [[row["key"], row["total"], row["mismatch"], _pct(float(row["share"]))]
                       for row in report["by_section"]], "layout": "auto"},
-            {"title": "Раздел датасета (type)", "columns": ["Раздел", "Сообщений", "Расхождений", "Доля"],
+            {"title": "Раздел набора", "columns": ["Раздел", "Сообщений", "Расхождений", "Доля"],
              "rows": [[row["key"], row["total"], row["mismatch"], _pct(float(row["share"]))]
                       for row in report["by_type"]], "layout": "auto"},
         ],
@@ -1945,17 +1957,17 @@ def _sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict[str, A
     if examples:
         tables.append({
             "title": "Примеры расхождений (до %d)" % MAX_EXAMPLES,
-            "columns": ["Площадка", "Дата", "Источник → модель", "Цитата из сообщения",
-                        "Пояснение модели", "Ссылка"],
+            "columns": ["Площадка", "Дата", "Источник → наша оценка", "Цитата из сообщения",
+                        "Пояснение", "Ссылка"],
             "rows": [[item["hub"], item["date"],
                       "%s → %s" % (item["source"], item["model"]),
                       item["quote"], item["reason"], item["url"] or "—"] for item in examples],
-            "note": "Ссылки приведены текстом: в JSON-версии отчёта они кликабельны.",
+            "note": "Ссылки приведены текстом — их можно скопировать и открыть в браузере.",
             "layout": "landscape",
         })
     sections.append({
         "heading": "Примеры расхождений",
-        "text": "Показаны самые уверенные решения модели, разошедшиеся с источником: именно такие "
+        "text": "Показаны самые уверенные наши оценки, разошедшиеся с источником: именно такие "
                 "случаи чаще всего означают ошибку разметки источника.",
         "tables": tables,
     })
@@ -1984,7 +1996,7 @@ def _write_report_files(job: Dict[str, Any], report: Dict[str, Any]) -> Dict[str
     if not owner:
         return {}
     out: Dict[str, str] = {}
-    label = _safe_name(report.get("dataset") or job.get("index_name") or "датасет", 40)
+    label = _safe_name(report.get("dataset") or job.get("index_name") or "набор", 40)
     stamp = datetime.now().strftime("%Y-%m-%d %H-%M")
     mode = "полная" if (job.get("mode") == "full") else "выборка %s" % (job.get("sample_size") or "")
     title = "Проверка тональности: качество разметки источника"
@@ -1992,7 +2004,7 @@ def _write_report_files(job: Dict[str, Any], report: Dict[str, Any]) -> Dict[str
     meta = {
         "dataset_label": report.get("dataset") or "",
         "period": report.get("period") or "",
-        "author": "Tellscope, локальные модели vLLM",
+        "author": "Tellscope, автоматическая разметка",
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
     }
     sections = _sections(report, (report.get("method") or {}).get("pass2") or {})
@@ -2016,7 +2028,7 @@ router = APIRouter(prefix="/tone-check", tags=["tone check"])
 
 
 class ToneCheckBody(BaseModel):
-    index: str = Field(description="ключ датасета из indexes.pkl или имя индекса Elasticsearch")
+    index: str = Field(description="набор данных, по которому идёт проверка")
     mode: str = Field(default="sample", description="sample | full")
     sample_size: int = Field(default=1000, ge=1, le=MAX_FULL_DOCS)
     min_date: Optional[int] = None
@@ -2030,7 +2042,7 @@ class ToneCheckBody(BaseModel):
     # ---- область проверки ----
     label_mode: str = Field(default="message", description="message (тон сообщения) | aspect (отношение к объекту)")
     objects: List[str] = Field(default_factory=list, description="объекты аспектной разметки: бренд, продукт, конкурент")
-    theme: str = Field(default="", description="инфоповод/тема датасета: подсказка модели и текстовый фильтр")
+    theme: str = Field(default="", description="инфоповод или тема, по которой сужаем проверку")
     hub: str = Field(default="", description="площадка (поле hub), точное совпадение")
     author: str = Field(default="", description="автор (authorObject.fullname), поиск по фразе")
     preset: str = Field(default="", description="имя пресета, если запуск из сохранённого набора")
@@ -2081,9 +2093,9 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
             note = "нет новых результатов %s — жду ответа модели" % _human_sec(stale)
         elif prog["stage"] == "pass2":
             # Второй проход на 32B заведомо медленнее: подпись объясняет паузу счётчика.
-            note = "идёт перепроверка спорных на 32B — она медленнее первого прохода"
+            note = "идёт уточняющая проверка спорных случаев — она медленнее первого этапа"
         if writing:
-            note = "пишу размеченную пачку в Elasticsearch"
+                note = "сохраняю результат"
     if job.get("error"):
         note = str(job.get("error"))
     out = {
@@ -2226,14 +2238,14 @@ def start(body: ToneCheckBody, user: Any = Depends(current_user_any)):
         raise HTTPException(status_code=400, detail="Режим: sample или full")
     key, name = _guard_dataset(user, body.index)
     if not _es().indices.exists(index=name):
-        raise HTTPException(status_code=404, detail="Индекс %s не найден в Elasticsearch" % name)
+        raise HTTPException(status_code=404, detail="Данные набора не найдены — возможно, он удалён")
     tone_int = _tone_filter(body.tone)
     label_mode = str(body.label_mode or "message").strip().lower()
     if label_mode not in ("message", "aspect"):
         raise HTTPException(status_code=400, detail="Режим разметки: message или aspect")
     objects = _object_terms(body.objects)
     if label_mode == "aspect" and not objects:
-        raise HTTPException(status_code=400, detail="Для аспектной разметки укажите хотя бы один объект")
+        raise HTTPException(status_code=400, detail="Добавьте хотя бы один объект для проверки по объектам")
     jid = uuid.uuid4().hex[:12]
     job = {
         "id": jid,
@@ -2290,7 +2302,7 @@ def start(body: ToneCheckBody, user: Any = Depends(current_user_any)):
 
 
 @router.get("/scope")
-def scope_preview(index: str = Query(description="ключ датасета из indexes.pkl или имя индекса"),
+def scope_preview(index: str = Query(description="набор данных, по которому считаем объём"),
                   objects: str = Query(default="", description="объекты через запятую"),
                   theme: str = Query(default=""), hub: str = Query(default=""),
                   author: str = Query(default=""), tone: str = Query(default=""),
@@ -2344,7 +2356,7 @@ def scope_preview(index: str = Query(description="ключ датасета из
 
 
 @router.get("/scope-options")
-def scope_options(index: str = Query(description="ключ датасета или имя индекса"),
+def scope_options(index: str = Query(description="набор данных для подсказок"),
                   limit: int = Query(default=30, ge=5, le=80),
                   user: Any = Depends(current_user_any)):
     """Подсказки для области проверки: темы датасета, частые термины, площадки, авторы."""
@@ -2618,7 +2630,7 @@ def _scope_text(job: Dict[str, Any]) -> str:
         parts.append("площадка %s" % _flat(job["hub"]))
     if _flat(job.get("author")):
         parts.append("автор %s" % _flat(job["author"]))
-    return ", ".join(parts) if parts else "весь датасет без дополнительных фильтров"
+    return ", ".join(parts) if parts else "все сообщения набора"
 
 
 def _scope_public(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -2758,7 +2770,7 @@ def _preset_note(record: Dict[str, Any]) -> str:
     if record.get("hub"):
         pieces.append(record["hub"])
     if record.get("label_mode") == "aspect":
-        pieces.append("аспектная разметка")
+        pieces.append("по объектам")
     return ", ".join(pieces)
 
 
@@ -3064,7 +3076,7 @@ async def _run_aspect_job(jid: str) -> None:
     ctx = _Ctx(jid)
     started = time.time()
     try:
-        _set(jid, status="running", stage="preparing", stage_label="готовлю аспектную разметку",
+        _set(jid, status="running", stage="preparing", stage_label="читаю сообщения",
              progress_schema=PROGRESS_SCHEMA, worker_pid=os.getpid(), writing=False,
              started=job.get("started") or datetime.now().isoformat(timespec="seconds"),
              objects=objects, scope=_scope_public(job),
@@ -3077,15 +3089,16 @@ async def _run_aspect_job(jid: str) -> None:
             total = min(int(job.get("sample_size") or 1000), total)
         elif total > MAX_FULL_DOCS:
             raise RuntimeError(
-                "Полная аспектная разметка этого датасета — %d сообщений, больше лимита %d. "
-                "Сузьте область проверки (период, площадка, объект) или поднимите "
-                "TELLSCOPE_TONE_FULL_LIMIT." % (total, MAX_FULL_DOCS))
+                "Полная проверка по объектам — это %d сообщений, а за один раз мы проверяем "
+                "до %d. "
+                "Сузьте область: период, площадку или список объектов."
+                % (total, MAX_FULL_DOCS))
         _set(jid, total=total, processed=len(results), errors=0)
         _log_line("[%s] аспектная разметка: к обработке %d сообщений, уже размечено %d, объекты %s"
                   % (jid, total, len(results), ", ".join(objects)))
 
         # ------------------------------ проход 1: быстрая 4B ------------------------------
-        _set(jid, stage="pass1", stage_label="оцениваю отношение к объектам", phase="pass1")
+        _set(jid, stage="pass1", stage_label="определяю отношение к объектам", phase="pass1")
         bulk = _bulk_profile()
         batch_size = int(job.get("batch_size") or ASPECT_BATCH)
         parallel = int(job.get("parallel") or ASPECT_PARALLEL)
@@ -3152,9 +3165,9 @@ async def _run_aspect_job(jid: str) -> None:
             if records and not written and werrors:
                 # Ничего не записалось — разметка физически не сохраняется. Честно падаем
                 # с причиной, а не крутимся на месте до срабатывания детектора застоя.
-                raise RuntimeError("разметка не записывается в Elasticsearch: %s"
-                                   % (_LAST_WRITE_ERROR or "пакетные обновления отклонены"))
-            _set(jid, writing=False, stage="pass1", stage_label="оцениваю отношение к объектам",
+                raise RuntimeError("не удалось сохранить результат проверки — попробуйте ещё раз "
+                                   "или обратитесь к администратору")
+            _set(jid, writing=False, stage="pass1", stage_label="определяю отношение к объектам",
                  processed=len(results), total=total, cursor=job.get("cursor"),
                  bulk_written=job["bulk_written"], errors=job["errors"])
         _set(jid, processed=len(results), total=total)
@@ -3187,10 +3200,10 @@ async def _run_aspect_job(jid: str) -> None:
             base_url = str(gen.get("base_url") or "")
             if not await _model_up(base_url):
                 pass2.update({"available": False, "skipped": True,
-                              "reason": "модель перепроверки недоступна (%s)" % (base_url or "не задана")})
+                              "reason": "сервис уточняющей проверки был недоступен"})
                 _log_line("[%s] 32B недоступна: перепроверка аспектов не выполнена" % jid, level="warning")
             else:
-                _set(jid, stage="pass2", stage_label="перепроверяю спорные на 32B", phase="pass2",
+                _set(jid, stage="pass2", stage_label="уточняю спорные случаи", phase="pass2",
                      pass2_total=len(disputed), pass2_done=0)
                 p2_batch = int(job.get("pass2_batch") or ASPECT_PASS2_BATCH)
                 p2_parallel = int(job.get("pass2_parallel") or DEFAULT_PARALLEL_PASS2)
@@ -3242,7 +3255,7 @@ async def _run_aspect_job(jid: str) -> None:
                             if batch_recs:
                                 _journal_append(jid, batch_recs)
                                 changed.extend(batch_recs)
-                            _set(jid, stage="pass2", stage_label="перепроверяю спорные на 32B",
+                            _set(jid, stage="pass2", stage_label="уточняю спорные случаи",
                                  pass2_done=done + seen, pass2_total=len(disputed),
                                  processed=len(results), total=total)
                     if changed:
@@ -3251,14 +3264,14 @@ async def _run_aspect_job(jid: str) -> None:
                         job["errors"] = int(job.get("errors") or 0) + werrors
                         job["bulk_written"] = int(job.get("bulk_written") or 0) + written
                     done += len(window)
-                    _set(jid, writing=False, stage="pass2", stage_label="перепроверяю спорные на 32B",
+                    _set(jid, writing=False, stage="pass2", stage_label="уточняю спорные случаи",
                          pass2_done=done, pass2_total=len(disputed),
                          processed=len(results), total=total, errors=job.get("errors") or 0,
                          bulk_written=job.get("bulk_written") or 0)
 
         # -------------------------------- отчёт --------------------------------
         cancelled = _cancelled(jid)
-        _set(jid, status="running", stage="report", stage_label="собираю отчёт по объектам",
+        _set(jid, status="running", stage="report", stage_label="собираю отчёт",
              phase="report", processed=len(results), total=total,
              percent_before_report=int(job.get("percent") or 0),
              bulk_written=job.get("bulk_written") or 0, errors=job.get("errors") or 0)
@@ -3385,7 +3398,7 @@ def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]
                     "object_tone_int": tone,
                     "source_tone": TONE_RU.get(source_tone, "—"),
                     "confidence": conf,
-                    "decided_by": entry.get("by") or "",
+                    "decided_by": BY_RU.get(entry.get("by") or "", entry.get("by") or ""),
                     "reason": entry.get("reason") or "—",
                     "quote": _flat(entry.get("quote")) or text[:220],
                     "text": text[:320],
@@ -3513,19 +3526,19 @@ def _build_aspect_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]]
         "scope": _scope_public(job),
         "scope_text": _scope_text(job),
         "preset": job.get("preset") or "",
-        "source_note": ("Разметка источника (toneMark) сделана на уровне сообщения целиком, а не "
+        "source_note": ("Разметка источника сделана на уровне сообщения целиком, а не "
                         "по объекту. Поэтому в аспектном режиме она показана только как контекст "
                         "и НЕ используется как эталон точности: сравнивать отношение к объекту "
                         "с общей разметкой сообщения нельзя."),
         "method": {
-            "pass1_model": "qwen3-4b-fast (vLLM, 127.0.0.1:8001, профиль texts_bulk)",
-            "pass2_model": "Qwen/Qwen3-32B-FP8 (vLLM, 127.0.0.1:8000)",
+            "pass1_model": "первичная автоматическая разметка",
+            "pass2_model": "уточняющая проверка",
             "batch_size": int(job.get("batch_size") or ASPECT_BATCH),
             "parallel": int(job.get("parallel") or ASPECT_PARALLEL),
             "conf_threshold": float(job.get("conf_threshold") or DEFAULT_CONF),
             "objects": objects,
             "fields": list(ASPECT_FIELDS),
-            "source_field": "toneMark (не изменяется, только контекст)",
+            "source_field": "разметка источника (не изменяется, только контекст)",
             "pass2": dict(pass2),
         },
         "summary": summary,
@@ -3548,7 +3561,7 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
     with_mention = int(summary.get("messages_with_mention") or 0)
     out.append("Проверено %s по области: %s. Объект упомянут в %s из них."
                % (_plural(checked, "сообщение", "сообщения", "сообщений"),
-                  summary.get("scope_text") or "весь датасет без дополнительных фильтров",
+                  summary.get("scope_text") or "все сообщения набора",
                   _plural(with_mention, "сообщении", "сообщениях", "сообщениях")))
     mentioned = [row for row in rows if row["mentions"] >= 3]
     if mentioned:
@@ -3600,15 +3613,15 @@ def _aspect_conclusions(summary: Dict[str, Any], rows: List[Dict[str, Any]],
             out.append("Худшая площадка — %s по объекту «%s»: негатив %s при %s."
                        % (worst_hub[1], worst_hub[0], _pct(float(worst_hub[2]["negative_share"])),
                           _plural(int(worst_hub[2]["mentions"]), "упоминании", "упоминаниях", "упоминаниях")))
-    out.append("Спорных случаев, которые решала 32B, — %s от проверенного (%s)."
+    out.append("Спорных случаев, прошедших уточняющую проверку, — %s от проверенного (%s)."
                % (_pct(float(summary.get("pass2_share") or 0.0)),
                   _plural(int(summary.get("pass2_decided") or 0), "сообщение", "сообщения", "сообщений")))
     if not summary.get("pass2_available", True):
-        out.append("ВНИМАНИЕ: 32B была недоступна — спорные случаи остались решением быстрой "
-                   "модели, окончательными их считать нельзя.")
+        out.append("ВНИМАНИЕ: уточняющая проверка была недоступна — спорные случаи остались "
+                   "результатом первичной автоматической разметки, окончательными их считать нельзя.")
     if int(summary.get("unresolved") or 0):
-        out.append("Для %s модель не вернула вердикт: они помечены tone_aspect_by=none и не "
-                   "попали в распределение." % _plural(int(summary["unresolved"]), "сообщения",
+        out.append("Для %s автоматическая разметка не дала вердикт: такие сообщения не попали "
+                   "в распределение." % _plural(int(summary["unresolved"]), "сообщения",
                                                        "сообщений", "сообщений"))
     return out[:8]
 
@@ -3634,7 +3647,8 @@ def _aspect_recommendation(summary: Dict[str, Any], rows: List[Dict[str, Any]],
                      "проблемный объект." % (best["object"], _pct(float(best["negative_share"]))))
     if int(summary.get("divergence_total") or 0) > max(3, int(0.03 * max(1, summary.get("evaluated") or 1))):
         parts.append("Общий тон сообщения часто не совпадает с отношением к объекту (%s): "
-                     "для решений используйте поля tone_aspect, а не общую тональность сообщения."
+                     "для решений опирайтесь на оценку по объекту, а не на общую тональность "
+                     "сообщения."
                      % _plural(int(summary.get("divergence_total") or 0),
                                 "случай", "случая", "случаев"))
     for block in by_hubs:
@@ -3645,9 +3659,9 @@ def _aspect_recommendation(summary: Dict[str, Any], rows: List[Dict[str, Any]],
                              % (top["hub"], _pct(float(top["negative_share"])), top["mentions"]))
             break
     if not summary.get("pass2_available", True):
-        parts.append("Перепроверка на 32B не выполнялась — цифры стоит уточнить повторным прогоном.")
+        parts.append("Уточняющая проверка не выполнялась — цифры стоит уточнить повторным прогоном.")
     parts.append("Разметка источника в аспектном режиме не эталон: она сделана по сообщению "
-                 "целиком, поэтому итоговые цифры берите из полей tone_aspect.")
+                 "целиком, поэтому итоговые цифры берите из оценки по объекту.")
     return " ".join(parts)
 
 
@@ -3657,24 +3671,24 @@ def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict
     rows = report["by_object"]
     scope = report.get("scope") or {}
     objects = scope.get("objects") or []
-    pass2_text = "перепроверка не выполнялась (%s)" % (pass2.get("reason") or "нет спорных случаев") \
+    pass2_text = "не выполнялась (%s)" % (pass2.get("reason") or "нет спорных случаев") \
         if not pass2.get("available", True) else "выполнена"
 
     object_table = {
         "title": "Отношение по объектам",
         "columns": ["Объект", "Упоминаний", "Доля проверенного", "Позитив", "Нейтрал", "Негатив",
-                    "Индекс тона", "Средняя уверенность"],
+                    "Перевес позитива", "Средняя уверенность"],
         "rows": [[row["object"], row["mentions"], _pct(float(row["share_of_checked"])),
                   _pct(float(row["positive_share"])), _pct(float(row["neutral_share"])),
                   _pct(float(row["negative_share"])), _num(row["tone_index"]),
                   _num(row["mean_confidence"])] for row in rows],
-        "note": "Индекс тона = доля позитива минус доля негатива (−1…1). Считается по упоминаниям, "
-                "то есть по сообщениям, где объект реально назван.",
+        "note": "Перевес позитива = доля позитива минус доля негатива (от −1 до 1). Считается "
+                "по упоминаниям, то есть по сообщениям, где объект реально назван.",
         "layout": "landscape",
     }
     absolute_table = {
         "title": "Распределение в абсолютных числах",
-        "columns": ["Объект"] + [TONE_RU[c] for c in CLASSES] + ["Упоминаний", "Оценок от 32B"],
+        "columns": ["Объект"] + [TONE_RU[c] for c in CLASSES] + ["Упоминаний", "Уточнённых оценок"],
         "rows": [[row["object"], row["negative"], row["neutral"], row["positive"],
                   row["mentions"], row["by_32b"]] for row in rows],
         "layout": "portrait",
@@ -3722,7 +3736,7 @@ def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict
         example_table = {
             "title": "Где общий тон сообщения расходится с отношением к объекту (%d)" % len(examples),
             "columns": ["Объект", "Площадка", "Дата", "Тон сообщения", "Отношение к объекту",
-                        "Цитата-доказательство", "Пояснение модели", "Ссылка"],
+                        "Цитата-доказательство", "Пояснение", "Ссылка"],
             "rows": [[item["object"], item["hub"], item["date"], item["message_tone"],
                       item["object_tone"], item["quote"], item["reason"], item["url"] or "—"]
                      for item in examples],
@@ -3733,10 +3747,11 @@ def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict
 
     sections: List[Dict[str, Any]] = [{
         "heading": "Как проверяли",
-        "text": ("Датасет: %s. Область проверки: %s. Режим: аспектная разметка (отношение к объекту).\n"
-                 "Проверено сообщений: %d. Объектов в проверке: %d. Спорные случаи перепроверяла "
-                 "Qwen3-32B (%s). Наша разметка пишется в поля tone_aspect, tone_aspect_objects, "
-                 "tone_msg_llm; исходное toneMark не изменяется.\n%s"
+        "text": ("Набор данных: %s. Область проверки: %s. Что считаем: отношение сообщений "
+                 "к выбранным объектам.\n"
+                 "Проверено сообщений: %d. Объектов в проверке: %d. Уточняющая проверка спорных "
+                 "случаев: %s. Результаты проверки сохраняются отдельно от разметки источника: "
+                 "исходные данные не меняются.\n%s"
                  % (report.get("dataset") or "—", report.get("scope_text") or "—",
                     int(summary.get("checked") or 0), len(objects), pass2_text,
                     report.get("source_note") or "")),
@@ -3745,14 +3760,14 @@ def _aspect_sections(report: Dict[str, Any], pass2: Dict[str, Any]) -> List[Dict
             "columns": ["Показатель", "Значение"],
             "rows": [
                 ["Сообщений проверено", str(summary.get("checked") or 0)],
-                ["С вердиктом модели", str(summary.get("evaluated") or 0)],
+                ["С вердиктом автоматической разметки", str(summary.get("evaluated") or 0)],
                 ["Объект упомянут хотя бы в одном сообщении", str(summary.get("messages_with_mention") or 0)],
                 ["Всего упоминаний объектов", str(sum(row["mentions"] for row in rows))],
                 ["Расхождений «тон сообщения ≠ отношение к объекту»", str(summary.get("divergence_total") or 0)],
-                ["Спорных случаев на 32B", _pct(float(summary.get("pass2_share") or 0.0))],
-                ["Решений 32B", str(summary.get("pass2_decided") or 0)],
-                ["Не разобрано моделью", str(summary.get("unresolved") or 0)],
-                ["Записано в Elasticsearch", str(summary.get("bulk_written") or 0)],
+                ["Спорных случаев (уточняющая проверка)", _pct(float(summary.get("pass2_share") or 0.0))],
+                ["Решений после уточняющей проверки", str(summary.get("pass2_decided") or 0)],
+                ["Без вердикта автоматической разметки", str(summary.get("unresolved") or 0)],
+                ["Сохранено оценок", str(summary.get("bulk_written") or 0)],
             ],
             "layout": "portrait",
         }],
@@ -3790,17 +3805,17 @@ def _write_aspect_report_files(job: Dict[str, Any], report: Dict[str, Any]) -> D
         return {}
     out: Dict[str, str] = {}
     objects = _object_terms(job.get("objects"))
-    label = _safe_name(report.get("dataset") or job.get("index_name") or "датасет", 30)
+    label = _safe_name(report.get("dataset") or job.get("index_name") or "набор", 30)
     objects_part = _safe_name(", ".join(objects), 40)
     stamp = datetime.now().strftime("%Y-%m-%d %H-%M")
     mode = "полная" if job.get("mode") == "full" else "выборка %s" % (job.get("sample_size") or "")
-    title = "Отношение к объектам: аспектная разметка"
+    title = "Проверка тональности по объектам"
     subtitle = "%s → %s — %s, %s" % (label, objects_part or "объекты не заданы",
                                      report.get("period") or "", mode)
     meta = {
         "dataset_label": report.get("dataset") or "",
         "period": report.get("period") or "",
-        "author": "Tellscope, локальные модели vLLM",
+        "author": "Tellscope, автоматическая разметка",
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
     }
     sections = _aspect_sections(report, (report.get("method") or {}).get("pass2") or {})
