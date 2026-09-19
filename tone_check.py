@@ -102,6 +102,29 @@ MAX_EXAMPLES = 25
 # По умолчанию разрешаем «полностью» до 300 000 сообщений: дальше нужен срез по датам.
 MAX_FULL_DOCS = int(os.environ.get("TELLSCOPE_TONE_FULL_LIMIT") or 300000)
 
+# Перепроверка на 32B в разы медленнее первого прохода, поэтому её доля ограничена: если
+# спорных больше, чем PASS2_MAX_SHARE от объёма задачи, перепроверяем самые неуверенные
+# (сортировка по возрастанию уверенности), остальные остаются с решением 4B. Факт и размер
+# лимита попадают в отчёт (pass2_capped / pass2_capped_share), молча ничего не отбрасывается.
+PASS2_MAX_SHARE = float(os.environ.get("TELLSCOPE_TONE_PASS2_MAX_SHARE") or 0.5)
+
+# Жёсткий предел на один вызов модели: зависший запрос не должен держать пачку и всю
+# страницу минутами. По таймауту пачка повторяется, затем делится пополам.
+BATCH_TIMEOUT = float(os.environ.get("TELLSCOPE_TONE_BATCH_TIMEOUT") or 180.0)
+
+# Через сколько секунд без прироста счётчиков честно писать «нет новых результатов».
+STALE_AFTER = float(os.environ.get("TELLSCOPE_TONE_STALE_AFTER") or 120.0)
+
+# Шкала общего процента: подготовка → первый проход → перепроверка спорных → отчёт.
+WORK_PREPARE = 1
+WORK_PASS1_END = 62
+WORK_PASS2_END = 93
+WORK_REPORT_END = 96
+
+# Версия схемы расчёта прогресса. Задачи, записанные прежней формулой (постоянные 63% на
+# шаге записи в ES), помечены другой версией — их залипший процент пересчитывается честно.
+PROGRESS_SCHEMA = 2
+
 STAGE_LABELS = {
     "preparing": "подготовка",
     "pass1": "размечаю выборку",
@@ -284,9 +307,16 @@ def _set(jid: str, **fields: Any) -> Dict[str, Any]:
     previous = int(job.get("percent") or 0)
     job.update(fields)
     job["id"] = jid
-    if "percent" not in fields and ("processed" in fields or "total" in fields or "stage" in fields):
-        # Процент только растёт: переходы «пишу результаты» не должны откатывать полосу назад.
-        job["percent"] = max(previous, _percent(job))
+    if "percent" not in fields and any(
+            key in fields for key in ("processed", "total", "stage", "pass2_done", "pass2_total")):
+        fresh = _percent(job)
+        if int(job.get("progress_schema") or 0) == PROGRESS_SCHEMA:
+            # Процент только растёт: переходы между шагами не откатывают полосу назад.
+            job["percent"] = max(previous, fresh)
+        else:
+            # Задача из старой схемы: залипшие 63% нельзя тянуть дальше — считаем заново.
+            job["percent"] = fresh
+    _note_progress(job)
     _job_save(job)
     _redis_put(jid, {
         "status": job.get("status", ""),
@@ -300,30 +330,118 @@ def _set(jid: str, **fields: Any) -> Dict[str, Any]:
     return job
 
 
-def _percent(job: Dict[str, Any]) -> int:
-    """Общий процент: этапы взвешены (4B → запись → 32B → отчёт)."""
+def _stage_progress(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Прогресс по этапам: сколько сделано из скольких ИМЕННО на этом этапе.
+
+    Процент этапа всегда совпадает со счётчиком «N / M», который видит пользователь.
+    Запись в Elasticsearch (``writing``) — это под-шаг, а не отдельный этап: у неё нет
+    собственного счётчика, поэтому и своего процента быть не должно.
+    """
     stage = str(job.get("stage") or "preparing")
-    processed = int(job.get("processed") or 0)
-    total = max(1, int(job.get("total") or 0))
-    p2_done = int(job.get("pass2_done") or 0)
+    p1_total = int(job.get("total") or 0)
+    p1_done = int(job.get("processed") or 0)
+    if p1_total:
+        p1_done = min(p1_done, p1_total)
     p2_total = int(job.get("pass2_total") or 0)
+    p2_done = int(job.get("pass2_done") or 0)
+    if p2_total:
+        p2_done = min(p2_done, p2_total)
+    if stage == "pass2":
+        cur_done, cur_total = p2_done, p2_total
+    else:
+        cur_done, cur_total = p1_done, p1_total
+    return {
+        "stage": stage,
+        "stage_label": job.get("stage_label") or STAGE_LABELS.get(stage, ""),
+        "stage_done": cur_done,
+        "stage_total": cur_total,
+        "stage_percent": int(round(100.0 * cur_done / cur_total)) if cur_total else 0,
+        "pass1_done": p1_done,
+        "pass1_total": p1_total,
+        "pass1_percent": int(round(100.0 * p1_done / p1_total)) if p1_total else 0,
+        "pass2_done": p2_done,
+        "pass2_total": p2_total,
+        "pass2_percent": int(round(100.0 * p2_done / p2_total)) if p2_total else 0,
+    }
+
+
+def _percent(job: Dict[str, Any]) -> int:
+    """Общий процент: взвешенная сумма работы обоих проходов.
+
+    Работа измеряется документами: N сообщений первого прохода плюс K спорных второго.
+    Пока объём второго прохода неизвестен, первый проход занимает шкалу 2..62%.
+
+    Здесь больше НЕТ постоянного процента для шага записи в ES. Раньше ``writing``
+    возвращал жёсткие 63%, а ``_set`` держит процент только растущим — поэтому полоса
+    навсегда замирала на 63%, пока счётчик «N / M сообщений» шёл вперёд.
+    """
+    stage = str(job.get("stage") or "preparing")
+    if stage == "writing":
+        # Состояние задач, записанных до этой правки: уточняем этап по объёму второго прохода.
+        stage = "pass2" if int(job.get("pass2_total") or 0) else "pass1"
+    prog = _stage_progress(job)
     if stage == "done":
         return 100
     if stage == "cancelled":
         return int(job.get("percent") or 0)
-    if stage in ("preparing",):
-        return 1
-    if stage == "pass1":
-        return min(62, 2 + int(58 * processed / total))
-    if stage == "writing":
-        return 63
-    if stage == "pass2":
-        if p2_total <= 0:
-            return 93
-        return min(93, 63 + int(30 * p2_done / max(1, p2_total)))
+    if stage in ("preparing", "queued"):
+        return WORK_PREPARE
     if stage == "report":
-        return 96
-    return 5
+        return WORK_REPORT_END
+    p1_done, p1_total = prog["pass1_done"], prog["pass1_total"]
+    p2_done, p2_total = prog["pass2_done"], prog["pass2_total"]
+    if stage == "pass1":
+        if p1_total <= 0:
+            return WORK_PREPARE
+        span = WORK_PASS1_END - WORK_PREPARE
+        return min(WORK_PASS1_END, WORK_PREPARE + int(span * p1_done / p1_total))
+    if stage == "pass2":
+        if p1_total <= 0:
+            return WORK_PASS1_END
+        if p2_total <= 0:
+            return WORK_PASS1_END + 1
+        span = WORK_PASS2_END - WORK_PREPARE
+        return min(WORK_PASS2_END,
+                   WORK_PREPARE + int(span * (p1_done + p2_done) / max(1, p1_total + p2_total)))
+    return WORK_PREPARE
+
+
+def _note_progress(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Запоминает момент реального прироста: без него интерфейс не отличит «идёт» от «висит».
+
+    Работа = размеченные сообщения первого прохода + перепроверенные второго. Точки
+    хранятся коротким кольцом, по ним считается живая скорость и оценка остатка.
+    """
+    now = time.time()
+    done = int(job.get("processed") or 0) + int(job.get("pass2_done") or 0)
+    samples = [s for s in (job.get("progress_samples") or []) if isinstance(s, (list, tuple)) and len(s) == 2]
+    if not samples or int(samples[-1][1]) != done:
+        samples.append([round(now, 1), done])
+        samples = samples[-60:]
+    job["progress_samples"] = samples
+    try:
+        job["last_progress_at"] = datetime.fromtimestamp(float(samples[-1][0])).isoformat(timespec="seconds")
+    except Exception:
+        job["last_progress_at"] = job.get("updated")
+    return job
+
+
+def _rate_and_eta(job: Dict[str, Any], prog: Dict[str, Any]) -> Tuple[float, Optional[int]]:
+    """Средняя скорость (сообщений/мин) за последние минуты и оценка остатка в секундах."""
+    now = time.time()
+    window = [s for s in (job.get("progress_samples") or [])
+              if isinstance(s, (list, tuple)) and len(s) == 2 and now - float(s[0]) <= 300]
+    rate = 0.0
+    if len(window) >= 2:
+        dt = float(window[-1][0]) - float(window[0][0])
+        dd = float(window[-1][1]) - float(window[0][1])
+        if dt >= 1.0 and dd > 0:
+            rate = dd / dt * 60.0
+    remaining = max(0, prog["pass1_total"] - prog["pass1_done"])
+    if prog["pass2_total"]:
+        remaining += max(0, prog["pass2_total"] - prog["pass2_done"])
+    eta = int(remaining / rate * 60.0) if rate > 0 and remaining > 0 else None
+    return round(rate, 1), eta
 
 
 def _journal_append(jid: str, records: List[Dict[str, Any]]) -> None:
@@ -777,8 +895,18 @@ async def _read_batch(ctx: _Ctx, docs: List[Dict[str, Any]], *, system: str, ins
         for attempt in range(2 if depth == 0 else 1):
             meta: Dict[str, Any] = {}
             try:
-                text, _tokens = await _qwen(ctx, prompt, system=system, max_tokens=max_tokens,
-                                            temperature=0.0, vllm_cfg=vllm_cfg, meta=meta)
+                # Жёсткий предел на вызов: без него зависший запрос держит пачку (а с ней и
+                # всю страницу) до сетевого таймаута — это и есть «голова очереди».
+                text, _tokens = await asyncio.wait_for(
+                    _qwen(ctx, prompt, system=system, max_tokens=max_tokens,
+                          temperature=0.0, vllm_cfg=vllm_cfg, meta=meta),
+                    timeout=BATCH_TIMEOUT)
+            except asyncio.TimeoutError:
+                last = "нет ответа модели за %.0f с" % BATCH_TIMEOUT
+                _log_line("пачка из %d не ответила за %.0f с" % (len(lines), BATCH_TIMEOUT),
+                          level="warning")
+                await asyncio.sleep(1.0 + attempt)
+                continue
             except Exception as exc:  # noqa: BLE001 — пачка не должна ломать весь проход
                 last = "%s: %s" % (type(exc).__name__, str(exc)[:160])
                 await asyncio.sleep(1.0 + attempt)
@@ -939,6 +1067,7 @@ async def _run_job(jid: str) -> None:
     try:
         _set(jid, status="running", stage="preparing", stage_label=STAGE_LABELS["preparing"],
              started=job.get("started") or datetime.now().isoformat(timespec="seconds"),
+             writing=False, progress_schema=PROGRESS_SCHEMA,
              log="старт разметки: %s (%s)" % (name, job.get("mode")))
         _ensure_mapping(name)
         results = _journal_load(jid)
@@ -1024,11 +1153,13 @@ async def _run_job(jid: str) -> None:
             if job.get("mode") == "full" and docs and docs[-1].get("sort"):
                 cursor = docs[-1]["sort"]
                 job["cursor"] = cursor
-            _set(jid, stage="writing", stage_label=STAGE_LABELS["writing"])
+            # Запись в ES — это под-шаг первого прохода, а не отдельный этап: у неё нет
+            # своего счётчика, поэтому этап не подменяется и полоса не скачет.
+            _set(jid, writing=True)
             written, werrors = _bulk_write(job, records)
             job["errors"] = int(job.get("errors") or 0) + werrors
             job["bulk_written"] = int(job.get("bulk_written") or 0) + written
-            _set(jid, stage="pass1", stage_label=STAGE_LABELS["pass1"],
+            _set(jid, writing=False, stage="pass1", stage_label=STAGE_LABELS["pass1"],
                  processed=len(results), total=total, cursor=job.get("cursor"),
                  bulk_written=job["bulk_written"], errors=job["errors"])
         _set(jid, processed=len(results), total=total)
@@ -1038,6 +1169,24 @@ async def _run_job(jid: str) -> None:
         disputed = [rec for rec in results.values() if _needs_pass2(rec, threshold)]
         pass2 = {"available": True, "skipped": False, "reason": "", "targets": len(disputed),
                  "decided": 0, "failed": 0}
+        # 32B в разы медленнее 4B: если спорных слишком много, перепроверка съест всё время.
+        # Ограничиваем её долю и перепроверяем самые неуверенные; остальные честно остаются
+        # с решением 4B, а факт и размер лимита видны в отчёте (pass2_capped).
+        disputed_total = len(disputed)
+        pass2_limit = int(max(1, total) * PASS2_MAX_SHARE)
+        pass2_capped = 0
+        if disputed_total > pass2_limit:
+            disputed.sort(key=lambda rec: float(rec.get("tone_llm_conf") or 0.0))
+            pass2_capped = disputed_total - max(1, pass2_limit)
+            disputed = disputed[:max(1, pass2_limit)]
+            _log_line("[%s] спорных %d — больше лимита %.0f%% (%d): перепроверяю %d самых "
+                      "неуверенных, остальные %d остаются решением 4B"
+                      % (jid, disputed_total, PASS2_MAX_SHARE * 100, pass2_limit,
+                         len(disputed), pass2_capped), level="warning")
+        pass2["candidates"] = disputed_total
+        pass2["capped"] = pass2_capped
+        pass2["max_share"] = PASS2_MAX_SHARE
+        pass2["share"] = round(disputed_total / float(max(1, total)), 4)
         stopped = _cancelled(jid)
         if not stopped and disputed:
             from mlops.lock import generate_cfg
@@ -1115,12 +1264,12 @@ async def _run_job(jid: str) -> None:
                                  pass2_done=done + seen, pass2_total=len(disputed),
                                  processed=len(results), total=total)
                     if changed:
-                        _set(jid, stage="writing", stage_label=STAGE_LABELS["writing"])
+                        _set(jid, writing=True)
                         written, werrors = _bulk_write(job, changed)
                         job["errors"] = int(job.get("errors") or 0) + werrors
                         job["bulk_written"] = int(job.get("bulk_written") or 0) + written
                     done += len(window)
-                    _set(jid, stage="pass2", stage_label=STAGE_LABELS["pass2"],
+                    _set(jid, writing=False, stage="pass2", stage_label=STAGE_LABELS["pass2"],
                          pass2_done=done, pass2_total=len(disputed),
                          processed=len(results), total=total, errors=job.get("errors") or 0,
                          bulk_written=job.get("bulk_written") or 0)
@@ -1388,6 +1537,10 @@ def build_report(job: Dict[str, Any], results: Dict[str, Dict[str, Any]],
         "kappa": round(kappa, 4),
         "pass2_share": round(pass2_share, 4),
         "pass2_decided": int(pass2.get("decided") or 0),
+        # Сколько спорных было всего и сколько не попало в перепроверку из-за лимита доли.
+        "pass2_candidates": int(pass2.get("candidates") or pass2.get("targets") or 0),
+        "pass2_capped": int(pass2.get("capped") or 0),
+        "pass2_max_share": float(pass2.get("max_share") or PASS2_MAX_SHARE),
         "pass2_available": bool(pass2.get("available", True)),
         "pass2_reason": str(pass2.get("reason") or ""),
         "threshold": float(job.get("conf_threshold") or DEFAULT_CONF),
@@ -1503,6 +1656,13 @@ def _conclusions(summary: Dict[str, Any], by_length: List[Dict[str, Any]],
     if not summary.get("pass2_available", True):
         out.append("ВНИМАНИЕ: модель перепроверки была недоступна — спорные случаи остались "
                    "решением быстрой модели, окончательными их считать нельзя.")
+    capped = int(summary.get("pass2_capped") or 0)
+    if capped:
+        out.append("Спорных оказалось %d — больше лимита %.0f%% от выборки, поэтому на 32B ушли "
+                   "только %d самых неуверенных сообщений; у остальных %d осталось решение 4B."
+                   % (int(summary.get("pass2_candidates") or 0),
+                      float(summary.get("pass2_max_share") or PASS2_MAX_SHARE) * 100,
+                      int(summary.get("pass2_decided") or 0), capped))
     if int(summary.get("unresolved") or 0):
         out.append("Для %d сообщений локальная модель не вернула вердикт: они помечены "
                    "tone_llm_by=none и исключены из расчёта согласия, а не выданы за решение модели."
@@ -1734,6 +1894,19 @@ class ToneCheckBody(BaseModel):
     relabel: bool = Field(default=False, description="размечать заново, даже если поля уже заполнены")
 
 
+def _human_sec(value: Optional[float]) -> str:
+    """Секунды в короткую человеческую подпись («8 с», «3 мин», «1 ч 05 мин»)."""
+    if value is None:
+        return ""
+    total = int(max(0, value))
+    if total < 60:
+        return "%d с" % total
+    if total < 3600:
+        return "%d мин" % (total // 60)
+    hours, minutes = divmod(total // 60, 60)
+    return "%d ч %02d мин" % (hours, minutes)
+
+
 def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
     """Статус задачи для интерфейса: прогресс, этап, статистика на ходу."""
     report = None
@@ -1743,16 +1916,52 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
                 report = json.load(handle)
         except Exception:
             report = None
+    prog = _stage_progress(job)
+    rate, eta = _rate_and_eta(job, prog)
+    now = datetime.now()
+
+    def _age(stamp: Any) -> Optional[float]:
+        try:
+            return max(0.0, (now - datetime.fromisoformat(str(stamp))).total_seconds())
+        except Exception:
+            return None
+
+    updated_ago = _age(job.get("updated"))
+    stale = _age(job.get("last_progress_at"))
+    if stale is None:
+        stale = updated_ago
+    running = str(job.get("status") or "") == "running"
+    writing = bool(job.get("writing"))
+    stalled = bool(running and stale is not None and stale > STALE_AFTER)
+    note = ""
+    if running:
+        if stalled:
+            note = "нет новых результатов %s — жду ответа модели" % _human_sec(stale)
+        elif prog["stage"] == "pass2":
+            # Второй проход на 32B заведомо медленнее: подпись объясняет паузу счётчика.
+            note = "идёт перепроверка спорных на 32B — она медленнее первого прохода"
+        if writing:
+            note = "пишу размеченную пачку в Elasticsearch"
+    if job.get("error"):
+        note = str(job.get("error"))
     out = {
         "job_id": job.get("id"),
         "status": job.get("status"),
-        "stage": job.get("stage"),
-        "stage_label": job.get("stage_label") or STAGE_LABELS.get(str(job.get("stage")), ""),
+        "stage": prog["stage"],
+        "stage_label": prog["stage_label"],
         "percent": int(job.get("percent") or 0),
+        # Процент текущего этапа — ровно тот же, что у счётчика «stage_done / stage_total».
+        "stage_percent": prog["stage_percent"],
+        "stage_done": prog["stage_done"],
+        "stage_total": prog["stage_total"],
+        "pass1_percent": prog["pass1_percent"],
+        "pass1_done": prog["pass1_done"],
+        "pass1_total": prog["pass1_total"],
+        "pass2_percent": prog["pass2_percent"],
         "processed": int(job.get("processed") or 0),
         "total": int(job.get("total") or 0),
-        "pass2_done": int(job.get("pass2_done") or 0),
-        "pass2_total": int(job.get("pass2_total") or 0),
+        "pass2_done": prog["pass2_done"],
+        "pass2_total": prog["pass2_total"],
         "index_name": job.get("index_name"),
         "index_key": job.get("index_key"),
         "dataset_label": job.get("dataset_label"),
@@ -1763,7 +1972,16 @@ def _public_status(job: Dict[str, Any]) -> Dict[str, Any]:
         "finished": job.get("finished"),
         "updated": job.get("updated"),
         "elapsed_sec": job.get("elapsed_sec"),
-        "rate_per_min": job.get("rate_per_min"),
+        # Живые «часы» интерфейса: без них замерший счётчик выглядит как зависший проход.
+        "updated_ago_sec": int(updated_ago) if updated_ago is not None else None,
+        "stale_sec": int(stale) if stale is not None else None,
+        "stalled": stalled,
+        "writing": writing,
+        "note": note,
+        "rate_per_min": rate or float(job.get("rate_per_min") or 0),
+        "rate_messages_per_min": rate or float(job.get("rate_per_min") or 0),
+        "eta_sec": eta,
+        "eta_text": _human_sec(eta) if eta else "",
         "bulk_written": int(job.get("bulk_written") or 0),
         "write_errors": int(job.get("errors") or 0),
         "error": job.get("error") or "",
