@@ -2557,16 +2557,25 @@ def presets_list(user: Any = Depends(current_user_any)):
 def preset_save(body: PresetBody, user: Any = Depends(current_user_any)):
     """Сохранить или перезаписать набор по имени (запуск из списка — в один клик)."""
     uid = getattr(user, "id", "")
+    label_mode = str(body.label_mode or "message").strip().lower()
+    objects = _object_terms(body.objects)
+    # Такое же требование, как у запуска: иначе шаблон сохранится, но «Запустить» по нему
+    # будет молча упираться в проверку «добавьте хотя бы один объект».
+    if label_mode == "aspect" and not objects:
+        raise HTTPException(status_code=400,
+                            detail="Проверка по объектам: добавьте хотя бы один объект")
+    if not str(body.index or "").strip():
+        raise HTTPException(status_code=400, detail="Выберите набор данных")
     record = {
         "name": _flat(body.name)[:120],
         "index": str(body.index),
-        "label_mode": str(body.label_mode or "message").strip().lower(),
+        "label_mode": label_mode,
         "mode": str(body.mode or "sample").strip().lower(),
         "sample_size": int(body.sample_size),
         "min_date": body.min_date,
         "max_date": body.max_date,
         "tone": _flat(body.tone),
-        "objects": _object_terms(body.objects),
+        "objects": objects,
         "theme": _flat(body.theme),
         "hub": _flat(body.hub),
         "author": _flat(body.author),
