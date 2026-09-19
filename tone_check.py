@@ -2244,7 +2244,12 @@ def datasets(user: Any = Depends(current_user_any)):
             continue
         labeled = 0
         try:
-            labeled = int(_es().count(index=name, query={"exists": {"field": "tone_llm"}}).get("count") or 0)
+            # Считаем обе разметки: обычную (tone_llm) и по объектам (tone_aspect_at) — иначе
+            # после аспектного прогона набор выглядел бы неразмеченным.
+            labeled = int(_es().count(index=name, query={"bool": {"should": [
+                {"exists": {"field": "tone_llm"}},
+                {"exists": {"field": "tone_aspect_at"}},
+            ], "minimum_should_match": 1}}).get("count") or 0)
         except Exception:
             labeled = 0
         items.append({
