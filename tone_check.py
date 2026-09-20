@@ -2245,6 +2245,7 @@ def datasets(user: Any = Depends(current_user_any)):
     for key, value in mapping.items():
         reverse.setdefault(_norm_name(value), key)
     folders = _dataset_folders(str(getattr(user, "id", "")), bool(getattr(user, "is_superuser", False)))
+    checks = _dataset_check_info()
     items = []
     for name in sorted(names):
         if counts.get(name, 0) <= 0:
@@ -2262,6 +2263,7 @@ def datasets(user: Any = Depends(current_user_any)):
         # Режим тональности набора: по нему видно, обновлена ли тональность и применяли ли её
         # к аналитике. Нужно, чтобы списки тем показывали это без захода в блок проверки.
         mode_state = _tone_mode_load(name)
+        check = checks.get(name) or {}
         items.append({
             "index": reverse.get(name),
             "name": name,
@@ -2272,9 +2274,48 @@ def datasets(user: Any = Depends(current_user_any)):
             "tone_mode": str(mode_state.get("mode") or "source"),
             "tone_applied": int(mode_state.get("applied") or 0),
             "tone_status": str(mode_state.get("status") or "idle"),
+            # Настройки последней проверки: объекты, режим, объём и дата.
+            "check_objects": list(check.get("objects") or []),
+            "check_label_mode": str(check.get("label_mode") or ""),
+            "check_mode": str(check.get("mode") or ""),
+            "check_checked": int(check.get("checked") or 0),
+            "check_at": str(check.get("at") or ""),
         })
     items.sort(key=lambda item: item["docs"])
     return {"datasets": items}
+
+
+def _dataset_check_info() -> Dict[str, Dict[str, Any]]:
+    """Что именно проверяли в последней проверке тональности по каждому набору.
+
+    Нужно интерфейсу: в списке тем рядом с меткой «тональность обновлена» видно, по каким
+    объектам и в каком режиме шла проверка — чтобы не гадать, откуда взялась разметка.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not os.path.isdir(STATE_DIR):
+        return out
+    for entry in os.listdir(STATE_DIR):
+        if not entry.endswith(".json") or entry.endswith(".report.json"):
+            continue
+        job = _job_load(entry[:-5])
+        if not job:
+            continue
+        name = str(job.get("index_name") or "")
+        if not name:
+            continue
+        at = str(job.get("finished") or job.get("created") or "")
+        prev = out.get(name)
+        if prev and str(prev.get("at") or "") >= at:
+            continue
+        out[name] = {
+            "at": at,
+            "objects": list(job.get("objects") or []),
+            "label_mode": str(job.get("label_mode") or "message"),
+            "mode": str(job.get("mode") or "sample"),
+            "checked": int(job.get("processed") or 0),
+            "status": str(job.get("status") or ""),
+        }
+    return out
 
 
 def _dataset_folders(me: str, allow_any: bool) -> Dict[str, str]:
