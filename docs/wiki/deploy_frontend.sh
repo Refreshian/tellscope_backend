@@ -6,7 +6,8 @@
 # Что делает по шагам:
 #   1) собирает фронтенд (yarn build);
 #   2) публикует сборку в /var/www/tellscope и перезапускает nginx;
-#   3) обновляет подписи интерфейса (labels.txt) и синхронизирует страницы wiki.
+#   3) переносит тексты документации из репозитория (docs/wiki) в рабочую папку wiki;
+#   4) обновляет подписи интерфейса (labels.txt) и синхронизирует страницы wiki.
 #
 # Синхронизация идемпотентна: если тексты не менялись, wiki не трогается.
 set -euo pipefail
@@ -33,6 +34,13 @@ cp -r dist/. "$WEB"/
 service nginx restart >/dev/null
 BUNDLE=$(grep -o 'index-[A-Za-z0-9_-]*\.js' "$WEB/index.html" | head -1 || true)
 echo "выложен бандл: ${BUNDLE:-не найден}"
+
+say "документация из репозитория"
+mkdir -p "$WIKI/pages"
+cp -r "$BE/docs/wiki/pages/." "$WIKI/pages/"
+cp "$BE/docs/wiki/manifest.json" "$WIKI/manifest.json"
+cp "$BE/docs/wiki/wiki_sync.py" "$BE/docs/wiki/wiki_labels.py" "$BE/docs/wiki/wiki_locale.py" "$WIKI/"
+echo "страниц в рабочей папке: $(find "$WIKI/pages" -name '*.md' | wc -l)"
 
 say "подписи интерфейса для документации"
 "$PY" "$WIKI/wiki_labels.py" | tail -1
