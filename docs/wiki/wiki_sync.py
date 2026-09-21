@@ -197,6 +197,8 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
         rest = (content[:start] + "\n\n" + content[end:]).strip()
     else:
         rest = content.strip()
+    # прежний заголовок первого уровня опускаем до второго: на странице один главный заголовок
+    rest = re.sub(r"^#\s+(?!#)", "## ", rest, count=1)
     # блок всегда в начале страницы: открыв wiki, сразу видно разделы
     new_content = block + ("\n\n" + rest if rest else "")
     if new_content.strip() == content.strip():
