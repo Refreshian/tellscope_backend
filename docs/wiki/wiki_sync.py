@@ -128,6 +128,11 @@ def load_pages() -> list:
     return out
 
 
+def flush_cache(wiki: "Wiki") -> None:
+    """Сбрасывает кэш отрисовки: без этого страница может показываться в прежнем виде."""
+    wiki.call("mutation { pages { flushCache { responseResult { succeeded message } } } }")
+
+
 def sync(wiki: Wiki, pages: list, only: str = "", dry: bool = False) -> dict:
     existing = wiki.pages()
     stats = {"created": [], "updated": [], "skipped": [], "failed": []}
@@ -158,6 +163,8 @@ def sync(wiki: Wiki, pages: list, only: str = "", dry: bool = False) -> dict:
                   .get("responseResult") or {})
         (stats["updated"] if status.get("succeeded") else stats["failed"]).append(
             path if status.get("succeeded") else "%s: %s" % (path, status.get("message")))
+    if (stats["created"] or stats["updated"]) and not dry:
+        flush_cache(wiki)
     return stats
 
 
@@ -215,6 +222,8 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
     result = wiki.update(home["id"], row, new_content)
     status = ((((result.get("data") or {}).get("pages") or {}).get("update") or {})
               .get("responseResult") or {})
+    if status.get("succeeded"):
+        flush_cache(wiki)
     return "обновлено" if status.get("succeeded") else "ошибка: %s" % status.get("message")
 
 
