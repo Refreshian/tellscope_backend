@@ -194,12 +194,11 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
     if NAV_START in content and NAV_END in content:
         start = content.index(NAV_START)
         end = content.index(NAV_END) + len(NAV_END)
-        before = content[:start].strip()
-        after = content[end:].strip()
-        parts = [part for part in (before, block, after) if part]
-        new_content = "\n\n".join(parts)
+        rest = (content[:start] + "\n\n" + content[end:]).strip()
     else:
-        new_content = block + "\n\n" + content.strip()
+        rest = content.strip()
+    # блок всегда в начале страницы: открыв wiki, сразу видно разделы
+    new_content = block + ("\n\n" + rest if rest else "")
     if new_content.strip() == content.strip():
         return "без изменений"
     if dry:
