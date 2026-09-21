@@ -161,7 +161,11 @@ def sync(wiki: Wiki, pages: list, only: str = "", dry: bool = False) -> dict:
 
 
 def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
-    """Добавляет на Home блок со ссылками на страницы разделов (идемпотентно)."""
+    """Собирает на главной странице блок со ссылками на разделы (в начале страницы).
+
+    Блок ставится в начало: открыв wiki, сразу видно список разделов, а не только
+    вводный текст. Повторный запуск заменяет блок, дублей не появляется.
+    """
     existing = wiki.pages()
     home = existing.get("home")
     if not home:
@@ -175,9 +179,9 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
             continue
         groups.setdefault(row.get("nav_group", "Разделы"), []).append(row)
 
-    lines = [NAV_START, "## Подробные страницы по вкладкам", "",
-             "Ниже — описания каждого раздела: зачем он нужен, как им пользоваться, "
-             "как читать цифры и что делать в типовых ситуациях.", ""]
+    lines = [NAV_START, "## Разделы документации", "",
+             "Выберите раздел — на каждой странице описан порядок работы, показатели и типовые "
+             "ситуации. Ниже остался вводный обзор сервиса.", ""]
     for group, rows in groups.items():
         lines.append("### " + group)
         lines.append("")
@@ -190,15 +194,18 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
     if NAV_START in content and NAV_END in content:
         start = content.index(NAV_START)
         end = content.index(NAV_END) + len(NAV_END)
-        new_content = content[:start].rstrip() + "\n\n" + block + content[end:]
+        before = content[:start].strip()
+        after = content[end:].strip()
+        parts = [part for part in (before, block, after) if part]
+        new_content = "\n\n".join(parts)
     else:
-        new_content = content.rstrip() + "\n\n" + block
+        new_content = block + "\n\n" + content.strip()
     if new_content.strip() == content.strip():
         return "без изменений"
     if dry:
         return "будет обновлено (%d знаков)" % len(new_content)
     row = {"path": "home", "title": home.get("title") or "Home Page",
-           "description": "", "locale": home.get("locale") or "en"}
+           "description": "", "locale": home.get("locale") or "ru"}
     result = wiki.update(home["id"], row, new_content)
     status = ((((result.get("data") or {}).get("pages") or {}).get("update") or {})
               .get("responseResult") or {})
