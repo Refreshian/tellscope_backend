@@ -179,6 +179,10 @@ def home_nav(wiki: Wiki, pages: list, dry: bool = False) -> str:
         if row["path"] == "home" or not row.get("nav"):
             continue
         groups.setdefault(row.get("nav_group", "Разделы"), []).append(row)
+    # порядок групп задаём вручную: сначала данные, затем аналитика, ИИ и служебное
+    order = ["Данные и отчёты", "Аналитика", "ИИ-инструменты", "Специальные разделы", "Служебное"]
+    groups = {name: groups[name] for name in order if name in groups} | \
+             {name: rows for name, rows in groups.items() if name not in order}
 
     lines = [NAV_START, "## Разделы документации", "",
              "Выберите раздел — на каждой странице описан порядок работы, показатели и типовые "
