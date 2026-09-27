@@ -75,6 +75,12 @@ DEFAULT_LIMIT = 60
 # Меньше одной пачки просить бессмысленно: модель не увидит срез целиком, а пользователь —
 # «прочитано 15 из 41». Такой предел инструмент поднимает до DEFAULT_LIMIT сам.
 MIN_USEFUL_LIMIT = 20
+# Меньше этого числа сообщений темы и цитаты не построить: срез из одного сообщения давал
+# «модель не выделила ни одной темы» и запуск падал. Если фильтр оставил крохи, а без фильтра
+# сообщений много — инструмент возвращает понятное объяснение вместо ошибки.
+TINY_SLICE = 10
+# «Без фильтра сообщений много» — порог, ниже которого крохи объясняются просто пустым срезом.
+TINY_SLICE_WIDE = 50
 
 MESSAGE_CHARS = 480      # обрезка текста сообщения в промпте (max_model_len vLLM = 8192)
 BATCH_CHAR_BUDGET = 9000  # страховка по длине промпта пачки
@@ -652,11 +658,12 @@ def _engagement_script(fields: List[str]) -> Optional[Dict[str, Any]]:
     return {"type": "double", "script": {"source": "double s = 0.0; " + " ".join(parts) + " emit(s);"}}
 
 
-def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int) -> Dict[str, Any]:
+def _fetch_slice(index_name: str, lo, hi, tone: str, limit: int,
+                 phrase: Optional[str] = None, hubs: Optional[List[str]] = None) -> Dict[str, Any]:
     """Берёт сообщения среза из Elasticsearch и определяет, заполнена ли вовлечённость."""
     from .tools_data import _es, _exact_count, _iso, _query
 
-    query = _query(None, lo, hi, tone)
+    query = _query(phrase, lo, hi, tone, hubs)
     total = _exact_count(index_name, query)
 
     numeric = _numeric_engagement_fields(index_name)
@@ -1742,6 +1749,8 @@ def _public_highlights(highlights: List[Dict[str, Any]], limit: int = 8) -> List
             "limit": {"type": "integer", "description": "сколько сообщений прочитать: по умолчанию весь срез (до 20 000) или выборка представителей кластеров при кластеризации. Занижать не нужно — меньше 20 инструмент поднимает сам"},
             "batch_size": {"type": "integer", "description": "сообщений в одной пачке для модели, 15–25 (по умолчанию 20); указывать не обязательно"},
             "focus": {"type": "string", "description": "на что смотреть в первую очередь (например «причины возвратов»)"},
+            "phrase": {"type": "string", "description": "ограничить чтение сообщениями с этой фразой (например имя персоны, бренд или название проекта): тогда темы, доли и цитаты считаются только по ним. НЕ подставляйте сюда название датасета или темы — это поиск по тексту сообщений"},
+            "hub": {"type": "string", "description": "ограничить чтение одной площадкой-источником: «vk.com», «telegram.org», «ВКонтакте» (можно словами — инструмент сопоставит с реальными значениями)"},
         },
     },
     group="analytics",
@@ -1756,12 +1765,41 @@ async def analyze_texts(
     limit: int = DEFAULT_LIMIT,
     batch_size: int = BATCH_SIZE,
     focus: Optional[str] = None,
+    phrase: Optional[str] = None,
+    hub: Optional[str] = None,
     parallel: Optional[int] = None,
 ):
-    from .tools_data import _iso, _require_period, dates, guard
+    from .tools_data import _iso, _period, _require_period, dates, guard, resolve_hubs
+
+    phrase = (str(phrase).strip() or None) if phrase else None
 
     started = time.time()
     idx, index_name = guard(ctx, index)
+    # Фраза, совпадающая с названием датасета, — это не фильтр по тексту, а название темы:
+    # модель регулярно подставляла сюда имя датасета («Мониторинг тем»), срез схлопывался
+    # до одного сообщения, и разбор падал с «модель не выделила ни одной темы».
+    if phrase:
+        from .tools_data import _norm_text, _split_name
+
+        label = _split_name(str(index_name))[0]
+        flat_phrase = _norm_text(phrase).replace(" ", "")
+        flat_label = _norm_text(label).replace(" ", "")
+        flat_name = _norm_text(index_name).replace(" ", "")
+        if flat_phrase and (flat_phrase in flat_label or flat_phrase in flat_name
+                            or flat_label in flat_phrase):
+            await ctx.log(
+                f"Фраза «{phrase}» совпадает с названием датасета — фильтр по тексту снят"
+            )
+            phrase = None
+
+    hub_info = resolve_hubs(index_name, hub)
+    hubs = hub_info["hubs"]
+    if hub and not hubs:
+        await ctx.log(
+            "Площадка «%s» не найдена в датасете — фильтр по источнику не применён. Доступные: %s"
+            % (hub, ", ".join(hub_info["available"][:8]) or "нет данных")
+        )
+
     lo, hi = dates(ctx, min_date, max_date)
     if min_date is None and max_date is None and (ctx.min_date or ctx.max_date):
         # Даты не передали, но период задачи известен — читаем период задачи, а не весь датасет.
@@ -1773,7 +1811,19 @@ async def analyze_texts(
         await ctx.log(
             f"Даты в вызове не указаны — читаю период задачи {_iso(lo)} — {_iso(hi)}"
         )
+    requested_lo, requested_hi = lo, hi
     lo, hi = _require_period(index_name, lo, hi)
+    # Период задачи может выходить за пределы датасета (например просят 20–27 сентября, а выгрузка
+    # заканчивается 21-м). Раньше об этом нигде не сообщалось: агент молча считал урезанный срез.
+    coverage_note = ""
+    try:
+        from .tools_data import coverage_hint as _coverage_hint
+
+        coverage_note = _coverage_hint(index_name, requested_lo, requested_hi)
+    except Exception:  # noqa: BLE001
+        coverage_note = ""
+    if coverage_note:
+        await ctx.log(coverage_note, level="info")
 
     # Служебный параметр (нет в схеме инструмента): сколько пачек читать одновременно.
     # Нужен для замеров и тонкой настройки под нагрузку vLLM.
@@ -1801,6 +1851,8 @@ async def analyze_texts(
         )
     focus_text = f" Особое внимание: {_flat(focus)}." if _flat(focus) else ""
     scope = f" за период {_iso(lo)} — {_iso(hi)}" + (f" (тональность: {tone})" if str(tone).lower() not in ("all", "any", "") else "")
+    if phrase:
+        scope += f" (только сообщения с фразой «{phrase}»)"
 
     # ------------------------------------------------------- стратегия чтения среза
     # Пороги (mlops/lock.yaml, секция texts): до 5 000 сообщений читаем срез ЦЕЛИКОМ; 5 000–20 000 —
@@ -1810,11 +1862,50 @@ async def analyze_texts(
     # по всему корпусу, цитаты и пояснения — из прочитанных представителей.
     from .tools_data import _exact_count, _query
 
-    slice_query = _query(None, lo, hi, tone)
+    slice_query = _query(phrase, lo, hi, tone, hubs)
     try:
         slice_total = int(_exact_count(index_name, slice_query))
     except Exception:  # noqa: BLE001 — без точного размера работаем по выборке
         slice_total = 0
+    # Если узкий фильтр оставил крохи, а в срезе без него сообщений много — темы по такой
+    # выборке не построить. Раньше инструмент падал с ToolError и запуск закрывался неуспешно;
+    # теперь возвращаем понятный ответ, чтобы модель сняла фильтр и повторила чтение.
+    wide_total = slice_total
+    if slice_total < TINY_SLICE:
+        try:
+            wide_query = _query(None, lo, hi, tone, hubs)
+            wide_total = int(_exact_count(index_name, wide_query))
+        except Exception:  # noqa: BLE001
+            wide_total = slice_total
+        if wide_total >= TINY_SLICE_WIDE:
+            filters_used = []
+            if phrase:
+                filters_used.append("фраза «%s»" % phrase)
+            if hubs:
+                filters_used.append("источник %s" % ", ".join(hubs))
+            await ctx.log(
+                "Срез по фильтру слишком мал: %d сообщений против %d без фильтра — темы не строю"
+                % (slice_total, wide_total)
+            )
+            return {
+                "index": idx,
+                "index_name": index_name,
+                "messages_analyzed": 0,
+                "messages_in_slice": slice_total,
+                "messages_in_slice_wide": wide_total,
+                "topics": [],
+                "highlights": [],
+                "categories": [],
+                "summary": "",
+                "stats": {"messages_processed": 0, "messages_in_slice": slice_total,
+                          "batches": 0, "seconds": round(time.time() - started, 1)},
+                "note": (
+                    "По фильтру (%s) в датасете «%s» всего %d сообщений, а без фильтра за тот же "
+                    "период — %d. Темы и цитаты по такой выборке не строятся: снимите фильтр "
+                    "(или уточните фразу) и вызовите инструмент снова."
+                    % ("; ".join(filters_used) or "период", index_name, slice_total, wide_total)
+                ),
+            }
     warn_read = int(texts_cfg["warn_read_limit"])
     long_read = int(texts_cfg["long_read_limit"])
     cluster_min = int(texts_cfg["cluster_min_messages"])
@@ -1869,12 +1960,17 @@ async def analyze_texts(
         ))
         await ctx.log("Срез большой: читаю выборку значимых сообщений, в отчёте это помечено")
 
-    found = _fetch_slice(index_name, lo, hi, tone, limit)
-    if not found["docs"] and (ctx.min_date or ctx.max_date) and (lo, hi) != (ctx.min_date, ctx.max_date):
+    found = _fetch_slice(index_name, lo, hi, tone, limit, phrase, hubs)
+    explicit_period = min_date is not None or max_date is not None
+    if (not found["docs"] and not explicit_period
+            and (ctx.min_date or ctx.max_date) and (lo, hi) != (ctx.min_date, ctx.max_date)):
         # Модель могла указать период «от себя». Если по периоду задачи сообщения есть,
         # читаем период задачи: иначе запуск заканчивается впустую («прочитано 0 сообщений»),
         # а отчёт помечается неполным из-за отсутствия тем и цитат.
-        retry = _fetch_slice(index_name, ctx.min_date, ctx.max_date, tone, limit)
+        # Период НЕ подменяем, если его явно назвали в вызове: иначе запрос «неделя сентября
+        # 2026» по датасету за декабрь 2025 молча превращался в чтение декабря 2025 —
+        # отчёт выходил с заголовком одной темы, а темы и цитаты в нём были из другой.
+        retry = _fetch_slice(index_name, ctx.min_date, ctx.max_date, tone, limit, phrase, hubs)
         if retry["docs"]:
             await ctx.log(
                 f"По периоду {_iso(lo)} — {_iso(hi)} сообщений нет — читаю период задачи "
@@ -1887,8 +1983,33 @@ async def analyze_texts(
         if not int(found.get("messages_in_slice") or 0):
             # За выбранный период сообщений нет вообще: помечаем запуск как «данные не найдены»,
             # иначе модель напишет отчёт-заглушку и запуск закроется как успешный.
+            # В подсказке называем датасет и его собственный период: чаще всего причина в том,
+            # что запрошенный период относится к другой теме, и её надо выгрузить отдельно.
+            data_lo, data_hi = _period(index_name)
             ctx.no_data = "данные за период не найдены"
-            await ctx.log("За указанный период сообщений нет — данные не найдены", level="error")
+            await ctx.log(
+                f"За период {_iso(lo)} — {_iso(hi)} в датасете «{index_name}» сообщений нет — "
+                f"период датасета {_iso(data_lo)} — {_iso(data_hi)}",
+                level="error",
+            )
+            return {
+                "index": idx,
+                "index_name": index_name,
+                "messages_analyzed": 0,
+                "messages_in_slice": int(found.get("messages_in_slice") or 0),
+                "topics": [],
+                "highlights": [],
+                "categories": [],
+                "summary": "",
+                "stats": {"messages_processed": 0, "messages_in_slice": int(found.get("messages_in_slice") or 0), "batches": 0, "seconds": round(time.time() - started, 1)},
+                "dataset_period": {"from": _iso(data_lo), "to": _iso(data_hi)},
+                "note": (
+                    f"За период {_iso(lo)} — {_iso(hi)} в датасете «{index_name}» сообщений нет — "
+                    f"этот датасет покрывает {_iso(data_lo)} — {_iso(data_hi)}. Тему из запроса нужно "
+                    "выгрузить отдельным датасетом (fetch_dataset) и читать его: данные другого "
+                    "датасета для этого отчёта не подходят."
+                ),
+            }
         return {
             "index": idx,
             "index_name": index_name,
@@ -2227,8 +2348,25 @@ async def analyze_texts(
         "citations": citations,
         "chart_ids": [],
     }
-    if reading_note:
-        section["note"] = reading_note
+    # Провенанс раздела: в документе всегда видно, из какого датасета и за какой период взяты
+    # темы и цитаты. Без этой строки отчёт по одной теме мог содержать темы другого датасета,
+    # и заметить расхождение было невозможно.
+    scope_line = (
+        f"Датасет «{index_name}», период чтения {_iso(lo)} — {_iso(hi)}, "
+        f"прочитано {total_read} сообщений."
+    )
+    if phrase:
+        scope_line += f" Читались только сообщения с фразой «{phrase}»."
+    if hubs:
+        scope_line += f" Источник: {', '.join(hubs)}."
+    if coverage_note:
+        scope_line += " " + coverage_note
+    section["note"] = (scope_line + (" " + reading_note if reading_note else ""))
+    section["dataset"] = {
+        "index": idx,
+        "name": index_name,
+        "period": {"from": _iso(lo), "to": _iso(hi)},
+    }
     # Эти поля нужны структурному итогу запуска (<ГГГГ-ММ>_summary.json): по ним видно, каким
     # способом получены темы, сколько сообщений прочитано и сколько кластеров в отчёте.
     section["strategy"] = strategy
@@ -2245,6 +2383,8 @@ async def analyze_texts(
         f"Тональность среза: {tone_note}. Отбор важных сообщений: "
         f"{docs[0].get('importance_basis') if docs else '—'}."
     )
+    if phrase:
+        scope_note += f" Срез ограничен фразой «{phrase}»: темы и доли считаются только по этим сообщениям."
     if reading_note:
         scope_note += " " + reading_note
     if failed:

@@ -58,6 +58,121 @@ def _best_theme(query: str, themes: List[Dict[str, Any]]) -> Optional[Dict[str, 
     return None
 
 
+def _ru_period(text: str) -> Optional["tuple[str, str]"]:
+    """«01.03.2025 — 31.03.2025» → («2025-03-01», «2025-03-31») для проверки покрытия периода."""
+    parts = re.split(r"\s*[—–]\s*|\s+-\s+", str(text or "").strip())
+    if len(parts) != 2:
+        return None
+    out = []
+    for part in parts:
+        match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", part.strip())
+        if not match:
+            return None
+        day, month, year = match.groups()
+        out.append("%s-%s-%s" % (year, month, day))
+    return out[0], out[1]
+
+
+def _covers_period(item: Dict[str, Any], want_from: Any, want_to: Any) -> bool:
+    """Покрывает ли готовый датасет запрошенный период. Неизвестный период — не считаем покрытием."""
+    if not want_from or not want_to:
+        return True
+    try:
+        lo_want, hi_want = int(want_from), int(want_to)
+    except (TypeError, ValueError):
+        return True
+    bounds = _ru_period(str(item.get("period") or ""))
+    if bounds:
+        lo, hi = _period(bounds[0], bounds[1])
+    else:
+        # В подписи периода нет (например «БА Риномарис 20260917») — спрашиваем Elasticsearch.
+        # Имя индекса берём из справочника датасетов: у старых датасетов name и индекс не совпадают.
+        es_name = ""
+        try:
+            from .tools_data import index_map
+
+            es_name = (index_map() or {}).get(int(item.get("index"))) or ""
+        except Exception:
+            es_name = ""
+        if not es_name:
+            es_name = str(item.get("name") or "")
+        try:
+            from .tools_data import _period as _dataset_period
+
+            lo, hi = _dataset_period(es_name)
+        except Exception:
+            lo, hi = (None, None)
+        lo, hi = (str(lo) if lo else "", str(hi) if hi else "")
+        if not lo or not hi:
+            return False
+    try:
+        return int(lo) <= lo_want and int(hi) >= hi_want
+    except (TypeError, ValueError):
+        return False
+
+
+def _existing_dataset(theme_title: str, want_from: Any = None,
+                      want_to: Any = None) -> Optional[Dict[str, Any]]:
+    """Уже загруженный в Tellscope датасет по названию темы (без выгрузки из Brand Analytics)."""
+    try:
+        from . import tools_data as _td
+        items = _td.datasets_public()
+    except Exception:
+        return None
+    norm = getattr(_td, "_norm_text", None)
+
+    def _n(text: str) -> str:
+        text = str(text or "").lower()
+        if norm:
+            try:
+                return norm(text)
+            except Exception:
+                pass
+        return text
+
+    words = [w for w in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", _n(theme_title)) if len(w) >= 3]
+    if not words:
+        return None
+    threshold = max(1, len(words) - 1)
+    scored = []
+    for item in items or []:
+        hay = _n(str(item.get("name") or "")) + " " + _n(str(item.get("label") or ""))
+        score = sum(1 for word in words if word in hay)
+        if score >= threshold:
+            scored.append((score, item))
+    if not scored:
+        return None
+    # Из подходящих по названию берём тот, что реально покрывает запрошенный период:
+    # иначе на запрос «Мониторинг тем за 14–21.09.2026» подставлялся готовый датасет
+    # за март 2025 — отчёт выходил не про тот период, о котором спросили.
+    scored.sort(key=lambda pair: -pair[0])
+    for _score, item in scored:
+        if _covers_period(item, want_from, want_to):
+            return item
+    return None
+
+
+def _remember_dataset(ctx: Any, index: Any, label: str = "",
+                      period_from: Any = None, period_to: Any = None) -> None:
+    """Делает выгруженный датасет текущим для остальных инструментов запуска.
+
+    Иначе после успешной выгрузки инструменты без явного index продолжали работать с датасетом,
+    выбранным в интерфейсе: отчёт выходил по одной теме, а данные в нём — по другой.
+    """
+    try:
+        if index is not None:
+            ctx.dataset_index = int(index)
+        if label:
+            ctx.dataset_name = label
+            ctx.dataset_label = label
+        if period_from:
+            ctx.min_date = int(period_from)
+        if period_to:
+            ctx.max_date = int(period_to)
+    except Exception:
+        return
+
+
 @tool(
     "fetch_dataset",
     title="Загрузить тему из Brand Analytics",
@@ -81,38 +196,6 @@ def _best_theme(query: str, themes: List[Dict[str, Any]]) -> Optional[Dict[str, 
     timeout=570.0,
     cost=3,
 )
-def _existing_dataset(theme_title: str) -> Optional[Dict[str, Any]]:
-    """Уже загруженный в Tellscope датасет по названию темы (без выгрузки из Brand Analytics)."""
-    try:
-        from . import tools_data as _td
-        items = _td.datasets_public()
-    except Exception:
-        return None
-    norm = getattr(_td, "_norm_text", None)
-
-    def _n(text: str) -> str:
-        text = str(text or "").lower()
-        if norm:
-            try:
-                return norm(text)
-            except Exception:
-                pass
-        return text
-
-    words = [w for w in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", _n(theme_title)) if len(w) >= 3]
-    if not words:
-        return None
-    best, best_score = None, 0
-    for item in items or []:
-        hay = _n(str(item.get("name") or "")) + " " + _n(str(item.get("label") or ""))
-        score = sum(1 for word in words if word in hay)
-        if score > best_score:
-            best, best_score = item, score
-    if best is None or best_score < max(1, len(words) - 1):
-        return None
-    return best
-
-
 async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
                         wait_seconds: Optional[int] = None) -> Dict[str, Any]:
     """Загружает тему из Brand Analytics и возвращает новый датасет."""
@@ -137,9 +220,20 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
             )
         raise ToolError(f"В Brand Analytics нет темы «{theme}». Доступные темы: {titles}")
 
-    # Тема могла выгружаться раньше — тогда берём готовый датасет, а не идём в BA
-    existing = _existing_dataset(str(match.get("title") or theme))
+    tsf, tst = _period(date_from, date_to)
+    # Тема могла выгружаться раньше — берём готовый датасет, только если он покрывает
+    # запрошенный период; иначе идём в BA за нужными датами.
+    existing = _existing_dataset(str(match.get("title") or theme), tsf, tst)
     if existing:
+        bounds = _ru_period(str(existing.get("period") or ""))
+        if bounds:
+            use_from, use_to = _period(bounds[0], bounds[1])
+            _remember_dataset(ctx, existing.get("index"),
+                              str(existing.get("label") or existing.get("name") or ""),
+                              use_from, use_to)
+        else:
+            _remember_dataset(ctx, existing.get("index"),
+                              str(existing.get("label") or existing.get("name") or ""))
         return {
             "status": "используется ранее загруженный датасет",
             "theme": match.get("title"),
@@ -154,7 +248,6 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
             ),
         }
 
-    tsf, tst = _period(date_from, date_to)
     job_id = uuid.uuid4().hex[:12]
     body = ba_api.ImportBody(
         theme_id=str(match["theme_id"]),
@@ -168,18 +261,21 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
 
     limit = min(int(wait_seconds or DEFAULT_WAIT), MAX_WAIT)
     deadline = time.time() + limit
+    check = 0
     while time.time() < deadline:
         await asyncio.sleep(5)
+        check += 1
         try:
             status = ba_api.job_status(job_id)
         except Exception:
-            continue
+            status = {}
         state = status.get("status")
         if state == "done":
             rec = status.get("summary") or {}
             index_key = rec.get("index_key")
             index_name = rec.get("index_name") or ""
             label, period = _split_name(index_name)
+            _remember_dataset(ctx, index_key, index_name or label, tsf, tst)
             return {
                 "status": "готово",
                 "theme": match.get("title"),
@@ -187,6 +283,7 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
                 "index": index_key,
                 "label": label,
                 "period": period,
+                "period_requested": {"from": date_from, "to": date_to},
                 "file": rec.get("file"),
                 "bytes": rec.get("bytes"),
                 "hint": (
@@ -196,6 +293,26 @@ async def fetch_dataset(ctx, theme: str, date_from: str = "", date_to: str = "",
             }
         if state == "error":
             raise ToolError(f"Выгрузка из Brand Analytics не удалась: {status.get('message')}")
+        if check % 6 == 0:
+            # Статус задачи в BA иногда не доходит до «готово», хотя датасет уже собран:
+            # проверяем справочник датасетов, чтобы не отдавать «идёт загрузка» на готовые данные.
+            ready = _existing_dataset(str(match.get("title") or theme), tsf, tst)
+            if ready:
+                _remember_dataset(ctx, ready.get("index"),
+                                  str(ready.get("label") or ready.get("name") or ""), tsf, tst)
+                return {
+                    "status": "готово",
+                    "theme": match.get("title"),
+                    "dataset": ready.get("name"),
+                    "index": ready.get("index"),
+                    "label": ready.get("label") or ready.get("name"),
+                    "period": ready.get("period") or "",
+                    "period_requested": {"from": date_from, "to": date_to},
+                    "hint": (
+                        f"Данные загружены: работайте с темой «{ready.get('name')}» "
+                        f"(index {ready.get('index')}) обычными инструментами"
+                    ),
+                }
 
     return {
         "status": "идёт загрузка",

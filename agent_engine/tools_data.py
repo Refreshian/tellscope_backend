@@ -8,6 +8,7 @@ main._guard_index_access(user, index).
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -351,10 +352,104 @@ def _tone_filter(tone: Optional[str]) -> Optional[dict]:
     return None
 
 
-def _query(phrase: Optional[str], lo: Optional[int], hi: Optional[int], tone: Optional[str] = None) -> dict:
+_OR_SPLIT = re.compile(r"\s*\|\s*|\s+или\s+|\s+OR\s+", re.IGNORECASE)
+
+
+def _phrase_clauses(phrase: Optional[str]) -> List[str]:
+    """Фраза поиска или список альтернатив: «Боевое Братство | Саблин», «Саблин или Братство».
+
+    Запрос «только в привязке к X или Y» иначе превращался в поиск одной длинной строки
+    «X или Y» и не находил ничего: match_phrase ищет точную последовательность слов.
+    """
+    text = str(phrase or "").strip()
+    if not text:
+        return []
+    parts = [part.strip() for part in _OR_SPLIT.split(text) if part.strip()]
+    parts = [part for part in parts if len(part) >= 3]
+    return parts or [text]
+
+
+def related_datasets(phrase: Optional[str], limit: int = 3) -> List[Dict[str, Any]]:
+    """Датасеты, в названии или подписи которых встречается фраза.
+
+    Нужно для подсказки при нуле находок: «Риномарис» в датасете другого бренда не найдётся,
+    зато найдётся датасет этой темы — и агент переключится на него, а не напишет отчёт наугад.
+    """
+    text = _norm_text(phrase)
+    stem = _stem(phrase).strip().lower()
+    if len(text) < 3:
+        return []
+    found = []
+    for idx, name in index_map().items():
+        label, period = _split_name(name)
+        hay = _norm_text(label) + " " + _norm_text(name)
+        if text in hay or (len(stem) >= 3 and stem in hay):
+            found.append({"index": idx, "label": label or name, "period": period})
+    found.sort(key=lambda row: -int(row["index"]))
+    return found[:limit]
+
+
+def _norm_hub(value: Any) -> str:
+    """Площадка в сравнимом виде: «VK.com» → «vk.com», «ВКонтакте» → «вконтакте»."""
+    return _norm_text(value).replace(" ", "").strip().lower()
+
+
+def resolve_hubs(index_name: str, value: Optional[str], limit: int = 12) -> Dict[str, Any]:
+    """Подбирает реальные значения поля hub по тому, как площадку назвал пользователь.
+
+    Площадки в данных — домены («vk.com», «telegram.org»), а в задаче их называют словами
+    («ВКонтакте», «вк», «телеграм»). Без сопоставления фильтр по источнику молча давал ноль.
+    """
+    requested = str(value or "").strip()
+    if not requested:
+        return {"hubs": [], "available": [], "matches": []}
+    known = [str(row.get("key") or "") for row in _terms(index_name, "hub", 40) if row.get("key")]
+    wanted = _norm_hub(requested)
+    exact = [hub for hub in known if _norm_hub(hub) == wanted]
+    if exact:
+        return {"hubs": exact, "available": known, "matches": exact}
+    loose = [hub for hub in known if wanted and (wanted in _norm_hub(hub) or _norm_hub(hub) in wanted)]
+    if loose:
+        return {"hubs": loose, "available": known, "matches": loose}
+    # «вк» → «vk.com»: сравниваем по началу домена и по транслиту
+    # (нормализация переводит «ВКонтакте» в латиницу, поэтому держим оба написания)
+    alias = {"вк": "vk", "вконтакте": "vk", "vk": "vk", "vkontakte": "vk",
+             "телеграм": "telegram", "тг": "telegram", "telegram": "telegram", "tg": "telegram",
+             "одноклассники": "ok", "ок": "ok", "ok": "ok", "odnoklassniki": "ok",
+             "ютуб": "youtube", "youtube": "youtube", "твиттер": "twitter", "twitter": "twitter",
+             "инстаграм": "instagram", "instagram": "instagram",
+             "дзен": "dzen", "яндексдзен": "dzen", "dzen": "dzen", "zen": "dzen",
+             "вксосед": "vk", "макс": "max", "max": "max"}
+    stem = alias.get(wanted, wanted)
+    if stem:
+        by_alias = [hub for hub in known if stem and stem in _norm_hub(hub)]
+        if by_alias:
+            return {"hubs": by_alias, "available": known, "matches": by_alias}
+    return {"hubs": [], "available": known, "matches": []}
+
+
+def _hub_filter(hubs: List[str]) -> Optional[dict]:
+    values = [hub for hub in hubs if hub]
+    if not values:
+        return None
+    if len(values) == 1:
+        return {"term": {"hub": values[0]}}
+    return {"terms": {"hub": values[:10]}}
+
+
+def _query(phrase: Optional[str], lo: Optional[int], hi: Optional[int], tone: Optional[str] = None,
+           hubs: Optional[List[str]] = None) -> dict:
     must: List[dict] = []
-    if phrase and str(phrase).strip():
-        must.append({"match_phrase": {"text": str(phrase).strip()}})
+    clauses = _phrase_clauses(phrase)
+    if len(clauses) > 1:
+        must.append({
+            "bool": {
+                "should": [{"match_phrase": {"text": clause}} for clause in clauses],
+                "minimum_should_match": 1,
+            }
+        })
+    elif clauses:
+        must.append({"match_phrase": {"text": clauses[0]}})
     filters: List[dict] = []
     if lo or hi:
         rng: Dict[str, Any] = {}
@@ -366,6 +461,9 @@ def _query(phrase: Optional[str], lo: Optional[int], hi: Optional[int], tone: Op
     tone_q = _tone_filter(tone)
     if tone_q:
         filters.append(tone_q)
+    hub_q = _hub_filter(list(hubs or []))
+    if hub_q:
+        filters.append(hub_q)
     query: Dict[str, Any] = {"bool": {}}
     if must:
         query["bool"]["must"] = must
@@ -427,6 +525,47 @@ async def list_datasets(ctx, include_shared: bool = False):
     }
 
 
+def coverage_hint(index_name: str, requested_lo: Any = None, requested_hi: Any = None) -> str:
+    """Что делать, если запрошенный период шире данных датасета.
+
+    Возвращает готовую подсказку с вызовом fetch_dataset: без неё агент молча строил отчёт по
+    урезанному периоду (запросили 20–27 сентября, а данные кончались 21-м).
+    """
+    try:
+        data_lo, data_hi = _period(index_name)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not (data_lo and data_hi):
+        return ""
+    try:
+        want_lo = int(requested_lo) if requested_lo else int(data_lo)
+        want_hi = int(requested_hi) if requested_hi else int(data_hi)
+    except (TypeError, ValueError):
+        return ""
+    gaps = []
+    missing_from = missing_to = None
+    if want_lo < int(data_lo):
+        end = min(int(data_lo) - 1, want_hi)
+        gaps.append(f"нет данных с {_iso(want_lo)} по {_iso(end)}")
+        missing_from, missing_to = want_lo, end
+    if want_hi > int(data_hi):
+        start = max(int(data_hi) + 1, want_lo)
+        gaps.append(f"нет данных с {_iso(start)} по {_iso(want_hi)}")
+        if missing_from is None:
+            missing_from, missing_to = start, want_hi
+    if not gaps:
+        return ""
+    label, _given_period = _split_name(index_name)
+    return (
+        f"Период задачи шире данных датасета «{index_name}» ({_iso(data_lo)} — {_iso(data_hi)}): "
+        + "; ".join(gaps)
+        + f". Выгрузите недостающий период из Brand Analytics инструментом fetch_dataset "
+          f"(theme=\"{label or index_name}\", date_from=\"{_iso(missing_from)}\", "
+          f"date_to=\"{_iso(missing_to)}\") и дальше работайте с полученным датасетом; "
+          "отчёт по урезанному периоду без такой выгрузки собирать не нужно."
+    )
+
+
 @tool(
     "dataset_overview",
     title="Обзор датасета",
@@ -457,6 +596,15 @@ async def dataset_overview(ctx, index: Optional[int] = None, top_n: int = 10):
     notes = ["toneMark: -1 негатив, 0 нейтрал, 1 позитив"]
     if not lo:
         notes.append(NO_TIME_NOTE)
+    # Период задачи мог быть урезан до границ датасета — говорим об этом прямо и подсказываем выгрузку.
+    try:
+        _want_lo = getattr(ctx, "min_date", None)
+        _want_hi = getattr(ctx, "max_date", None)
+    except Exception:  # noqa: BLE001
+        _want_lo = _want_hi = None
+    hint = coverage_hint(index_name, _want_lo, _want_hi)
+    if hint:
+        notes.append(hint)
     return {
         "index": idx,
         "index_name": index_name,
@@ -466,6 +614,7 @@ async def dataset_overview(ctx, index: Optional[int] = None, top_n: int = 10):
         "hubs": _terms(index_name, "hub", top_n),
         "cities": _terms(index_name, "city", top_n),
         "monthly_dynamics": _monthly(index_name, limit=48),
+        "coverage_hint": hint,
         "note": "; ".join(notes),
     }
 
@@ -491,6 +640,7 @@ async def dataset_overview(ctx, index: Optional[int] = None, top_n: int = 10):
             "limit": {"type": "integer", "description": "сколько примеров вернуть (по умолчанию 10, максимум 30)"},
             "sort": {"type": "string", "enum": ["date_desc", "date_asc", "relevance"], "description": "порядок примеров"},
             "expand": {"type": "boolean", "description": "расширять запрос формами слов и синонимами (по умолчанию да)"},
+            "hub": {"type": "string", "description": "площадка-источник: «vk.com», «telegram.org», «ВКонтакте» — фильтр по источнику сообщений"},
         },
         "required": ["phrase"],
     },
@@ -506,10 +656,13 @@ async def search_messages(
     limit: int = 10,
     sort: str = "date_desc",
     expand: bool = True,
+    hub: Optional[str] = None,
 ):
     idx, index_name = guard(ctx, index)
     lo, hi = dates(ctx, min_date, max_date)
     limit = max(1, min(int(limit or 10), 30))
+    hub_info = resolve_hubs(index_name, hub)
+    hubs = hub_info["hubs"]
 
     variants: List[str] = []
     per_term: Dict[str, int] = {}
@@ -520,7 +673,7 @@ async def search_messages(
         expanded_info = await semantic.expand_terms(ctx, phrase, use_llm=False)
         variants = expanded_info.get("variants") or []
 
-    query = semantic.build_query(variants, []) if variants else _query(phrase, lo, hi, tone)
+    query = semantic.build_query(variants, []) if variants else _query(phrase, lo, hi, tone, hubs)
     if variants:
         # период и тональность добавляем фильтрами, чтобы не терять расширенные формулировки
         filters: List[dict] = []
@@ -531,7 +684,7 @@ async def search_messages(
             if hi:
                 rng["lte"] = int(hi)
             filters.append({"range": {"timeCreate": rng}})
-        filters.extend(_query("", None, None, tone).get("bool", {}).get("filter") or [])
+        filters.extend(_query("", None, None, tone, hubs).get("bool", {}).get("filter") or [])
         if filters:
             query.setdefault("bool", {})["filter"] = filters
         per_term = semantic.count_terms(index_name, variants, filters)
@@ -559,11 +712,36 @@ async def search_messages(
             notes.append(NO_TIME_NOTE)
     if variants:
         notes.append("Поиск расширен формами слов и синонимами: см. search_terms и per_term_counts — только эти формулировки дают данное число сообщений.")
+    if total == 0 and phrase and str(phrase).strip():
+        # Ноль находок чаще всего означает не «темы нет», а «тема в другом датасете»: раньше агент
+        # в такой ситуации продолжал работать в текущем датасете и собирал отчёт не по той теме.
+        hint = (
+            f"По фразе «{phrase}» в датасете «{index_name}» ничего не найдено. Если тема относится "
+            "к другому датасету, вызовите list_datasets, выберите подходящий и повторите поиск по нему; "
+            "отсутствующую тему можно выгрузить из Brand Analytics инструментом fetch_dataset."
+        )
+        related = related_datasets(phrase)
+        if related:
+            hint += " Похожие датасеты: " + "; ".join(
+                "«%s» (index %s%s)" % (row["label"], row["index"],
+                                       ", период %s" % row["period"] if row.get("period") else "")
+                for row in related
+            ) + "."
+        notes.append(hint)
+
+    if hub and not hubs:
+        notes.append(
+            "Площадку «%s» в датасете найти не удалось — фильтр по источнику не применён. "
+            "Доступные площадки: %s." % (hub, ", ".join(hub_info["available"][:10]) or "нет данных")
+        )
+    elif hub and hubs and _norm_hub(hub) not in [_norm_hub(item) for item in hubs]:
+        notes.append("Площадка «%s» сопоставлена с %s." % (hub, ", ".join(hubs)))
 
     result = {
         "index": idx,
         "index_name": index_name,
         "phrase": phrase,
+        "hub_filter": hubs,
         "period": {"from": _iso(lo) if lo else None, "to": _iso(hi) if hi else None},
         "messages_found": total,
         "tonality": _tone_rows(_terms(index_name, "toneMark", 5, query)),

@@ -1049,6 +1049,42 @@ def _allowed_dataset_stems(user_id):
     return stems
 
 
+
+
+async def _guard_body_datasets(request: Request, user, resolver) -> None:
+    """403, если в теле запроса выбран чужой датасет.
+
+    Проверяем **разрешённое** имя индекса, а не то, что прислал клиент: клиент может
+    прислать короткое имя, которое подстрочный поиск сведёт к чужому индексу. Тело
+    читается повторно через `request.json()` — Starlette кэширует body, поэтому
+    обработчик получит те же данные.
+    """
+    if getattr(user, "is_superuser", False):
+        return
+    try:
+        payload = await request.json()
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    names = payload.get("selected_databases") or payload.get("db_name")
+    if isinstance(names, str):
+        names = [names]
+    if not isinstance(names, list) or not names:
+        return
+    indexes = load_dict_from_pickle(
+        '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
+    try:
+        resolved = resolver(indexes, [str(n) for n in names if n])
+    except Exception:
+        return
+    allowed = _allowed_dataset_stems(getattr(user, "id", None))
+    denied = [c for c in resolved if str(c).strip().lower() not in allowed]
+    if denied:
+        raise HTTPException(
+            status_code=403,
+            detail="Нет доступа к наборам данных: %s" % ", ".join(denied[:5]))
+
 def _guard_index_access(user, index):
     if not index:
         return
@@ -2382,6 +2418,7 @@ async def chain_graph(
     index_name = indexes.get(index) or indexes.get(str(index))
     if not index_name:
         raise HTTPException(status_code=404, detail='Индекс не найден')
+    _guard_index_access(user, index)
     body = {
         'size': 3000,
         '_source': ['text', 'title', 'timeCreate', 'hub', 'hubtype', 'authorObject', 'url', 'likesCount', 'commentsCount', 'duplicateCount', 'toneMark'],
@@ -2480,6 +2517,8 @@ async def ai_analytics_get(
 ) -> ModelAiAnalytics:
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
+    # Проверка владения до запроса: иначе сам факт ответа уже раскрывал бы чужой датасет.
+    _guard_index_access(user, index)
     
     # Получаем все данные (без фильтрации по дате сначала)
     all_data = elastic_query(theme_index=indexes[index], query_str=query_str)
@@ -4860,7 +4899,13 @@ async def run_llm_query(task_data: dict):
         embeddings_full = []
         qdrant_hashes = []
         try:
-            embeddings_full, qdrant_hashes, _qt = await load_qdrant_data(indexes[int(task_data['index'])])
+            # Коллекция Qdrant выбирается вместе с моделью: базовые коллекции 768-мерные,
+            # __bge — 1024. Иначе векторы одной размерности ушли бы в коллекцию другой.
+            from mlops.embed_switch import collection_and_encoder as _pick_collection
+
+            _qdrant_collection, _qdrant_encoder = _pick_collection(
+                indexes[int(task_data['index'])])
+            embeddings_full, qdrant_hashes, _qt = await load_qdrant_data(_qdrant_collection)
             if qdrant_hashes:
                 qdrant_ok = True
         except Exception as exc:
@@ -4925,6 +4970,16 @@ async def run_llm_query(task_data: dict):
                 dedup_map.setdefault(_t, []).append(_idx)
             _uniq = list(dedup_map.keys())
             def _encode_batch(ts):
+                # Размерность обязана совпасть с коллекцией: для __bge считаем тем же
+                # сервисом bge-m3, иначе 768-мерные векторы попадут в 1024-мерную.
+                if _qdrant_encoder == 'bge':
+                    from mlops.embed_switch import encode_passages as _encode_passages
+
+                    vecs = _encode_passages(ts)
+                    if not vecs:
+                        raise RuntimeError(
+                            'Сервис эмбеддингов недоступен: векторы для __bge не посчитать')
+                    return vecs
                 return model_manager.encode_texts(ts, batch_size=64)
             _vecs = await loop.run_in_executor(executor, _encode_batch, _uniq)
             _emb_by_text = {_t: _vecs[_i] for _i, _t in enumerate(_uniq)}
@@ -6113,6 +6168,16 @@ async def _forbid_foreign_body_user(request: Request, user: User = Depends(curre
     if not isinstance(payload, dict):
         return
     _guard_user_id(user, payload.get("user_id"))
+    # Кроме чужого user_id проверяем и индекс: тело запроса решает, какой датасет
+    # читать, а результат складывается в папку запросившего. Без этой проверки любой
+    # авторизованный пользователь мог выгрузить чужой корпус целиком.
+    _body_index = payload.get("index")
+    if _body_index not in (None, ""):
+        try:
+            _body_index = int(_body_index)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Некорректный индекс датасета")
+        _guard_index_access(user, _body_index)
 
 
 @app.post("/llm-run/", tags=['ai analytics'])
@@ -7256,6 +7321,25 @@ async def add_file(
 
     next_key = max(indexes.keys()) + 1 if indexes else 1
     formatted_value = json_filename.replace('.json', '').lower()
+    # Имя индекса — общий ключ доступа: два аккаунта с выгрузкой «отчёт.json»
+    # получили бы один индекс Elasticsearch, и проверка прав этого не заметила бы —
+    # оба владеют именем «законно». Поэтому имя закрепляется за первым загрузившим.
+    try:
+        from pr.index_names import claim as _claim_index_name
+
+        _granted, _name_owner = await _claim_index_name(redis_db, formatted_value, user_id)
+    except Exception as _exc:
+        # Сбой проверки не должен ломать загрузку: клиент Redis ниже используется всё
+        # равно, и при его недоступности загрузка упадёт сама, но по делу.
+        logger.warning(
+            'Не удалось проверить владельца имени индекса %s: %s', formatted_value, _exc)
+        _granted, _name_owner = True, str(user_id)
+    if not _granted:
+        raise HTTPException(
+            status_code=409,
+            detail=('Имя датасета «%s» уже занято другим пользователем (id %s). '
+                    'Переименуйте файл: имена индексов общие, и совпадение увело бы '
+                    'данные в один индекс.' % (formatted_value, _name_owner)))
     indexes[next_key] = formatted_value
     save_dict_to_pickle(file_path, indexes)
 
@@ -7395,7 +7479,7 @@ async def check_files(user_id: str, folder_name: str, user: User = Depends(curre
 # Удаление папки
 @app.delete("/delete-folder/{user_id}/{directory_type}/{folder_name}", tags=['data & folders'])
 async def delete_folder(user_id: str, directory_type: str, folder_name: str, user: User = Depends(current_user)):
-    _folder_guard(user_id, folder_name, user, need_write=True)
+    _folder_guard(user_id, folder_name, user, need_write=True, need_owner=True)
     # Получаем текущее содержимое для указанного пользователя
     json_folders = await redis_db.hget(user_id, directory_type)
     
@@ -7459,7 +7543,7 @@ async def delete_folder(user_id: str, directory_type: str, folder_name: str, use
 # Удаление файла
 @app.delete("/delete-file/{user_id}/{directory_type}/{directory_name}/{file_name}", tags=['data & folders'])
 async def delete_file(user_id: str, directory_type: str, directory_name: str, file_name: str, user: User = Depends(current_user)):
-    _folder_guard(user_id, directory_name, user, need_write=True)
+    _folder_guard(user_id, directory_name, user, need_write=True, need_owner=True)
     # Получаем директории для указанного user_id
     folders = await redis_db.hgetall(user_id)
     # Преобразуем байтовые строки в обычные строки и десериализуем JSON
@@ -10241,7 +10325,8 @@ async def convert_file_mlg(file: UploadFile = File(...), user: User = Depends(cu
 
 @app.post("/ai-question-analysis", tags=['data analytics'])
 async def ai_question_analysis(request: Request, user: User = Depends(current_user_any)):
-    from mlops.ai_bot_rag import handle_question_analysis
+    from mlops.ai_bot_rag import handle_question_analysis, resolve_collections
+    await _guard_body_datasets(request, user, resolve_collections)
     return await handle_question_analysis(
         request,
         es=es,
@@ -10258,7 +10343,8 @@ async def ai_question_analysis(request: Request, user: User = Depends(current_us
 
 @app.post("/ai-bot/corpus-summary", tags=['data analytics'])
 async def ai_bot_corpus_summary(request: Request, user: User = Depends(current_user_any)):
-    from mlops.ai_bot_rag import handle_corpus_summary
+    from mlops.ai_bot_rag import handle_corpus_summary, resolve_collections
+    await _guard_body_datasets(request, user, resolve_collections)
     return await handle_corpus_summary(
         request,
         es=es,
@@ -10269,19 +10355,22 @@ async def ai_bot_corpus_summary(request: Request, user: User = Depends(current_u
 
 @app.post("/ai-bot/deep-brief", tags=['data analytics'])
 async def ai_bot_deep_brief(request: Request, user: User = Depends(current_user_any)):
-    from mlops.ai_bot_rag import handle_deep_brief
+    from mlops.ai_bot_rag import handle_deep_brief, resolve_collections
+    await _guard_body_datasets(request, user, resolve_collections)
+    _uid_for_job = getattr(user, 'id', None)
     return await handle_deep_brief(
         request,
         es=es,
         load_indexes=lambda: load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'),
         logger=logger,
+        user_id=_uid_for_job,
     )
 
 
 @app.get("/ai-bot/deep-brief", tags=['data analytics'])
 async def ai_bot_deep_brief_status(request: Request, user: User = Depends(current_user_any)):
     from mlops.ai_bot_rag import handle_deep_brief_status
-    return await handle_deep_brief_status(request)
+    return await handle_deep_brief_status(request, user_id=getattr(user, 'id', None))
 
 # Инициализация клиента через mlops.gateway (ключи только из .env)
 client = GatewayChatClient(provider="aitunnel", profile="dashboard_qa")
@@ -11793,15 +11882,21 @@ app.include_router(file_origin_router)
 from tone_check import router as tone_check_router
 app.include_router(tone_check_router)
 
+# PR-аналитика: решения «Эффективность PR-кампаний».
+# Роутер собирается фабрикой: зависимости (аутентификация, Elasticsearch, Redis)
+# передаём явно, чтобы модуль pr не импортировал main и не было цикла.
+from pr.api import build_router as build_pr_router
+app.include_router(build_pr_router(current_user, es, redis_db))
+
 @app.post("/graph-analysis/cluster-summary", tags=['data analytics'])
 async def graph_cluster_summary(request: Request, user: User = Depends(current_user_any)):
     from mlops.author_graph import handle_cluster_summary
-    return await handle_cluster_summary(request)
+    return await handle_cluster_summary(request, user_id=getattr(user, 'id', None))
 
 @app.get("/graph-analysis/cluster-summary/status", tags=['data analytics'])
 async def graph_cluster_summary_status(request: Request, user: User = Depends(current_user_any)):
     from mlops.author_graph import handle_cluster_summary_status
-    return await handle_cluster_summary_status(request)
+    return await handle_cluster_summary_status(request, user_id=getattr(user, 'id', None))
 
 
 from auth.database import User as AuthUser
@@ -11876,7 +11971,7 @@ class AdminShareBody(BaseModel):
     access: str = "read"
 
 
-def _folder_allowed(owner_user_id, folder, user, need_write=False):
+def _folder_allowed(owner_user_id, folder, user, need_write=False, need_owner=False):
     """Owner / superuser всегда имеют доступ; иначе — запись в реестре shares."""
     try:
         if str(user.id) == str(owner_user_id):
@@ -11884,6 +11979,11 @@ def _folder_allowed(owner_user_id, folder, user, need_write=False):
         if getattr(user, "is_superuser", False):
             return True
     except Exception:
+        return False
+    if need_owner:
+        # Удаление данных владельца не отдаём даже тому, кому дали право записи:
+        # «доступ на запись» иначе превращался в право снести индекс вместе с
+        # файлами на диске.
         return False
     if not folder:
         return False
@@ -11897,8 +11997,8 @@ def _folder_allowed(owner_user_id, folder, user, need_write=False):
     return False
 
 
-def _folder_guard(owner_user_id, folder, user, need_write=False):
-    if not _folder_allowed(owner_user_id, folder, user, need_write=need_write):
+def _folder_guard(owner_user_id, folder, user, need_write=False, need_owner=False):
+    if not _folder_allowed(owner_user_id, folder, user, need_write=need_write, need_owner=need_owner):
         raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
 
 current_superuser = fastapi_users.current_user(active=True, superuser=True)
@@ -12516,9 +12616,18 @@ async def agent_tools_catalog(user: User = Depends(current_user)):
 @app.get("/agent/runs", tags=["agent mode"])
 async def agent_runs_list(user: User = Depends(current_user)):
     """История агентных запусков пользователя и расход токенов за сегодня."""
+    # Раздел открыли — значит очередь должна разбираться: запуск мог остаться ждать
+    # слот с прошлого сеанса пользователя.
+    _agent_ensure_scheduler()
     return {
         "runs": _agent_runs.list_runs(user.id),
         "active": len(_agent_runs.active_runs_for_user(user.id)),
+        "running": len(_agent_runs.running_runs_for_user(user.id)),
+        "queued": len([item for item in _agent_runs.queued_runs()
+                       if str(item.get("user_id")) == str(user.id)]),
+        "queue_length": len(_agent_runs.queued_runs()),
+        "capacity": _agent_runs.MAX_ACTIVE_TOTAL,
+        "per_user_capacity": _agent_runs.MAX_ACTIVE_PER_USER,
         "runs_today": _agent_runs.runs_today_for_user(user.id),
         "limit_per_day": _AGENT_MAX_RUNS_PER_DAY,
         "tokens_today": _agent_runs.tokens_today_for_user(user.id),
@@ -12534,10 +12643,11 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
         raise HTTPException(status_code=400, detail="Опишите задачу для агента")
     if request.index is not None:
         _guard_index_access(user, request.index)
-    if len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
-        raise HTTPException(status_code=409, detail="Уже есть активный агентный запуск — дождитесь его завершения")
-    if _agent_runs.active_runs_total() >= _agent_runs.MAX_ACTIVE_TOTAL:
-        raise HTTPException(status_code=409, detail="Агент занят другими запусками — попробуйте через минуту")
+    index, min_date, max_date = _resolve_run_target(query, request.index,
+                                                    request.min_date, request.max_date, user)
+    # Свободных слотов может не быть — это больше не отказ: запуск встаёт в очередь и
+    # стартует сам (агентный планировщик в agent_engine.runs). Жёсткими остаются только
+    # дневные лимиты: они защищают бюджет, а не железо.
     if _agent_runs.runs_today_for_user(user.id) >= _AGENT_MAX_RUNS_PER_DAY:
         raise HTTPException(status_code=429, detail="Достигнут дневной лимит агентных запусков")
     spent_today = _agent_runs.tokens_today_for_user(user.id)
@@ -12549,32 +12659,23 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
                 f"({spent_today} из {_agent_runs.MAX_TOKENS_PER_DAY}). Лимит защищает бюджет на внешние модели."
             ),
         )
-    if (request.model or "") == "qwen":
-        try:
-            from mlops.runtime import GpuBusy, assert_can_start
-
-            assert_can_start("agent-mode")
-        except GpuBusy as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except HTTPException:
-            raise
-        except Exception:
-            pass
+    # Занятый GPU у локальной модели больше не отказ 409: запуск подождёт в очереди,
+    # а планировщик проверит GPU на своём тике (agent_engine.runs._gpu_free_for).
     run = _agent_runs.create_run(
         user=user,
         user_id=str(user.id),
         task=query,
-        dataset_index=request.index,
-        dataset_name=_agent_dataset_name(request.index),
-        dataset_label=_agent_dataset_name(request.index),
-        min_date=request.min_date,
-        max_date=request.max_date,
+        dataset_index=index,
+        dataset_name=_agent_dataset_name(index),
+        dataset_label=_agent_dataset_name(index),
+        min_date=min_date,
+        max_date=max_date,
         tools=request.tools,
         model_choice=(request.model or _AGENT_DEFAULT_CHOICE),
         folder=(request.folder or "Агент"),
         token_budget=request.max_tokens,
     )
-    _agent_runs.start_run(run, user)
+    queued = await _agent_runs.enqueue_run(run, user)
     return {
         "run_id": run["run_id"],
         "status": run["status"],
@@ -12582,6 +12683,10 @@ async def agent_run_start(request: AgentRunRequest, user: User = Depends(current
         "model": run.get("model_label"),
         "token_budget": run.get("token_budget"),
         "dataset": run.get("dataset_name"),
+        # Очередь: интерфейс показывает «в очереди, №2» вместо отказа «агент занят».
+        "started": bool(queued.get("started")),
+        "queue_position": int(queued.get("position") or 0),
+        "queue": _agent_runs.queue_info(run["run_id"]),
     }
 
 
@@ -12781,6 +12886,12 @@ _agent_scheduler_started = False
 def _agent_ensure_scheduler() -> None:
     """Планировщик расписаний поднимаем при первом обращении к разделу агентов."""
     global _agent_scheduler_started
+    # Разбор очереди запусков — отдельно от расписаний агентов: падение одного
+    # планировщика не должно оставлять запуски в очереди навсегда. Вызов идемпотентный.
+    try:
+        _agent_runs.start_queue_scheduler(asyncio.get_running_loop())
+    except Exception as exc:
+        print(f"agent queue scheduler start error: {exc}")
     if _agent_scheduler_started:
         return
     try:
@@ -12887,8 +12998,7 @@ async def agent_agents_run(agent_id: str, user: User = Depends(current_user)):
         raise HTTPException(status_code=400, detail="У агента нет инструкции")
     if agent.get("dataset_index") is not None:
         _guard_index_access(user, agent.get("dataset_index"))
-    if len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
-        raise HTTPException(status_code=409, detail="Уже есть активный агентный запуск — дождитесь завершения")
+    # Слотов может не хватить — это не отказ: запуск встанет в очередь.
     if _agent_runs.tokens_today_for_user(user.id) >= _agent_runs.MAX_TOKENS_PER_DAY:
         raise HTTPException(status_code=429, detail="Достигнут дневной лимит расхода токенов агента")
     run = _agent_agents_store.start_agent_run(user.id, agent, user)
@@ -13386,6 +13496,166 @@ async def harness_task_filters(user: User = Depends(current_user)):
     }
 
 
+_RU_MONTH_PREFIXES = (
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("май", 5), ("мая", 5),
+    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
+    ("ноябр", 11), ("декабр", 12),
+)
+_RU_MONTH_WORDS = "|".join(sorted((prefix for prefix, _ in _RU_MONTH_PREFIXES),
+                                  key=len, reverse=True))
+
+
+def _ru_month_number(word: str) -> int:
+    low = str(word or "").strip().lower()
+    for prefix, number in _RU_MONTH_PREFIXES:
+        if low.startswith(prefix):
+            return number
+    return 0
+
+
+def _resolve_run_target(text: str, index, min_date, max_date, user):
+    """Датасет и период запуска: из текста задачи, если он их называет.
+
+    Экран «Агент» отправляет датасет, выбранный в интерфейсе, и запрос про другую тему
+    уходил в чужой датасет с чужим периодом. Возвращает (index, min_date, max_date).
+    """
+    text_lo, text_hi = _task_period_from_text(text)
+    if text_lo and text_hi:
+        min_date, max_date = text_lo, text_hi
+    topic_index = _task_dataset_from_text(text)
+    if topic_index is not None and topic_index != index:
+        current_label = _dataset_topic_label(index) if index is not None else ""
+        mentioned = False
+        if current_label:
+            try:
+                from agent_engine.tools_data import _norm_text as _norm_task_text
+
+                mentioned = current_label in _norm_task_text(text)
+            except Exception:
+                mentioned = False
+        if not mentioned:
+            _guard_index_access(user, topic_index)
+            index = topic_index
+            if not (text_lo and text_hi):
+                min_date, max_date = _dataset_period_bounds(topic_index)
+    return index, min_date, max_date
+
+
+def _task_period_from_text(text: str):
+    """Период, названный в тексте задачи: «20-27 сентября 2026» → (unix начала, unix конца).
+
+    Период брался из датасета, выбранного в интерфейсе, из-за чего запрос «за 20–27 сентября»
+    уходил в чужие даты. Названные в тексте даты важнее.
+    """
+    import re as _re
+
+    from agent_engine.context import to_unix_end, to_unix_start
+
+    flat = str(text or "").replace("\u00a0", " ").replace("\u2013", "-").replace("\u2014", "-")
+
+    def stamp(day: int, month: int, year: int, end: bool) -> str:
+        iso = "%04d-%02d-%02d" % (year, month, day)
+        value = to_unix_end(iso) if end else to_unix_start(iso)
+        return str(value) if value else ""
+
+    pattern_range = _re.compile(
+        r"(\d{1,2})\s*(?:-|по|до)\s*(\d{1,2})\s+(%s)\w*\s*(\d{4})" % _RU_MONTH_WORDS,
+        _re.IGNORECASE,
+    )
+    found = pattern_range.search(flat)
+    if found:
+        day_from, day_to, month_word, year = found.groups()
+        month = _ru_month_number(month_word)
+        if month:
+            return (stamp(int(day_from), month, int(year), False),
+                    stamp(int(day_to), month, int(year), True))
+
+    pattern_day = _re.compile(r"(\d{1,2})\s+(%s)\w*\s*(\d{4})" % _RU_MONTH_WORDS,
+                              _re.IGNORECASE)
+    found = pattern_day.search(flat)
+    if found:
+        day, month_word, year = found.groups()
+        month = _ru_month_number(month_word)
+        if month:
+            return (stamp(int(day), month, int(year), False),
+                    stamp(int(day), month, int(year), True))
+
+    pattern_iso = _re.compile(
+        r"(\d{4}-\d{2}-\d{2})\s*(?:-|по|до)\s*(\d{4}-\d{2}-\d{2})")
+    found = pattern_iso.search(flat)
+    if found:
+        lo, hi = found.groups()
+        return str(to_unix_start(lo) or ""), str(to_unix_end(hi) or "")
+    return "", ""
+
+
+def _task_dataset_from_text(text: str):
+    """Свежий непустой датасет темы, названной в тексте задачи.
+
+    Задача создавалась с датасетом, выбранным в интерфейсе, а тема из текста игнорировалась:
+    запрос про «Риномарис» уходил в датасет другого бренда, и отчёт выходил не по той теме.
+    """
+    try:
+        from agent_engine.tools_data import (_exact_count, _match_dataset, _period, _split_name,
+                                             index_map, related_datasets)
+    except Exception:
+        return None
+    try:
+        matched = _match_dataset(text)
+        if matched is None:
+            return None
+        mapping = index_map() or {}
+        name = mapping.get(int(matched))
+        label = _split_name(name)[0] if name else ""
+        rows = related_datasets(label) or [{"index": int(matched), "label": label, "period": ""}]
+        best = None
+        for row in rows:
+            idx = int(row["index"])
+            es_name = mapping.get(idx)
+            if not es_name:
+                continue
+            try:
+                # Пустые датасеты темы (остатки старых выгрузок) в работу не берём.
+                if not _exact_count(es_name, {"match_all": {}}):
+                    continue
+                _lo, hi = _period(es_name)
+            except Exception:
+                continue
+            key = (int(hi or 0), idx)
+            if best is None or key > best[0]:
+                best = (key, idx)
+        return best[1] if best else int(matched)
+    except Exception:
+        return None
+
+
+def _dataset_topic_label(index) -> str:
+    """Нормализованная подпись темы датасета — чтобы понять, упомянута ли она в тексте задачи."""
+    try:
+        from agent_engine.tools_data import _norm_text, _split_name, index_map
+
+        name = (index_map() or {}).get(int(index))
+        if not name:
+            return ""
+        return _norm_text(_split_name(name)[0])
+    except Exception:
+        return ""
+
+
+def _dataset_period_bounds(index):
+    """Период датасета в unix-секундах: (None, None), если период неизвестен."""
+    try:
+        from agent_engine.tools_data import _period, index_map
+
+        name = (index_map() or {}).get(int(index))
+        if not name:
+            return None, None
+        lo, hi = _period(name)
+        return (str(lo) if lo else None), (str(hi) if hi else None)
+    except Exception:
+        return None, None
+
+
 @app.post("/harness/task", tags=["harness"])
 async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(current_user)):
     """Создаёт задачу и выполняет выбранный режим: объяснить, выполнить, собрать цепочку или Dify-flow."""
@@ -13398,11 +13668,36 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
     mode = request.mode if request.mode in modes else "explain"
     if request.index is not None:
         _guard_index_access(user, request.index)
-    dataset_name = _harness_dataset_name(request.index)
+    index = request.index
+    min_date, max_date = request.min_date, request.max_date
+    # Даты, названные в тексте задачи, важнее периода выбранного в интерфейсе датасета.
+    text_lo, text_hi = _task_period_from_text(text)
+    if text_lo and text_hi:
+        min_date, max_date = text_lo, text_hi
+    # Если текст задачи называет свою тему, работаем по её датасету: выбранный в интерфейсе
+    # датасет может относиться к другому бренду, и тогда отчёт выходил не по той теме.
+    topic_index = _task_dataset_from_text(text)
+    if topic_index is not None and topic_index != index:
+        current_label = _dataset_topic_label(index) if index is not None else ""
+        mentioned = False
+        if current_label:
+            try:
+                from agent_engine.tools_data import _norm_text as _norm_task_text
+
+                mentioned = current_label in _norm_task_text(text)
+            except Exception:
+                mentioned = False
+        if not mentioned:
+            _guard_index_access(user, topic_index)
+            index = topic_index
+            # Если период назван в тексте задачи — он важнее периода датасета.
+            if not (text_lo and text_hi):
+                min_date, max_date = _dataset_period_bounds(topic_index)
+    dataset_name = _harness_dataset_name(index)
     # Период, датасет и модель сохраняем в задаче: по ним работает «Запустить снова».
     task = _harness.create_task(
-        str(user.id), text, mode, request.index, dataset_name,
-        min_date=request.min_date, max_date=request.max_date, model=(request.model or _harness.DEFAULT_MODEL),
+        str(user.id), text, mode, index, dataset_name,
+        min_date=min_date, max_date=max_date, model=(request.model or _harness.DEFAULT_MODEL),
         tools=request.tools,
     )
 
@@ -13412,11 +13707,11 @@ async def harness_task_create(request: HarnessTaskRequest, user: User = Depends(
                 user=user,
                 user_id=str(user.id),
                 task=text,
-                dataset_index=request.index,
+                dataset_index=index,
                 dataset_name=dataset_name,
                 dataset_label=dataset_name,
-                min_date=request.min_date,
-                max_date=request.max_date,
+                min_date=min_date,
+                max_date=max_date,
                 tools=request.tools,
                 model_choice=(request.model or _harness.DEFAULT_MODEL),
                 folder="Центр задач",
@@ -13586,8 +13881,7 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
     task = _harness.get_task(user.id, task_id)
     if task is None:
         raise HTTPException(status_code=404, detail="Задача не найдена")
-    if _agent_runs.active_runs_for_user(user.id) and len(_agent_runs.active_runs_for_user(user.id)) >= _AGENT_MAX_ACTIVE_PER_USER:
-        raise HTTPException(status_code=409, detail="Уже есть активная задача — дождитесь завершения")
+    # Слотов может не хватить — задача встанет в очередь и стартует сама.
 
     agent_id = ((task.get("result") or {}).get("agent") or {}).get("id") if task.get("mode") == "chain" else None
     if agent_id:
@@ -13603,6 +13897,40 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
     else:
         dataset_index = task.get("dataset_index")
         dataset_name = task.get("dataset_name") or ""
+        text_lo, text_hi = _task_period_from_text(str(task.get("text") or ""))
+        if text_lo and text_hi:
+            # Повторный запуск тоже уважает даты из текста задачи.
+            task = _harness.update_task(str(user.id), task_id,
+                                        {"min_date": text_lo, "max_date": text_hi}) or task
+        # Повторный запуск тоже сверяем с текстом задачи: сохранённый датасет мог остаться
+        # от выбранного в интерфейсе и не иметь отношения к названной теме.
+        topic_index = _task_dataset_from_text(str(task.get("text") or ""))
+        if topic_index is not None and topic_index != dataset_index:
+            current_label = _dataset_topic_label(dataset_index) if dataset_index else ""
+            mentioned = False
+            if current_label:
+                try:
+                    from agent_engine.tools_data import _norm_text as _norm_task_text
+
+                    mentioned = current_label in _norm_task_text(str(task.get("text") or ""))
+                except Exception:
+                    mentioned = False
+            if not mentioned:
+                _guard_index_access(user, topic_index)
+                dataset_index = topic_index
+                dataset_name = _harness_dataset_name(topic_index)
+                task = _harness.update_task(str(user.id), task_id, {
+                    "dataset_index": dataset_index,
+                    "dataset_name": dataset_name,
+                }) or task
+                task_topic_bounds = ((text_lo, text_hi) if (text_lo and text_hi)
+                                     else _dataset_period_bounds(dataset_index))
+            else:
+                task_topic_bounds = ((text_lo, text_hi) if (text_lo and text_hi)
+                                     else (task.get("min_date"), task.get("max_date")))
+        else:
+            task_topic_bounds = ((text_lo, text_hi) if (text_lo and text_hi)
+                                 else (task.get("min_date"), task.get("max_date")))
         run = _agent_runs.create_run(
             user=user,
             user_id=str(user.id),
@@ -13610,15 +13938,16 @@ async def harness_task_run(task_id: str, user: User = Depends(current_user)):
             dataset_index=dataset_index,
             dataset_name=dataset_name,
             dataset_label=dataset_name,
-            # Постановку повторяем целиком: период, датасет и модель из записи задачи.
-            min_date=task.get("min_date"),
-            max_date=task.get("max_date"),
+            # Постановку повторяем целиком: период, датасет и модель из записи задачи;
+            # если датасет заменён по тексту — берём период этого датасета.
+            min_date=task_topic_bounds[0],
+            max_date=task_topic_bounds[1],
             tools=task.get("tools"),
             model_choice=str(task.get("model") or _harness.DEFAULT_MODEL),
             folder="Центр задач",
             mode=str(task.get("mode") or "run"),
         )
-        _agent_runs.start_run(run, user)
+        await _agent_runs.enqueue_run(run, user)
         run_id = run["run_id"]
     task = _harness.update_task(str(user.id), task_id, {"status": "running", "run_id": run_id, "unseen": False})
     return {
