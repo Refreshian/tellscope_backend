@@ -1373,7 +1373,7 @@ def _build_pdf(path: str, title: str, subtitle: str, sections: List[Dict[str, An
     },
     group="reports",
     scope="write",
-    timeout=300.0,
+    timeout=900.0,
 )
 async def build_report(
     ctx,
@@ -1625,11 +1625,26 @@ async def build_report(
                       % (_fmt(spam_info["messages"]), ", ".join(spam_info["topics"][:3])), level="info")
     # Из разделов убираем служебные технические сообщения перед сборкой документов.
     sections = _clean_sections(sections)
+    await ctx.log("Собираю документ отчёта…", level="info")
     _build_docx(docx_path, str(title), subtitle, sections, meta)
+    await ctx.log("Документ собран, конвертирую в PDF: %s" % os.path.basename(docx_path), level="info")
     pdf_ok = True
     pdf_error = ""
     try:
-        _build_pdf(pdf_path, str(title), subtitle, sections, meta)
+        # Конвертация идёт минутами и не пишет событий. Без heartbeat сторожевой таймер запусков
+        # (STALE_AFTER_SEC = 4 мин) объявлял запуск прерванным, хотя отчёт продолжал собираться.
+        import asyncio as _asyncio
+
+        loop = _asyncio.get_running_loop()
+        pending = loop.run_in_executor(None, _build_pdf, pdf_path, str(title), subtitle, sections, meta)
+        waited = 0
+        while True:
+            done, _still = await _asyncio.wait({pending}, timeout=25)
+            if done:
+                break
+            waited += 25
+            await ctx.log("Конвертирую отчёт в PDF… %d с" % waited, level="info")
+        pending.result()
     except Exception as exc:  # PDF не должен ломать отчёт
         pdf_ok = False
         pdf_error = f"{type(exc).__name__}: {exc}"
