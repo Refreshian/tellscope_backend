@@ -50,4 +50,4 @@ say "синхронизация wiki"
 
 say "готово"
 echo "фронтенд: https://tellscope40.headsmade.com"
-echo "документация: https://tellscope40.headsmade.com:8445"
+echo "документация: https://wiki.tellscope40.headsmade.com"
