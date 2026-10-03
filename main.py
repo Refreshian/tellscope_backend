@@ -13317,6 +13317,46 @@ async def agent_dify_info(request: Request, user: User = Depends(current_user)):
     }
 
 
+@app.get("/dify/gate", tags=["agent mode"])
+async def dify_gate(request: Request):
+    """Кого пускать в визуальный конструктор Dify. Спрашивает nginx на порту 8443.
+
+    Dify — отдельное приложение со своим входом, и рабочее пространство у него одно на
+    всех: у пользователя в браузере могла остаться чужая сессия, и он видел схемы другого
+    аккаунта («С возвращением, Alex»). Пока личные пространства не заведены, конструктор
+    открыт только администратору, а остальные работают со своими агентами в Tellscope.
+    """
+    import jwt as _jwt
+    from auth.auth import SECRET as _SECRET
+
+    token = ""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header[:7].lower() == "bearer ":
+        token = auth_header[7:].strip()
+    if not token:
+        token = (request.cookies.get("token")
+                 or request.cookies.get("access_token")
+                 or request.cookies.get("tellscope_refresh_token")
+                 or "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
+    try:
+        payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        uid = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
+
+    async with async_session_maker() as session:
+        user = await session.get(AuthUser, uid)
+    if user is None or not getattr(user, "is_active", True):
+        raise HTTPException(status_code=401, detail="Пользователь не найден")
+    if not getattr(user, "is_superuser", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Конструктор Dify открыт администратору: у каждого аккаунта будет своё пространство")
+    return {"ok": True, "user_id": uid}
+
+
 @app.get("/agent/service-tokens", tags=["agent mode"])
 async def agent_service_tokens_list(user: User = Depends(current_user)):
     """Список выданных сервисных токенов (значения маскируются)."""
