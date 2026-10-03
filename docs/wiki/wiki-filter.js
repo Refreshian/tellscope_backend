@@ -54,7 +54,9 @@
 
 	Promise.all([load(API + '/docs/pages'), load(API + '/docs/all')]).then(function (res) {
 		allowed = res[0].map(function (p) { return p.path; });
-		known = res[1].map(function (p) { return p.path; });
+		// Страницы, которым не соответствует вкладка сервиса (hidden), в вики остаются:
+		// скрывать их ссылки не нужно, из списка документации приложения они и так убраны.
+		known = res[1].filter(function (p) { return !p.hidden; }).map(function (p) { return p.path; });
 		hideLinks();
 		var observer = new MutationObserver(hideLinks);
 		observer.observe(document.body, { childList: true, subtree: true });

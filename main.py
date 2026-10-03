@@ -13698,26 +13698,76 @@ async def docs_gate(request: Request):
     return {"ok": True, "user_id": uid, "page": (item or {}).get("path", "")}
 
 
+# Порядок групп и разделов в документации повторяет левое меню: сначала ИИ-инструменты,
+# затем аналитика и данные — как в списке разделов сервиса.
+DOCS_GROUP_AI = "ИИ-инструменты"
+DOCS_GROUP_MAIN = "Аналитика и данные"
+DOCS_GROUP_HELP = "Справка"
+DOCS_AI_SECTIONS = ("harness", "dify", "agents")
+DOCS_GROUP_ORDER = (DOCS_GROUP_AI, DOCS_GROUP_MAIN, "Администрирование", DOCS_GROUP_HELP)
+
+
+def _docs_section_order():
+    """Порядок разделов интерфейса: он же порядок меню."""
+    try:
+        from access_sections import SECTIONS
+
+        return {str(item["slug"]): position for position, item in enumerate(SECTIONS)}
+    except Exception:
+        return {}
+
+
+DOCS_GROUP_ADMIN = "Администрирование"
+
+
+def _docs_group_for(section: str) -> str:
+    if not section:
+        return DOCS_GROUP_HELP
+    if section in DOCS_AI_SECTIONS:
+        return DOCS_GROUP_AI
+    if section == "admin":
+        return DOCS_GROUP_ADMIN
+    return DOCS_GROUP_MAIN
+
+
 @app.get("/docs/pages", tags=["docs"])
 async def docs_pages(user: User = Depends(current_user_any)):
-    """Содержание документации: только страницы выданных пользователю разделов."""
-    items = []
-    groups = []
-    for item in _docs_manifest():
-        if item.get("nav") is False:
+    """Содержание документации: страницы выданных разделов в порядке левого меню.
+
+    Страницы, которым не соответствует вкладка интерфейса (например «Конкуренты» —
+    её пункт в меню отключён), в приложении не показываем: документации нечего
+    описывать, если раздела нет.
+    """
+    order = _docs_section_order()
+    rows = []
+    for position, item in enumerate(_docs_manifest()):
+        if item.get("nav") is False or item.get("hidden") is True:
             continue
         if not _doc_allowed(user, item):
             continue
-        group = str(item.get("nav_group") or "Прочее")
-        if group not in groups:
-            groups.append(group)
-        items.append({
+        section = str(item.get("section") or "").strip()
+        group = _docs_group_for(section)
+        rows.append({
             "path": item["path"],
             "title": item.get("title") or item["path"],
             "description": item.get("description") or "",
             "group": group,
+            "section": section,
+            "_sort": (
+                DOCS_GROUP_ORDER.index(group),
+                order.get(section, 999),
+                item.get("order") if isinstance(item.get("order"), int) else 99,
+                position,
+            ),
         })
-    return {"pages": items, "groups": groups}
+    rows.sort(key=lambda row: row["_sort"])
+    for row in rows:
+        row.pop("_sort", None)
+    groups = []
+    for row in rows:
+        if row["group"] not in groups:
+            groups.append(row["group"])
+    return {"pages": rows, "groups": groups}
 
 
 @app.get("/docs/all", tags=["docs"])
@@ -13735,7 +13785,8 @@ async def docs_catalog(request: Request):
     if not auth_header and auth_header[:7].lower() != "bearer " and not token:
         raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
     return {"pages": [{"path": it["path"], "title": it.get("title") or it["path"],
-                       "section": str(it.get("section") or "")} for it in _docs_manifest()]}
+                       "section": str(it.get("section") or ""),
+                       "hidden": bool(it.get("hidden"))} for it in _docs_manifest()]}
 
 
 @app.get("/docs/page", tags=["docs"])

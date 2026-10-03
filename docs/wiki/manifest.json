@@ -7,7 +7,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "ai-analytics"
+    "section": "ai-analytics",
+    "order": 1
   },
   {
     "file": "centr-ii-zadach.md",
@@ -17,7 +18,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "ИИ-инструменты",
-    "section": "harness"
+    "section": "harness",
+    "order": 0
   },
   {
     "file": "dify.md",
@@ -27,7 +29,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "ИИ-инструменты",
-    "section": "dify"
+    "section": "dify",
+    "order": 0
   },
   {
     "file": "faq-i-oshibki.md",
@@ -47,7 +50,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "voice"
+    "section": "voice",
+    "order": 0
   },
   {
     "file": "graf-informacii.md",
@@ -57,7 +61,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "information-graph"
+    "section": "information-graph",
+    "order": 0
   },
   {
     "file": "ii-analiz.md",
@@ -67,7 +72,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "ai-analytics"
+    "section": "ai-analytics",
+    "order": 0
   },
   {
     "file": "ii-bot.md",
@@ -77,7 +83,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "ИИ-инструменты",
-    "section": "ai-bot"
+    "section": "ai-bot",
+    "order": 0
   },
   {
     "file": "index.md",
@@ -107,7 +114,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "graph-analysis"
+    "section": "graph-analysis",
+    "order": 1
   },
   {
     "file": "konkurenty.md",
@@ -117,7 +125,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": ""
+    "section": "",
+    "hidden": true
   },
   {
     "file": "media-rating.md",
@@ -127,7 +136,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "media"
+    "section": "media",
+    "order": 0
   },
   {
     "file": "moi-agenty.md",
@@ -137,7 +147,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "ИИ-инструменты",
-    "section": "agents"
+    "section": "agents",
+    "order": 0
   },
   {
     "file": "nabory-dannyh.md",
@@ -147,7 +158,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Данные и отчёты",
-    "section": "datasets"
+    "section": "datasets",
+    "order": 0
   },
   {
     "file": "nastrojki-i-dostupy.md",
@@ -167,7 +179,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Специальные разделы",
-    "section": "mosinform"
+    "section": "mosinform",
+    "order": 0
   },
   {
     "file": "otchety.md",
@@ -177,7 +190,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Данные и отчёты",
-    "section": "datasets"
+    "section": "datasets",
+    "order": 1
   },
   {
     "file": "pr-kampanii.md",
@@ -187,7 +201,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Специальные разделы",
-    "section": "pr-campaigns"
+    "section": "pr-campaigns",
+    "order": 0
   },
   {
     "file": "proverka-tonalnosti.md",
@@ -197,7 +212,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Данные и отчёты",
-    "section": "tonality"
+    "section": "tonality",
+    "order": 1
   },
   {
     "file": "smart-agent.md",
@@ -207,7 +223,9 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "ИИ-инструменты",
-    "section": "agents"
+    "section": "agents",
+    "hidden": true,
+    "order": 1
   },
   {
     "file": "svyazi-avtorov.md",
@@ -217,7 +235,8 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "graph-analysis"
+    "section": "graph-analysis",
+    "order": 0
   },
   {
     "file": "tonalnyy-landshaft.md",
@@ -227,6 +246,7 @@
     "locale": "ru",
     "nav": true,
     "nav_group": "Аналитика",
-    "section": "tonality"
+    "section": "tonality",
+    "order": 0
   }
 ]
