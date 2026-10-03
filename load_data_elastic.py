@@ -10,6 +10,7 @@ import tiktoken
 from elasticsearch.helpers import bulk, parallel_bulk
 from elasticsearch import Elasticsearch
 import os
+import re
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from tqdm import tqdm
@@ -28,6 +29,17 @@ import multiprocessing as mp
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("qdrant_loader")
+
+
+def dataset_index_name(file_name: str) -> str:
+    """Имя индекса Elasticsearch по имени файла датасета.
+
+    Файлы называются по-человечески — «Озон отзывы 01.09.2026-01.10.2026.json», — а в именах
+    индексов Elasticsearch пробелы и служебные символы недопустимы: заменяем их подчёркиванием.
+    """
+    base = str(file_name or "").replace(".json", "").lower()
+    base = re.sub(r"[^0-9a-zа-яё._-]+", "_", base).strip("_.-")
+    return base or "dataset"
 
 # Подключения
 redis_client = redis.Redis(host='localhost', port=6379, db=0)
@@ -62,7 +74,18 @@ OVERLAP = 150
 EMBED_BATCH_SIZE = 256
 QDRANT_BATCH_SIZE = 200
 # Большие файлы: если док-тов больше лимита - эмбеддинги пропускаем (только ES)
-EMBEDDING_MAX_DOCS = 150000
+# Порог, выше которого эмбеддинги раньше пропускались целиком. Жёсткие 150 000
+# оставили без векторов 31 корпус из 49 (14,99 млн документов — 96,6% объёма), и
+# проникновение ключевых сообщений считалось по ним терминологически, то есть не тем
+# методом, что обещан клиенту. Теперь лимита нет (0), а переменная осталась аварийным
+# тормозом: EMBEDDING_MAX_DOCS=200000 вернёт прежнее поведение.
+EMBEDDING_MAX_DOCS = int(os.environ.get("EMBEDDING_MAX_DOCS") or 0)
+# С какого размера корпуса считать векторы локально на GPU, а не сервисом эмбеддингов:
+# сервис считает на CPU ~4 документа в секунду, GPU — около 1 850.
+# Порог, с которого считаем локально на GPU. Ниже него выгоднее сервис на CPU.
+# 20 000 оказалось слишком много: корпус на 16,5 тыс. фрагментов уходил на CPU
+# и индексировался час вместо минут (4 документа в секунду против тысяч на GPU).
+EMBED_LOCAL_MIN_CHUNKS = int(os.environ.get("EMBED_LOCAL_MIN_CHUNKS") or 5000)
 ES_BATCH_SIZE = 2000
 
 encoding = tiktoken.get_encoding("cl100k_base")
@@ -334,17 +357,28 @@ def batch_process_documents_with_embeddings_optimized(documents, task_id=None):
         # Векторизация
         all_vectors = []
         chunk_batch_size = EMBED_BATCH_SIZE
+        USE_LOCAL_ENCODER = len(global_chunks) >= EMBED_LOCAL_MIN_CHUNKS
+        # Импорт нужен уже для строки в журнале ниже: раньше он был только внутри
+        # цикла, и первая же загрузка большого корпуса падала на UnboundLocalError.
+        from mlops import embed_batch as _embed_batch
+        if USE_LOCAL_ENCODER:
+            logger.info(f"Корпус большой ({len(global_chunks)} фрагментов): векторы считаются "
+                        f"локально, устройство {_embed_batch.pick_device('auto')}")
         total_batches = (len(global_chunks) + chunk_batch_size - 1) // chunk_batch_size
         
         for batch_idx in range(0, len(global_chunks), chunk_batch_size):
             batch_chunks = global_chunks[batch_idx:batch_idx + chunk_batch_size]
             
             try:
-                batch_vectors = model_manager.encode_texts(
-                    batch_chunks,
-                    batch_size=chunk_batch_size,
-                    normalize_embeddings=True
-                )
+                from mlops import embed_batch as _embed_batch
+
+                # Документы кодируем тем же bge-m3 с префиксом passage: иначе векторы
+                # окажутся в другом пространстве, чем запросы. На больших корпусах
+                # считаем локально на GPU (сервис на CPU даёт ~4 док./с, GPU ~1850),
+                # на обычных загрузках — сервисом, чтобы не грузить веса в загрузчик.
+                batch_vectors = _embed_batch.encode_passages(batch_chunks, local=USE_LOCAL_ENCODER)
+                if batch_vectors is None:
+                    raise RuntimeError('Сервис эмбеддингов недоступен: загрузка без векторов')
                 
                 if isinstance(batch_vectors, np.ndarray):
                     batch_vectors = batch_vectors.tolist()
@@ -485,21 +519,39 @@ def load_to_qdrant_optimized(collection_name, documents, task_id):
             logger.info(f"Создание коллекции {collection_name} с размерностью {vector_size}")
             
             # ✅ ПРОСТАЯ И НАДЁЖНАЯ КОНФИГУРАЦИЯ
+            # Конфигурация зависит от размера корпуса: миллионы точек нельзя держать
+            # в памяти (на 15,2 млн по 1024 измерения это ~150 ГБ, а контейнеру
+            # Qdrant отдано 16 ГБ), поэтому для крупных корпусов векторы и граф HNSW
+            # кладутся на диск, а квантование остаётся в памяти.
+            from pr.reembed import collection_config as _collection_config
+
             client_qdrant.create_collection(
                 collection_name=collection_name,
                 vectors_config=models.VectorParams(
                     size=vector_size,
-                    distance=models.Distance.COSINE
+                    distance=models.Distance.COSINE,
+                    on_disk=bool(_collection_config(vector_size, len(documents), "auto")
+                                 ["vectors"].get("on_disk")),
                 ),
-                # Минимальные настройки - Qdrant сам всё сделает
                 optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=20000,  # Индексация после 20К
+                    indexing_threshold=20000,
+                    memmap_threshold=int((_collection_config(vector_size, len(documents), "auto")
+                                          .get("optimizers_config") or {}).get("memmap_threshold") or 0),
                 ),
                 hnsw_config=models.HnswConfigDiff(
                     m=16,
                     ef_construct=100,
                     full_scan_threshold=10000,
-                )
+                    on_disk=bool((_collection_config(vector_size, len(documents), "auto")
+                                  .get("hnsw_config") or {}).get("on_disk")),
+                ),
+                quantization_config=(
+                    models.ScalarQuantization(
+                        scalar=models.ScalarQuantizationConfig(
+                            type=models.ScalarType.INT8, always_ram=True)) 
+                    if (_collection_config(vector_size, len(documents), "auto").get("quantization_config"))
+                    else None
+                ),
             )
             logger.info("✅ Коллекция создана")
         
@@ -737,7 +789,7 @@ def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None
             os.chdir(path)
         
         file_name = filename.filename if hasattr(filename, 'filename') else filename
-        new_index = file_name.replace('.json', '').lower()
+        new_index = dataset_index_name(file_name)
         
         logger.info(f"Создание оптимизированного индекса: {new_index}")
         
@@ -828,7 +880,7 @@ def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None
         # Лимит эмбеддингов: ES-загрузка всегда; эмбеддинги/Qdrant только для файлов
         # не больше лимита документов, либо если явно запрошено (build_embeddings=True).
         if build_embeddings is None:
-            build_embeddings = total_docs <= EMBEDDING_MAX_DOCS
+            build_embeddings = EMBEDDING_MAX_DOCS <= 0 or total_docs <= EMBEDDING_MAX_DOCS
 
         if not build_embeddings:
             logger.info(f"Файл большой ({total_docs} док. > {EMBEDDING_MAX_DOCS}) - эмбеддинги пропущены (только ES).")
@@ -859,7 +911,7 @@ def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None
                 continue
             if any(field in doc for field in ["text", "Текст сообщения", "title", "content"]):
                 docs_for_embeddings.append(doc)
-                if len(docs_for_embeddings) >= EMBEDDING_MAX_DOCS:
+                if EMBEDDING_MAX_DOCS > 0 and len(docs_for_embeddings) >= EMBEDDING_MAX_DOCS:
                     break
 
         processed_docs = batch_process_documents_with_embeddings_optimized(docs_for_embeddings, task_id)
@@ -880,7 +932,9 @@ def load_file_to_elstic(filename, path=None, task_id=None, build_embeddings=None
         )
 
         try:
-            load_to_qdrant_optimized(new_index, processed_docs, task_id)
+            # Пишем в __bge: коллекция с тем же именем, что индекс ES, остаётся
+            # старой (768) и больше не обновляется.
+            load_to_qdrant_optimized(new_index + '__bge', processed_docs, task_id)
         except Exception as e:
             logger.error(f"Ошибка Qdrant: {e}", exc_info=True)
             return {"status": "failed", "error": str(e)}

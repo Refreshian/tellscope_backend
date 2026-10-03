@@ -20,7 +20,7 @@ BA -> Tellscope manual import (P1).
 """
 from __future__ import annotations
 import argparse, hashlib, json, logging, os, pickle, re, shutil, subprocess, sys, threading, time, uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import redis
 
@@ -37,6 +37,37 @@ BA_DEFAULT_PERIOD = ("1788037200", "1788641999")  # последние дни, �
 
 def slug(text: str) -> str:
     return re.sub(r"[^A-Za-zА-Яа-я0-9]+", "_", text).strip("_")[:60]
+
+
+MSK = timezone(timedelta(hours=3))
+
+
+def human_dataset_name(theme_title: str, tsf, tst, folder_dir=None) -> str:
+    """Имя файла датасета по теме и периоду: «Озон отзывы 01.09.2026-01.10.2026.json».
+
+    Раньше файлы назывались BA_Озон_отзывы_20261003_120318.json: префикс BA, транслит и
+    отметка выгрузки ничего не говорили о содержимом, а период приходилось искать в подсказке.
+    """
+    def day(value) -> str:
+        try:
+            return datetime.fromtimestamp(int(value), MSK).strftime("%d.%m.%Y")
+        except Exception:
+            return ""
+
+    first, last = day(tsf), day(tst)
+    period = ""
+    if first and last:
+        period = first if first == last else "%s-%s" % (first, last)
+
+    base = " ".join(part for part in (str(theme_title or "").strip(), period) if part)
+    base = re.sub(r'[\\/:*?"<>|]+', "-", base).strip() or "Тема"
+    name = base + ".json"
+    if folder_dir is not None:
+        counter = 2
+        while (Path(folder_dir) / name).exists():
+            name = "%s (%d).json" % (base, counter)
+            counter += 1
+    return name
 
 
 # Дефолтный набор тем из кода: используется только как сид, если у пользователя ещё нет
@@ -600,7 +631,16 @@ def index_file(user_id: str, folder_name: str, json_filename: str, folder_dir: P
         result = load_file_to_elstic(FileObject(json_filename), path=str(folder_dir))
     finally:
         os.chdir(cwd)
-    return {"status": "ok", "result": result, "index_key": nk, "index_name": json_filename.replace(".json", "").lower()}
+    from load_data_elastic import dataset_index_name
+
+    index_name = dataset_index_name(json_filename)
+    # PR-аналитика: посчитать бренды нового индекса (в фоне, не блокирует импорт)
+    try:
+        from pr.enrich import enrich_after_index
+        enrich_after_index(index_name)
+    except Exception as _pr_exc:
+        print("PR-обогащение не запущено для %s: %s" % (index_name, _pr_exc))
+    return {"status": "ok", "result": result, "index_key": nk, "index_name": index_name}
 
 
 def cmd_export(args) -> int:
@@ -619,8 +659,10 @@ def cmd_export(args) -> int:
         raw = run_ba_export(theme_id, run_dir, tsf, tst, login=cc["BA_LOGIN"], passw=cc["BA_PASS"], user_id=user_id)
         size = raw.stat().st_size
         log.info("Скачан файл %s (%d байт)", raw.name, size)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_filename = "BA_%s_%s.json" % (slug(themes.get(theme_id, theme_id)), stamp)
+        theme_title = themes.get(theme_id, theme_id)
+        # Имя файла — тема и период: BA_Озон_отзывы_20261003_120318 ничего не говорило о содержимом.
+        json_filename = human_dataset_name(theme_title, tsf, tst,
+                                           DATA / user_id / "json_files_directory" / folder)
         indexes = load_indexes()
         nk = max(indexes.keys()) + 1 if indexes else 1
         folder_dir, nk = register_dataset(user_id, folder, json_filename, raw, nk)
@@ -652,7 +694,9 @@ def cmd_index(args) -> int:
         return 1
     indexes = load_indexes()
     nk = None
-    base = filename.replace(".json", "").lower()
+    from load_data_elastic import dataset_index_name
+
+    base = dataset_index_name(filename)
     for k, v in indexes.items():
         if v == base:
             nk = k

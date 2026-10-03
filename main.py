@@ -7867,6 +7867,11 @@ async def get_user_folders(
 
     json_folders = {}
 
+    # Имя файла может быть человекочитаемым («Озон отзывы 01.09.2026-01.10.2026.json»),
+    # а имя индекса Elasticsearch — без пробелов и в нижнем регистре. Приводим к общему виду:
+    # иначе файл не находил свой индекс и просто исчезал из списка в интерфейсе.
+    from load_data_elastic import dataset_index_name as _dataset_index_name
+
     # ✅ Проверяем наличие ключа json_files_directory
     json_files_dir = formatted_folders.get('json_files_directory', {})
     
@@ -7877,7 +7882,7 @@ async def get_user_folders(
     # Обработка файлов
     for folder_name, files in json_files_dir.items():
         for file_name in files:
-            file_name_stripped = file_name.replace('.json', '').lower()
+            file_name_stripped = _dataset_index_name(file_name)
 
             if file_name_stripped in es_indexes:
                 try:
@@ -7887,7 +7892,10 @@ async def get_user_folders(
                     index_number = index_numbers[0] if index_numbers else None
                     
                     file_info = {
-                        "file": file_name_stripped,
+                        # Показываем имя файла как есть — «Озон отзывы 01.09.2026-01.10.2026»,
+                        # а не нормализованное «озон_отзывы_...». Без расширения, как и раньше:
+                        # по этому значению интерфейс открывает и удаляет датасет.
+                        "file": str(file_name).replace('.json', ''),
                         "min_data": date_period_query['min_timeCreate']['value'],
                         "max_data": date_period_query['max_timeCreate']['value'],
                     }
