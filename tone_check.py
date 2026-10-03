@@ -2647,6 +2647,27 @@ def _dataset_file_owner(me: str, name: str, allow_any: bool) -> Tuple[str, str, 
     return "", "", ""
 
 
+def _shared_dataset_file_owner(me: str, name: str) -> Tuple[str, str, str]:
+    """Ищем набор в папках, выданных мне с правом на удаление: (владелец, папка, файл)."""
+    levels = {}
+    try:
+        for row in _load_shares():
+            if str(row.get("user_id")) != str(me):
+                continue
+            if str(row.get("access") or "read").strip().lower() != "delete":
+                continue
+            levels[str(row.get("owner_user_id"))] = str(row.get("folder") or "")
+    except Exception:
+        return "", "", ""
+    for owner_uid, folder in levels.items():
+        if not folder:
+            continue
+        found = _dataset_file_owner(owner_uid, name, False)
+        if found[1]:
+            return found
+    return "", "", ""
+
+
 def _dataset_jobs_active(name: str) -> int:
     """Сколько задач проверки тональности сейчас работают по этому набору."""
     count = 0
@@ -2677,8 +2698,13 @@ def delete_dataset(spec: str, user: Any = Depends(current_user_any)):
     admin = bool(getattr(user, "is_superuser", False))
     owner_uid, folder, file_name = _dataset_file_owner(uid, name, admin)
     if not folder and not admin:
+        # Набор может лежать в папке, выданной администратором с правом на удаление:
+        # тогда удаляем у владельца — это и есть выданное право.
+        owner_uid, folder, file_name = _shared_dataset_file_owner(uid, name)
+    if not folder and not admin:
         raise HTTPException(status_code=403,
-                            detail="Этот набор доступен вам по подписке — удалить его может только владелец")
+                            detail=("Этот набор доступен вам по подписке: удалить его может владелец "
+                                    "или тот, кому он выдал доступ с правом на удаление"))
     if _dataset_jobs_active(name):
         raise HTTPException(status_code=409,
                             detail="По этому набору идёт проверка тональности — сначала остановите её")

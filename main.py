@@ -7609,7 +7609,7 @@ async def delete_file(user_id: str, directory_type: str, directory_name: str, fi
             raise HTTPException(
                 status_code=404,
                 detail=("Файл «%s.json» не найден в папке «%s» этого аккаунта. Если папка выдана "
-                        "администратором, удалить датасет может только владелец."
+                        "администратором, удалить датасет можно при выданном праве на удаление."
                         % (file_name, directory_name)))
 
         try:
@@ -7904,10 +7904,11 @@ async def get_user_folders(
                             pass
 
                         if share is not None:
-                            # Папка выдана администратором: помечаем владельца и режим, чтобы
-                            # интерфейс не принимал её за свою и показывал, чьи это данные.
+                            # Папка выдана администратором: помечаем владельца и уровень доступа,
+                            # чтобы интерфейс не принимал её за свою и показывал, чьи это данные.
                             file_info["shared"] = True
                             file_info["access"] = share.get("access", "read")
+                            file_info["access_label"] = share_access_label(share.get("access"))
 
                         built[folder_name].append(file_info)
 
@@ -7950,7 +7951,9 @@ async def get_user_folders(
                 # Одноимённую свою папку не затираем: файлы соседствуют, у каждого
                 # проставлен owner_user_id.
                 json_folders.setdefault(name, []).extend(items)
-                shared_folders[name] = {"owner_user_id": int(owner_id), "access": share.get("access", "read")}
+                shared_folders[name] = {"owner_user_id": int(owner_id),
+                                        "access": share.get("access", "read"),
+                                        "access_label": share_access_label(share.get("access"))}
 
         bertopic_folders = formatted_folders.get('bertopic_files_directory', {})
         projector_folders = formatted_folders.get('projector_files_directory', {})
@@ -7966,7 +7969,9 @@ async def get_user_folders(
         json_folders = _build_files(user_id, owner_map, only_folders=only_folders, share=share_mark)
         if share_mark is not None:
             for name in json_folders:
-                shared_folders[name] = {"owner_user_id": int(user_id), "access": share_mark.get("access", "read")}
+                shared_folders[name] = {"owner_user_id": int(user_id),
+                                        "access": share_mark.get("access", "read"),
+                                        "access_label": share_access_label(share_mark.get("access"))}
 
     # Если CSV данных нет, сканируем файловую систему
     if own_call and not csv_files_directory:
@@ -12044,8 +12049,46 @@ class AdminShareBody(BaseModel):
     access: str = "read"
 
 
+# Уровни доступа к выданной папке. Читаются как «что можно делать с данными владельца»:
+# read — смотреть и брать в анализ, write — плюс править данные (разметка, переразметка),
+# delete — плюс удалять датасеты из папки владельца.
+SHARE_ACCESS_LEVELS = ("read", "write", "delete")
+SHARE_ACCESS_RANK = {"read": 0, "write": 1, "delete": 2}
+SHARE_ACCESS_LABELS = {
+    "read": "только чтение",
+    "write": "чтение и редактирование",
+    "delete": "чтение, редактирование и удаление",
+}
+
+
+def share_access_rank(value) -> int:
+    """Число-уровень доступа; неизвестное значение считаем «только чтение»."""
+    return SHARE_ACCESS_RANK.get(str(value or "read").strip().lower(), 0)
+
+
+def share_access_label(value) -> str:
+    """Название уровня доступа для интерфейса."""
+    key = str(value or "read").strip().lower()
+    return SHARE_ACCESS_LABELS.get(key, SHARE_ACCESS_LABELS["read"])
+
+
+def _shared_access_level(owner_user_id, folder, user):
+    """Какой уровень доступа выдан этому пользователю к папке (None — доступа нет)."""
+    if not folder:
+        return None
+    try:
+        for it in _load_shares():
+            if (int(it.get("owner_user_id", -1)) == int(owner_user_id)
+                    and it.get("folder") == folder
+                    and int(it.get("user_id", -1)) == int(user.id)):
+                return str(it.get("access") or "read").strip().lower()
+    except Exception:
+        return None
+    return None
+
+
 def _folder_allowed(owner_user_id, folder, user, need_write=False, need_owner=False):
-    """Owner / superuser всегда имеют доступ; иначе — запись в реестре shares."""
+    """Owner / superuser всегда имеют доступ; иначе — уровень в реестре shares."""
     try:
         if str(user.id) == str(owner_user_id):
             return True
@@ -12053,34 +12096,28 @@ def _folder_allowed(owner_user_id, folder, user, need_write=False, need_owner=Fa
             return True
     except Exception:
         return False
-    if need_owner:
-        # Удаление данных владельца не отдаём даже тому, кому дали право записи:
-        # «доступ на запись» иначе превращался в право снести индекс вместе с
-        # файлами на диске.
-        return False
     if not folder:
         return False
-    for it in _load_shares():
-        if (int(it.get("owner_user_id", -1)) == int(owner_user_id)
-                and it.get("folder") == folder
-                and int(it.get("user_id", -1)) == int(user.id)):
-            if need_write and it.get("access", "read") != "write":
-                return False
-            return True
-    return False
+    need = 2 if need_owner else (1 if need_write else 0)
+    granted = _shared_access_level(owner_user_id, folder, user)
+    if granted is None:
+        return False
+    return share_access_rank(granted) >= need
 
 
 def _folder_guard(owner_user_id, folder, user, need_write=False, need_owner=False):
     if _folder_allowed(owner_user_id, folder, user, need_write=need_write, need_owner=need_owner):
         return
-    # Папка может быть выдана администратором: тогда доступ есть, но удалять данные владельца
-    # нельзя. Раньше в этом случае приходило просто «нет доступа», и человек не понимал,
-    # почему кнопка не работает и что делать.
-    if need_owner and _folder_allowed(owner_user_id, folder, user):
+    # Папка может быть выдана, но с меньшим уровнем доступа: объясняем, что именно выдано
+    # и какого права не хватает, вместо сухого «нет доступа».
+    granted = _shared_access_level(owner_user_id, folder, user)
+    if granted:
+        wanted = "удаление" if need_owner else ("редактирование" if need_write else "доступ")
         raise HTTPException(
             status_code=403,
-            detail=("Папка «%s» выдана вам администратором (владелец #%s): данные можно смотреть "
-                    "и брать в анализ, а удалить датасет может только владелец." % (folder, owner_user_id)))
+            detail=("Папка «%s» выдана вам администратором (владелец #%s) с доступом «%s», "
+                    "а для этого действия нужно право на %s." % (
+                        folder, owner_user_id, share_access_label(granted), wanted)))
     raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
 
 current_superuser = fastapi_users.current_user(active=True, superuser=True)
@@ -12146,10 +12183,52 @@ async def admin_owner_folders(owner_id: int, admin: User = Depends(current_super
         folders = {}
     return {"owner_id": owner_id, "folders": [{"name": k, "files": len(v or [])} for k, v in folders.items()]}
 
+class AdminSharesBulkBody(BaseModel):
+    """Выдача доступа сразу к нескольким папкам: в админке их отмечают галочками."""
+
+    owner_user_id: int
+    folders: List[str] = []
+    user_id: int
+    access: str = "read"
+
+
+def _apply_share(items, owner_user_id, folder, user_id, access):
+    """Создаёт или обновляет одну выдачу. Возвращает "created" либо "updated"."""
+    now = datetime.now().isoformat()
+    for it in items:
+        if (int(it["owner_user_id"]) == int(owner_user_id) and it["folder"] == folder
+                and int(it["user_id"]) == int(user_id)):
+            it["access"] = access
+            it["updated"] = now
+            return "updated"
+    items.append({"owner_user_id": int(owner_user_id), "folder": folder, "user_id": int(user_id),
+                  "access": access, "created": now, "updated": now})
+    return "created"
+
+
+@app.post("/admin/shares/bulk")
+async def admin_add_shares_bulk(body: AdminSharesBulkBody, admin: User = Depends(current_superuser)):
+    """Выдаёт доступ к нескольким папкам одному пользователю за один раз."""
+    access = str(body.access or "read").strip().lower()
+    if access not in SHARE_ACCESS_LEVELS:
+        raise HTTPException(400, "access должен быть read, write или delete")
+    folders = [str(f).strip() for f in (body.folders or []) if str(f).strip()]
+    if not folders:
+        raise HTTPException(400, "Не выбрано ни одной папки")
+    items = _load_shares()
+    created, updated = [], []
+    for folder in folders:
+        (created if _apply_share(items, body.owner_user_id, folder, body.user_id, access) == "created"
+         else updated).append(folder)
+    _save_shares(items)
+    return {"created": created, "updated": updated, "access": access,
+            "access_label": share_access_label(access), "folders": folders}
+
+
 @app.post("/admin/shares")
 async def admin_add_share(body: AdminShareBody, admin: User = Depends(current_superuser)):
-    if body.access not in ("read", "write"):
-        raise HTTPException(400, "access должен быть read или write")
+    if str(body.access or "read").strip().lower() not in SHARE_ACCESS_LEVELS:
+        raise HTTPException(400, "access должен быть read, write или delete")
     items = _load_shares()
     for it in items:
         if it["owner_user_id"] == body.owner_user_id and it["folder"] == body.folder and it["user_id"] == body.user_id:
@@ -12172,7 +12251,9 @@ async def admin_remove_share(body: AdminShareBody, admin: User = Depends(current
 
 @app.get("/admin/shares")
 async def admin_list_shares(admin: User = Depends(current_superuser)):
-    return {"shares": _load_shares()}
+    items = _load_shares()
+    return {"shares": [dict(it, access_label=share_access_label(it.get("access"))) for it in items],
+            "levels": [{"value": key, "label": SHARE_ACCESS_LABELS[key]} for key in SHARE_ACCESS_LEVELS]}
 
 @app.get("/access")
 async def my_access(user: User = Depends(current_user)):
@@ -12183,7 +12264,7 @@ async def my_access(user: User = Depends(current_user)):
 
 @app.get("/my-datasets")
 async def my_datasets(user: User = Depends(current_user)):
-    """Свои папки + папки, расшаренные мне (read/write)."""
+    """Свои папки + папки, выданные мне администратором."""
     def folders_of(uid):
         raw = _redis_s.hget(str(uid), "json_files_directory")
         if not raw:
@@ -12199,7 +12280,9 @@ async def my_datasets(user: User = Depends(current_user)):
         fo = folders_of(it["owner_user_id"])
         files = fo.get(it["folder"], [])
         shared.append({"owner_user_id": it["owner_user_id"], "folder": it["folder"],
-                       "access": it.get("access", "read"), "files": files or []})
+                       "access": it.get("access", "read"),
+                       "access_label": share_access_label(it.get("access")),
+                       "files": files or []})
     return {"own": own, "shared": shared}
 
 
