@@ -1,0 +1,232 @@
+[
+  {
+    "file": "analiz-tem.md",
+    "path": "analiz-tem",
+    "title": "Анализ тем",
+    "description": "Разбор одной темы по подтемам: из чего складывается тема и что в ней меняется.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "ai-analytics"
+  },
+  {
+    "file": "centr-ii-zadach.md",
+    "path": "centr-ii-zadach",
+    "title": "Центр ИИ-задач",
+    "description": "Постановка задач словами: ассистент решает задачу цепочками агентов и инструментами сервиса.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "ИИ-инструменты",
+    "section": "harness"
+  },
+  {
+    "file": "dify.md",
+    "path": "dify",
+    "title": "Dify (визуальный конструктор)",
+    "description": "Автоматизация задач: визуальный редактор цепочек с узлами-инструментами сервиса.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "ИИ-инструменты",
+    "section": "dify"
+  },
+  {
+    "file": "faq-i-oshibki.md",
+    "path": "faq-i-oshibki",
+    "title": "Частые вопросы и что делать",
+    "description": "Короткие ответы на типовые ситуации: долгий расчёт, пустой экран, расхождения с источником, удаление данных.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Специальные разделы",
+    "section": ""
+  },
+  {
+    "file": "golos-klienta.md",
+    "path": "golos-klienta",
+    "title": "Голос клиента",
+    "description": "Что хвалят и на что жалуются: претензии, продукты, сервис и доставка — с примерами сообщений.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "voice"
+  },
+  {
+    "file": "graf-informacii.md",
+    "path": "graf-informacii",
+    "title": "Граф информации",
+    "description": "Как расходится информация: от первых публикаций до пиков, кто запускает тему и кто её подхватывает.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "information-graph"
+  },
+  {
+    "file": "ii-analiz.md",
+    "path": "ii-analiz",
+    "title": "ИИ анализ (темы)",
+    "description": "Тематическая модель по набору: о чём пишут, какие темы растут и где концентрируется негатив.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "ai-analytics"
+  },
+  {
+    "file": "ii-bot.md",
+    "path": "ii-bot",
+    "title": "ИИ-Бот",
+    "description": "Вопросы по своим данным: ответ строится по найденным сообщениям набора, с цитатами и ссылками.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "ИИ-инструменты",
+    "section": "ai-bot"
+  },
+  {
+    "file": "index.md",
+    "path": "index",
+    "title": "Навигация по wiki",
+    "description": "Оглавление по всем разделам сервиса.",
+    "locale": "ru",
+    "nav": false,
+    "nav_group": "",
+    "section": ""
+  },
+  {
+    "file": "kak-obnovlyat-dokumentaciyu.md",
+    "path": "kak-obnovlyat-dokumentaciyu",
+    "title": "Как обновлять документацию",
+    "description": "Как править страницы wiki: файлы, синхронизация, выгрузка подписей интерфейса.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Служебное",
+    "section": "admin"
+  },
+  {
+    "file": "klasterizaciya.md",
+    "path": "klasterizaciya",
+    "title": "Кластеризация",
+    "description": "Смысловые кластеры текстов: группы похожих по смыслу сообщений, которых не видно по ключевым словам.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "graph-analysis"
+  },
+  {
+    "file": "konkurenty.md",
+    "path": "konkurenty",
+    "title": "Конкуренты",
+    "description": "Сравнение бренда с конкурентами: доля голоса, тональность, площадки и динамика.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": ""
+  },
+  {
+    "file": "media-rating.md",
+    "path": "media-rating",
+    "title": "СМИ (медиа рейтинг)",
+    "description": "Рейтинг изданий и каналов: объём, тональность, индекс, вовлечение и лента публикаций.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "media"
+  },
+  {
+    "file": "moi-agenty.md",
+    "path": "moi-agenty",
+    "title": "Мои агенты",
+    "description": "Свои инструменты для задач: сохранённые цепочки шагов, набор инструментов, модель и расписание.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "ИИ-инструменты",
+    "section": "agents"
+  },
+  {
+    "file": "nabory-dannyh.md",
+    "path": "nabory-dannyh",
+    "title": "Наборы данных",
+    "description": "Где живут данные и отчёты: папки, файлы, загрузка из Brand Analytics, проверка тональности, статусы и удаление.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Данные и отчёты",
+    "section": "datasets"
+  },
+  {
+    "file": "nastrojki-i-dostupy.md",
+    "path": "nastrojki-i-dostupy",
+    "title": "Настройки, пользователи и доступы",
+    "description": "Пользователи, доступ к наборам данных, пароли и потребление ИИ по токенам.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Специальные разделы",
+    "section": "admin"
+  },
+  {
+    "file": "oiv-rejting.md",
+    "path": "oiv-rejting",
+    "title": "ОИВ рейтинг",
+    "description": "Рейтинг по органам исполнительной власти из выгрузок Медиалогии и сборка презентации.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Специальные разделы",
+    "section": "mosinform"
+  },
+  {
+    "file": "otchety.md",
+    "path": "otchety",
+    "title": "Отчёты",
+    "description": "Где лежат отчёты, какие они бывают и как их читать: месячные, годовые, межгодовые и тематические документы.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Данные и отчёты",
+    "section": "datasets"
+  },
+  {
+    "file": "pr-kampanii.md",
+    "path": "pr-kampanii",
+    "title": "PR-кампании",
+    "description": "Планирование и оценка кампаний: медийный и социальный срез, доля голоса, план и сообщения.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Специальные разделы",
+    "section": "pr-campaigns"
+  },
+  {
+    "file": "proverka-tonalnosti.md",
+    "path": "proverka-tonalnosti",
+    "title": "Проверка тональности",
+    "description": "Собственная разметка тональности и отношения к объектам: как запускать, как переключать расчёт и как вернуть разметку источника.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Данные и отчёты",
+    "section": "tonality"
+  },
+  {
+    "file": "smart-agent.md",
+    "path": "smart-agent",
+    "title": "Smart Agent",
+    "description": "Агент анализа данных по выбранному файлу: опишите задачу и заберите готовый отчёт.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "ИИ-инструменты",
+    "section": "agents"
+  },
+  {
+    "file": "svyazi-avtorov.md",
+    "path": "svyazi-avtorov",
+    "title": "Связи авторов",
+    "description": "Граф связей авторов: кто с кем связан, кто разгоняет тему и как переходят публикации.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "graph-analysis"
+  },
+  {
+    "file": "tonalnyy-landshaft.md",
+    "path": "tonalnyy-landshaft",
+    "title": "Тональный ландшафт",
+    "description": "Раздел про тональность: кто и как говорит о теме — авторы, площадки, доли негатива, нейтрала и позитива.",
+    "locale": "ru",
+    "nav": true,
+    "nav_group": "Аналитика",
+    "section": "tonality"
+  }
+]

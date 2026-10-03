@@ -104,8 +104,10 @@ SECTIONS: List[Dict[str, Any]] = [
     {
         "slug": "docs",
         "title": "Документация",
-        "path": "https://wiki.tellscope40.headsmade.com",
-        "prefixes": [],
+        # Документация открывается внутри Tellscope: там навигация строится по выданным
+        # разделам. Полная вики остаётся отдельным сайтом.
+        "path": "/docs",
+        "prefixes": ["/docs"],
     },
     {
         "slug": "admin",

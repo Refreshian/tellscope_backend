@@ -13594,6 +13594,89 @@ def _ai_bot_scope(user):
     return own, shared
 
 
+# ---------------------------------------------------------------------------
+# Документация внутри Tellscope: те же страницы, что и в вики, но содержание строится
+# по выданным пользователю разделам. Полная вики остаётся отдельным сайтом.
+DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "wiki")
+_DOCS_CACHE = {"mtime": 0.0, "items": []}
+
+
+def _docs_manifest():
+    """Страницы документации из манифеста: путь, заголовок, группа, раздел."""
+    path = os.path.join(DOCS_DIR, "manifest.json")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    if _DOCS_CACHE["mtime"] != mtime:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Не удалось прочитать манифест документации: {exc}")
+            data = []
+        _DOCS_CACHE["mtime"] = mtime
+        _DOCS_CACHE["items"] = [item for item in data if isinstance(item, dict) and item.get("path")]
+    return _DOCS_CACHE["items"]
+
+
+def _doc_allowed(me, item) -> bool:
+    """Видна ли страница пользователю: по выданным разделам, общие — всем вошедшим."""
+    section = str(item.get("section") or "").strip()
+    if not section:
+        return True
+    if getattr(me, "is_superuser", False):
+        return True
+    try:
+        from access_sections import ALL_SECTIONS, allowed_sections
+
+        allowed = allowed_sections(getattr(me, "id", None))
+        return ALL_SECTIONS in allowed or section in allowed
+    except Exception:
+        return False
+
+
+@app.get("/docs/pages", tags=["docs"])
+async def docs_pages(user: User = Depends(current_user_any)):
+    """Содержание документации: только страницы выданных пользователю разделов."""
+    items = []
+    groups = []
+    for item in _docs_manifest():
+        if item.get("nav") is False:
+            continue
+        if not _doc_allowed(user, item):
+            continue
+        group = str(item.get("nav_group") or "Прочее")
+        if group not in groups:
+            groups.append(group)
+        items.append({
+            "path": item["path"],
+            "title": item.get("title") or item["path"],
+            "description": item.get("description") or "",
+            "group": group,
+        })
+    return {"pages": items, "groups": groups}
+
+
+@app.get("/docs/page", tags=["docs"])
+async def docs_page(path: str, user: User = Depends(current_user_any)):
+    """Текст страницы документации. Страницы чужих разделов не отдаём."""
+    item = next((it for it in _docs_manifest() if it["path"] == path), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Страница не найдена")
+    if not _doc_allowed(user, item):
+        raise HTTPException(status_code=403, detail="Раздел этой страницы вам не выдан")
+    filename = os.path.basename(str(item.get("file") or (path + ".md")))
+    full = os.path.join(DOCS_DIR, "pages", filename)
+    try:
+        with open(full, encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail="Файл страницы недоступен") from exc
+    return {"path": item["path"], "title": item.get("title") or item["path"],
+            "group": str(item.get("nav_group") or "Прочее"), "markdown": text}
+
+
 @app.get("/ai-bot/datasets", tags=["agent mode"])
 async def ai_bot_datasets(user: User = Depends(current_user_any)):
     """Темы, доступные пользователю в AI-боте: свои папки и выданные администратором.
