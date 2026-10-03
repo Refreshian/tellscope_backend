@@ -283,12 +283,14 @@ class AuthGate:
 
         ok = False
         via_service = False
+        token_sub = ""
         if token:
             try:
                 import jwt as _jwt
                 from auth.auth import SECRET as _SECRET
                 payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
                 ok = bool(payload.get("sub"))
+                token_sub = str(payload.get("sub") or "")
             except Exception:
                 ok = False
         if not ok:
@@ -338,6 +340,29 @@ class AuthGate:
                     {"detail": "Доступно только администратору или сервисному токену"},
                     ensure_ascii=False,
                 ).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 403,
+                    "headers": [
+                        (b"content-type", b"application/json; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+
+        # Доступ к разделам интерфейса: если пользователю выданы конкретные вкладки,
+        # запросы чужих разделов отклоняем. Суперпользователи и сервисные токены — без ограничений.
+        if ok and not via_service and token_sub:
+            reason = None
+            try:
+                from access_sections import deny_reason
+
+                reason = await deny_reason(token_sub, path)
+            except Exception:
+                reason = None
+            if reason:
+                body = json.dumps({"detail": reason}, ensure_ascii=False).encode("utf-8")
                 await send({
                     "type": "http.response.start",
                     "status": 403,
@@ -9397,16 +9422,16 @@ def process_data_by_tab(data):
 
             question = data.get("question", "")
             
-            # Получаем embedding для вопроса
-            embeddings = client.embeddings.create(
-                input=question,
-                model="text-embedding-3-small"
-            )
-            embedding = embeddings.data[0].embedding
+            # Вектор вопроса считаем локальной моделью, парной к коллекции (pr/voc_search.py):
+            # раньше вызов шёл к OpenAI-эмбеддингам через шлюз чат-моделей — панель падала
+            # с AttributeError, а 1536 измерений всё равно не совпали бы с коллекциями (768/1024).
+            from pr.voc_search import query_vector_for_index
+
+            _voc_collection, embedding = query_vector_for_index(data.get("index", 0), question)
             
             # Получаем имя коллекции/индекса
             indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-            collection_name = indexes.get(data.get("index", 0), "")
+            collection_name = _voc_collection
             
             # Получаем elastic_ids из данных
             elastic_ids = []
@@ -9608,19 +9633,15 @@ async def ai_question_information_graph(request: Request, user: User = Depends(c
 
         es_ids = collect_unique_es_ids(body_json)
         
-        # Получаем embedding для вопроса пользователя
+        # Вектор вопроса считаем локальной моделью, парной к коллекции (pr/voc_search.py).
         question = body_json.get("question", "")
 
-        embeddings = client.embeddings.create(
-            input=question,
-            model="text-embedding-3-small"
-        )
-        embedding = embeddings.data[0].embedding
+        from pr.voc_search import query_vector_for_index
+
+        _voc_collection, embedding = query_vector_for_index(body_json.get("index", 0), question)
         
-        # Получаем имя коллекции/индекса
-        indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-        collection_name = indexes.get(body_json.get("index", 0), "")
-        
+        collection_name = _voc_collection
+
         # Ищем близкие векторы в Qdrant, используя фильтр по es_ids
         search_result = []
         if es_ids and collection_name:
@@ -9920,14 +9941,9 @@ async def ai_question_voice(request: Request, user: User = Depends(current_user_
 
         question = body_json.get("question", "") 
 
-        embeddings = client.embeddings.create(
-            input=question,
-            model="text-embedding-3-small"
-        )
-        embedding = embeddings.data[0].embedding
+        from pr.voc_search import query_vector_for_index
 
-        indexes = load_dict_from_pickle('/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl')
-        collection_name = indexes.get(body_json.get("index", 0), "")
+        collection_name, embedding = query_vector_for_index(body_json.get("index", 0), question)
 
         search_result = []
         if es_ids and collection_name:
@@ -12149,9 +12165,45 @@ async def current_user_id(request: Request):
 
 @app.get("/me")
 async def whoami(user: User = Depends(current_user)):
+    from access_sections import ALL_SECTIONS, allowed_sections, catalog
+    try:
+        allowed = sorted(allowed_sections(user.id))
+    except Exception:
+        allowed = [ALL_SECTIONS]
     return {"id": user.id, "email": user.email, "username": user.username,
             "role_id": user.role_id, "is_active": bool(user.is_active),
-            "is_superuser": bool(user.is_superuser), "is_verified": bool(user.is_verified)}
+            "is_superuser": bool(user.is_superuser), "is_verified": bool(user.is_verified),
+            "allowed_sections": allowed,
+            "all_sections": ALL_SECTIONS in allowed,
+            "sections_catalog": catalog()}
+
+
+class UserSectionsBody(BaseModel):
+    """Разделы интерфейса для учётной записи: ["*"] или список слагов."""
+
+    sections: Optional[List[str]] = None
+
+
+@app.get("/admin/users/{user_id}/sections")
+async def admin_get_user_sections(user_id: int, admin: User = Depends(current_superuser)):
+    """Какие разделы интерфейса выданы пользователю."""
+    from access_sections import ALL_SECTIONS, allowed_sections, catalog
+    allowed = sorted(allowed_sections(user_id))
+    return {"user_id": user_id, "sections": allowed, "all": ALL_SECTIONS in allowed,
+            "catalog": catalog()}
+
+
+@app.put("/admin/users/{user_id}/sections")
+async def admin_set_user_sections(user_id: int, body: UserSectionsBody,
+                                  admin: User = Depends(current_superuser)):
+    """Выдаёт пользователю разделы интерфейса: конкретные вкладки или все («*»)."""
+    from access_sections import ALL_SECTIONS, catalog, set_allowed_sections
+    try:
+        saved = set_allowed_sections(user_id, body.sections)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"user_id": user_id, "sections": sorted(saved), "all": ALL_SECTIONS in saved,
+            "catalog": catalog()}
 
 
 @app.patch("/admin/users/{user_id}")
