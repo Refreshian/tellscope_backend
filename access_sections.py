@@ -32,6 +32,7 @@ SECTIONS: List[Dict[str, Any]] = [
         "title": "Dify",
         "path": "/dify-constructor",
         "prefixes": ["/dify"],
+        "hint": "редактор Dify открыт только администратору: вкладка видна, но конструктор закрыт.",
     },
     {
         "slug": "agents",
@@ -111,6 +112,11 @@ SECTIONS: List[Dict[str, Any]] = [
         "title": "Администрирование",
         "path": "/admin",
         "prefixes": ["/admin"],
+        # Чувствительный раздел: подсвечиваем в списке выдачи и объясняем последствия.
+        "danger": True,
+        "hint": ("открывает раздел администрирования. Полные возможности над темами и "
+                 "пользователями даёт только флаг «админ» у учётной записи (кнопка «сделать "
+                 "админом»): сама вкладка прав не добавляет."),
     },
 ]
 
@@ -126,8 +132,20 @@ _CACHE_TTL = 20.0
 
 
 def catalog() -> List[Dict[str, Any]]:
-    """Каталог разделов для интерфейса: слаг, название, путь."""
-    return [{"slug": item["slug"], "title": item["title"], "path": item["path"]} for item in SECTIONS]
+    """Каталог разделов для интерфейса: слаг, название, путь, пометка и пояснение.
+
+    У чувствительных разделов (``danger``) интерфейс показывает пояснение: без него
+    «Администрирование» выглядит как обычная вкладка в списке выдачи.
+    """
+    rows = []
+    for item in SECTIONS:
+        row = {"slug": item["slug"], "title": item["title"], "path": item["path"]}
+        if item.get("danger"):
+            row["danger"] = True
+        if item.get("hint"):
+            row["hint"] = item["hint"]
+        rows.append(row)
+    return rows
 
 
 def known_slugs() -> Set[str]:
