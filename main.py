@@ -13404,6 +13404,103 @@ async def agent_tool_call(tool_name: str, request: Request, user_manager: UserMa
 # Отдаём уникальные темы с читаемыми подписями: их показывают выбор темы в интерфейсе
 # и подсказка в конструкторе Dify, чтобы пользователю не нужно было знать числовой index.
 
+def _ai_bot_scope(user):
+    """Свои имена индексов пользователя и владельцы выданных ему наборов."""
+    import redis as _rds
+    from load_data_elastic import dataset_index_name as _dataset_index_name
+
+    _r = _rds.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+    own = set()
+    raw = _r.hget(str(user.id), 'json_files_directory')
+    if raw:
+        try:
+            for files in (json.loads(raw) or {}).values():
+                for fn in files or []:
+                    own.add(_dataset_index_name(str(fn)))
+        except Exception:
+            pass
+
+    shared = {}
+    try:
+        for it in _load_shares():
+            if str(it.get('user_id')) != str(user.id) or str(it.get('owner_user_id')) == str(user.id):
+                continue
+            folder = it.get('folder')
+            owner = str(it.get('owner_user_id'))
+            raw2 = _r.hget(owner, 'json_files_directory') if folder else None
+            if not raw2:
+                continue
+            try:
+                files = (json.loads(raw2) or {}).get(folder) or []
+            except Exception:
+                continue
+            for fn in files:
+                shared.setdefault(_dataset_index_name(str(fn)), owner)
+    except Exception:
+        pass
+    return own, shared
+
+
+@app.get("/ai-bot/datasets", tags=["agent mode"])
+async def ai_bot_datasets(user: User = Depends(current_user)):
+    """Темы, доступные пользователю в AI-боте: свои папки и выданные администратором.
+
+    Раньше список тем AI-бот брал из `/qdrant/collections`. Тот маршрут доступен только
+    администратору и отдаёт вообще все коллекции сервиса, поэтому у обычного пользователя
+    тем не появлялось вовсе, а выданная папка не показывалась и подавно. Здесь тот же круг
+    данных, что на остальных вкладках, плюс имя коллекции и число сообщений для подписи.
+    """
+    from agent_engine.tools_data import datasets_public
+
+    try:
+        collections = {c.name: c for c in qdrant_client.get_collections().collections}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Qdrant недоступен для списка тем AI-бота: {exc}")
+        collections = {}
+
+    own, shared = _ai_bot_scope(user)
+
+    items = []
+    for item in datasets_public():
+        try:
+            _guard_index_access(user, item["index"])
+        except Exception:
+            continue
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        collection = name + "__bge" if (name + "__bge") in collections else (name if name in collections else "")
+        info = collections.get(collection)
+        points = 0
+        size = 0
+        if info is not None:
+            try:
+                points = int(info.points_count or 0)
+            except Exception:
+                points = 0
+            try:
+                vectors = getattr(getattr(getattr(info, "config", None), "params", None), "vectors", None)
+                size = int(getattr(vectors, "size", 0) or 0)
+            except Exception:
+                size = 0
+        owner = shared.get(name)
+        items.append({
+            "index": item["index"],
+            "name": name,
+            "label": str(item.get("label") or "").strip() or name,
+            "period": str(item.get("period") or ""),
+            "collection": collection,
+            "points_count": points,
+            "vector_size": size,
+            "shared": bool(owner) and name not in own,
+            "owner_user_id": int(owner) if owner else None,
+        })
+
+    # Свои темы — первыми, выданные следом: так список читается как «мои данные, потом чужие».
+    items.sort(key=lambda row: (bool(row["shared"]), -int(row["index"] or 0)))
+    return {"datasets": items, "total": len(items)}
+
+
 @app.get("/agent/datasets", tags=["agent mode"])
 async def agent_datasets(user: User = Depends(current_user)):
     """Список доступных тем: подпись, период, название датасета и номер индекса."""
