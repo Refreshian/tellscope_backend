@@ -7601,6 +7601,17 @@ async def delete_file(user_id: str, directory_type: str, directory_name: str, fi
     # Удаляем файл из json_files_directory
     if directory_type == "json_files_directory":
 
+        target = os.path.join(folder_path, file_name + '.json')
+        if not os.path.isfile(target):
+            # Файла в этом аккаунте нет: либо его уже удалили, либо датасет лежит в папке,
+            # выданной администратором (удалять её данные может только владелец). Раньше здесь
+            # был 500 с путём на диске — по нему нельзя было понять, что произошло.
+            raise HTTPException(
+                status_code=404,
+                detail=("Файл «%s.json» не найден в папке «%s» этого аккаунта. Если папка выдана "
+                        "администратором, удалить датасет может только владелец."
+                        % (file_name, directory_name)))
+
         try:
             # Удаляем соответствующий словарь
             if directory_name in folders.get("json_files_directory", {}):
@@ -7610,15 +7621,12 @@ async def delete_file(user_id: str, directory_type: str, directory_name: str, fi
                 schools_data[directory_name] = updated_schools
                 await redis_db.hset(user_id, "json_files_directory", json.dumps(schools_data))
 
-            # Удаляем файл из файловой системы
-            print(111)
-            print(os.path.join(folder_path, file_name + '.json'))
-            os.remove(os.path.join(folder_path, file_name + '.json'))
-            print(222)
+            os.remove(target)
 
             return {"message": f"Файл {file_name + '.json'} из директории {directory_name} был успешно удалён!"}
+        except HTTPException:
+            raise
         except Exception as e:
-            print(333)
             raise HTTPException(status_code=500, detail=f"Ошибка при удалении файлов: {str(e)}")
 
 
@@ -12063,8 +12071,17 @@ def _folder_allowed(owner_user_id, folder, user, need_write=False, need_owner=Fa
 
 
 def _folder_guard(owner_user_id, folder, user, need_write=False, need_owner=False):
-    if not _folder_allowed(owner_user_id, folder, user, need_write=need_write, need_owner=need_owner):
-        raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
+    if _folder_allowed(owner_user_id, folder, user, need_write=need_write, need_owner=need_owner):
+        return
+    # Папка может быть выдана администратором: тогда доступ есть, но удалять данные владельца
+    # нельзя. Раньше в этом случае приходило просто «нет доступа», и человек не понимал,
+    # почему кнопка не работает и что делать.
+    if need_owner and _folder_allowed(owner_user_id, folder, user):
+        raise HTTPException(
+            status_code=403,
+            detail=("Папка «%s» выдана вам администратором (владелец #%s): данные можно смотреть "
+                    "и брать в анализ, а удалить датасет может только владелец." % (folder, owner_user_id)))
+    raise HTTPException(status_code=403, detail="Нет доступа к этой папке пользователя")
 
 current_superuser = fastapi_users.current_user(active=True, superuser=True)
 
