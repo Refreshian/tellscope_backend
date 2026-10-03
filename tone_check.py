@@ -598,6 +598,7 @@ def _index_map() -> Dict[int, str]:
 
 
 def _allowed_stems(user_id: Any) -> set:
+    from load_data_elastic import dataset_index_name as _dataset_index_name
     """Имена датасетов, доступные пользователю: свои папки + расшаренные папки.
 
     Та же логика, что у ``main._allowed_dataset_stems``, без импорта ``main``.
@@ -622,6 +623,9 @@ def _allowed_stems(user_id: Any) -> set:
         for name in files or []:
             text = str(name).lower()
             stems.add(text[:-5] if text.endswith(".json") else text)
+            # Файл может называться человекочитаемо («Озон отзывы 01.09.2026-01.10.2026.json»),
+            # а сравниваем мы с именем индекса ES: нормализуем так же, как при загрузке.
+            stems.add(_dataset_index_name(str(name)))
 
     try:
         _add(rds.hget(str(user_id), "json_files_directory"))

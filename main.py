@@ -1048,15 +1048,32 @@ def elastic_query(
 
 
 def _allowed_dataset_stems(user_id):
+    """Имена индексов, доступные пользователю: свои папки плюс выданные администратором.
+
+    Сравниваем с именем индекса Elasticsearch, а файл может называться человекочитаемо
+    («Озон отзывы 01.09.2026-01.10.2026.json»). Без общей нормализации выданный датасет
+    считался чужим: он не попадал ни в списки тем, ни в проверки доступа.
+    """
     import redis as _rds
+    from load_data_elastic import dataset_index_name as _dataset_index_name
+
     _r = _rds.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     stems = set()
+
+    def _add(fn):
+        text = str(fn or '').strip()
+        if not text:
+            return
+        low = text.lower()
+        stems.add(low[:-5] if low.endswith('.json') else low)
+        stems.add(_dataset_index_name(text))
+
     raw = _r.hget(str(user_id), 'json_files_directory')
     if raw:
         try:
             for files in json.loads(raw).values():
                 for fn in files or []:
-                    stems.add(str(fn).lower()[:-5] if str(fn).lower().endswith('.json') else str(fn).lower())
+                    _add(fn)
         except Exception:
             pass
     try:
@@ -1066,7 +1083,7 @@ def _allowed_dataset_stems(user_id):
                 if raw2:
                     try:
                         for fn in json.loads(raw2).get(it.get('folder'), []) or []:
-                            stems.add(str(fn).lower()[:-5] if str(fn).lower().endswith('.json') else str(fn).lower())
+                            _add(fn)
                     except Exception:
                         pass
     except Exception:
