@@ -112,11 +112,10 @@ SECTIONS: List[Dict[str, Any]] = [
         "title": "Администрирование",
         "path": "/admin",
         "prefixes": ["/admin"],
-        # Чувствительный раздел: подсвечиваем в списке выдачи и объясняем последствия.
-        "danger": True,
-        "hint": ("открывает раздел администрирования. Полные возможности над темами и "
-                 "пользователями даёт только флаг «админ» у учётной записи (кнопка «сделать "
-                 "админом»): сама вкладка прав не добавляет."),
+        # Вкладкой не выдаётся: полные права даёт только флаг «админ» у учётной записи
+        # (кнопка «сделать админом»). Слаг оставляем известным, чтобы сервер по-прежнему
+        # понимал путь /admin и не принимал его за неизвестный раздел.
+        "grantable": False,
     },
 ]
 
@@ -132,13 +131,17 @@ _CACHE_TTL = 20.0
 
 
 def catalog() -> List[Dict[str, Any]]:
-    """Каталог разделов для интерфейса: слаг, название, путь, пометка и пояснение.
+    """Каталог разделов, которые можно выдать вкладкой: слаг, название, путь, пометка, пояснение.
 
     У чувствительных разделов (``danger``) интерфейс показывает пояснение: без него
     «Администрирование» выглядит как обычная вкладка в списке выдачи.
     """
     rows = []
     for item in SECTIONS:
+        # Разделы, которые не выдаются вкладкой («Администрирование»), в список выдачи не
+        # попадают: их доступ даётся только флагом «админ».
+        if item.get("grantable") is False:
+            continue
         row = {"slug": item["slug"], "title": item["title"], "path": item["path"]}
         if item.get("danger"):
             row["danger"] = True
@@ -209,6 +212,10 @@ def set_allowed_sections(user_id: Any, slugs: Optional[Iterable[str]]) -> Set[st
         raise ValueError("неизвестные разделы: %s" % ", ".join(sorted(unknown)))
     if ALL_SECTIONS in items and len(items) > 1:
         raise ValueError("нельзя сочетать «*» с отдельными разделами: выберите или все, или перечисление")
+    not_grantable = sorted(slug for slug in items if not _BY_SLUG.get(slug, {}).get("grantable", True))
+    if not_grantable:
+        titles = ", ".join("«%s»" % _BY_SLUG[slug]["title"] for slug in not_grantable)
+        raise ValueError("%s не выдаётся вкладкой: полные права даёт флаг «админ» у учётной записи" % titles)
     if not items or ALL_SECTIONS in items:
         items = {ALL_SECTIONS}
     _redis().hset(str(user_id), "allowed_sections", json.dumps(sorted(items), ensure_ascii=False))
