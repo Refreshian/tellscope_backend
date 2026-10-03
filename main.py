@@ -400,6 +400,9 @@ origins = [
     "https://localhost:4000",
     "https://tellscope.headsmade.com",
     "https://tellscope40.headsmade.com",  # ← ДОБАВЬТЕ ЭТО
+    # Вики на своём поддомене: скрипт скрытия недоступных разделов читает список страниц
+    # из API, поэтому источник вики должен быть разрешён.
+    "https://wiki.tellscope40.headsmade.com",
     "https://tsdoc.headsmade.com"
 ]
 
@@ -13636,6 +13639,65 @@ def _doc_allowed(me, item) -> bool:
         return False
 
 
+def _wiki_page_for_path(uri: str):
+    """Страница документации по адресу вики (/ru/pr-kampanii → pr-kampanii).
+
+    None — путь не относится к страницам (служебные адреса, файлы, API самой вики).
+    """
+    text = str(uri or "").split("?")[0].split("#")[0]
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        return None
+    # Первый сегмент может быть языком вики (/ru/..., /en/...).
+    if len(parts) > 1 and len(parts[0]) == 2 and parts[0].isalpha() and parts[0].islower():
+        parts = parts[1:]
+    if not parts:
+        return None
+    slug = parts[0]
+    if slug.startswith("_") or slug in ("api", "admin", "assets", "svg", "img", "fonts", "graphql"):
+        return None
+    return next((it for it in _docs_manifest() if it["path"] == slug), None)
+
+
+@app.get("/docs/gate", tags=["docs"])
+async def docs_gate(request: Request):
+    """Кого пускать в вики и какие её страницы ему видны. Спрашивает nginx вики.
+
+    Вики — отдельное приложение со своей навигацией, поэтому ограничить её можно только
+    перед входом: проверяем сессию Tellscope (общая cookie на поддомены) и раздел страницы.
+    """
+    import jwt as _jwt
+    from auth.auth import SECRET as _SECRET
+
+    token = ""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header[:7].lower() == "bearer ":
+        token = auth_header[7:].strip()
+    if not token:
+        token = (request.cookies.get("token")
+                 or request.cookies.get("access_token")
+                 or request.cookies.get("tellscope_refresh_token")
+                 or "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
+    try:
+        payload = _jwt.decode(token, _SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        uid = int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
+
+    async with async_session_maker() as session:
+        user = await session.get(AuthUser, uid)
+    if user is None or not getattr(user, "is_active", True):
+        raise HTTPException(status_code=401, detail="Пользователь не найден")
+
+    uri = request.headers.get("x-original-uri") or request.query_params.get("path") or ""
+    item = _wiki_page_for_path(uri)
+    if item is not None and not _doc_allowed(user, item):
+        raise HTTPException(status_code=403, detail="Раздел этой страницы вам не выдан")
+    return {"ok": True, "user_id": uid, "page": (item or {}).get("path", "")}
+
+
 @app.get("/docs/pages", tags=["docs"])
 async def docs_pages(user: User = Depends(current_user_any)):
     """Содержание документации: только страницы выданных пользователю разделов."""
@@ -13656,6 +13718,24 @@ async def docs_pages(user: User = Depends(current_user_any)):
             "group": group,
         })
     return {"pages": items, "groups": groups}
+
+
+@app.get("/docs/all", tags=["docs"])
+async def docs_catalog(request: Request):
+    """Все страницы документации с разделами — для скрипта, который правит список в вики.
+
+    Отдаём только название, путь и раздел (без текстов): скрипт на домене вики сверяет этот
+    перечень с выданными пользователю страницами и прячет ссылки на недоступные разделы.
+    """
+    import jwt as _jwt
+    from auth.auth import SECRET as _SECRET
+
+    token = request.cookies.get("token") or request.cookies.get("access_token") or ""
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header and auth_header[:7].lower() != "bearer " and not token:
+        raise HTTPException(status_code=401, detail="Нужен вход в Tellscope")
+    return {"pages": [{"path": it["path"], "title": it.get("title") or it["path"],
+                       "section": str(it.get("section") or "")} for it in _docs_manifest()]}
 
 
 @app.get("/docs/page", tags=["docs"])
