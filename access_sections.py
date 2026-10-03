@@ -197,11 +197,18 @@ def allowed_sections(user_id: Any) -> Set[str]:
 
 
 def set_allowed_sections(user_id: Any, slugs: Optional[Iterable[str]]) -> Set[str]:
-    """Записывает доступы: пустой список или «*» — все разделы."""
+    """Записывает доступы: пустой список или «*» — все разделы, иначе перечисление.
+
+    Смешивать «*» с отдельными разделами нельзя: раньше такой список молча превращался в
+    «все разделы», и администратор, отметивший пару вкладок у пользователя, у которого были
+    выданы все, выдавал ему всё заново.
+    """
     items = {str(item).strip() for item in (slugs or []) if str(item).strip()}
     unknown = items - known_slugs() - {ALL_SECTIONS}
     if unknown:
         raise ValueError("неизвестные разделы: %s" % ", ".join(sorted(unknown)))
+    if ALL_SECTIONS in items and len(items) > 1:
+        raise ValueError("нельзя сочетать «*» с отдельными разделами: выберите или все, или перечисление")
     if not items or ALL_SECTIONS in items:
         items = {ALL_SECTIONS}
     _redis().hset(str(user_id), "allowed_sections", json.dumps(sorted(items), ensure_ascii=False))
