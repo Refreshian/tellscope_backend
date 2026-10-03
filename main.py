@@ -12204,10 +12204,16 @@ async def my_datasets(user: User = Depends(current_user)):
 
 
 class AdminUserPatch(BaseModel):
+    """Правка учётной записи администратором: доступ, админство, пароль, имя и почта."""
+
     is_active: Optional[bool] = None
     is_superuser: Optional[bool] = None
     role_id: Optional[int] = None
     password: Optional[str] = None
+    # Имя и почта правятся из карточки пользователя в админке: раньше их нельзя было
+    # изменить вообще — заведённую с опечаткой учётную запись приходилось пересоздавать.
+    username: Optional[str] = None
+    email: Optional[str] = None
 
 
 @app.get("/user-id", tags=["auth"])
@@ -12289,13 +12295,32 @@ async def admin_patch_user(user_id: int, body: AdminUserPatch, admin: User = Dep
             user.is_superuser = bool(body.is_superuser)
         if body.role_id is not None:
             user.role_id = body.role_id
+        if body.username is not None:
+            name = str(body.username).strip()
+            if not name:
+                raise HTTPException(status_code=400, detail="Имя не может быть пустым")
+            user.username = name
+        if body.email is not None:
+            mail = str(body.email).strip().lower()
+            if "@" not in mail or len(mail) < 5:
+                raise HTTPException(status_code=400, detail="Некорректный email")
+            if mail != str(user.email or "").lower():
+                exists = (await session.execute(
+                    select(AuthUser).where(AuthUser.email == mail))).scalars().first()
+                if exists is not None and int(exists.id) != int(user_id):
+                    raise HTTPException(status_code=400, detail="Такой email уже занят")
+                user.email = mail
         if body.password:
             if len(body.password) < 6:
                 raise HTTPException(status_code=400, detail="Пароль слишком короткий (минимум 6 символов)")
             udb = SQLAlchemyUserDatabase(session, AuthUser)
             mgr = UserManager(udb)
             user.hashed_password = mgr.password_helper.hash(body.password)
-        await session.commit()
+        try:
+            await session.commit()
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            raise HTTPException(status_code=400, detail="Не удалось сохранить: %s" % str(exc)[:160])
         await session.refresh(user)
         return {"id": user.id, "email": user.email, "username": user.username,
                 "role_id": user.role_id, "is_active": bool(user.is_active),
