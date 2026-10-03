@@ -7864,6 +7864,7 @@ async def get_user_folders(
     # а имя индекса Elasticsearch — без пробелов и в нижнем регистре. Приводим к общему виду:
     # иначе файл не находил свой индекс и просто исчезал из списка в интерфейсе.
     from load_data_elastic import dataset_index_name as _dataset_index_name
+    from dataset_names import pretty_dataset_name as _pretty_dataset_name
 
     def _build_files(owner_id, files_map, only_folders=None, share=None):
         """Папки и файлы одного владельца в том виде, в каком их рисует интерфейс."""
@@ -7881,13 +7882,17 @@ async def get_user_folders(
 
                         index_numbers = [i for i in indexes if indexes[i] == file_name_stripped]
 
+                        _min_ts = date_period_query['min_timeCreate']['value']
+                        _max_ts = date_period_query['max_timeCreate']['value']
                         file_info = {
-                            # Показываем имя файла как есть — «Озон отзывы 01.09.2026-01.10.2026»,
-                            # а не нормализованное «озон_отзывы_...». Без расширения, как и раньше:
-                            # по этому значению интерфейс открывает и удаляет датасет.
+                            # Значение "file" интерфейс использует для действий (открыть,
+                            # удалить), поэтому здесь имя файла как есть. Для показа рядом
+                            # лежит "file_display": «Тема 01.09.2026-30.09.2026» вместо
+                            # BA_Признаки_ОРВИ_20261003_175906.
                             "file": str(file_name).replace('.json', ''),
-                            "min_data": date_period_query['min_timeCreate']['value'],
-                            "max_data": date_period_query['max_timeCreate']['value'],
+                            "file_display": _pretty_dataset_name(file_name, _min_ts, _max_ts),
+                            "min_data": _min_ts,
+                            "max_data": _max_ts,
                             "owner_user_id": int(owner_id),
                         }
 

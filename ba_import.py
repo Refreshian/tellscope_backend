@@ -602,7 +602,12 @@ def register_dataset(user_id: str, folder_name: str, json_filename: str, json_pa
 
     indexes = load_indexes()
     nk = int(next_key) if next_key else (max(indexes.keys()) + 1 if indexes else 1)
-    indexes[nk] = json_filename.replace(".json", "").lower()
+    # В реестре лежит имя индекса Elasticsearch: у человекочитаемого имени файла
+    # («Признаки ОРВИ 27.09.2026-03.10.2026.json») пробелы заменяются на подчёркивания,
+    # иначе агент и проверки не находят датасет по имени.
+    from load_data_elastic import dataset_index_name as _dataset_index_name
+
+    indexes[nk] = _dataset_index_name(json_filename)
     save_indexes(indexes)
 
     folders = {}

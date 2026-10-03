@@ -25,8 +25,9 @@ from ba_import import (
     BE, DATA, STATUS_ERROR, STATUS_UNVERIFIED, STATUS_VERIFIED,
     account_creds, account_delete, account_status, account_touch, account_put,
     load_themes, save_themes, themes_cache_reset, fetch_ba_themes,
-    slug, run_ba_export, register_dataset, load_indexes,
+    slug, run_ba_export, register_dataset, load_indexes, human_dataset_name,
 )
+from load_data_elastic import dataset_index_name
 
 router = APIRouter(prefix="/ba", tags=["brand analytics"])
 
@@ -255,7 +256,11 @@ def _run_import(job_id: str, body: ImportBody):
         shutil.copyfile(raw, arch_file)
 
         _jid(job_id, status="running", message="Сохранение данных", progress="40")
-        json_filename = "BA_%s_%s.json" % (slug(theme_title), stamp)
+        # Имя датасета — тема и период, как у остальных выгрузок: BA_Признаки_ОРВИ_20261003_175906
+        # не говорило ни о теме, ни о периоде, а месяц выгрузки принимали за период данных.
+        _folder_dir = DATA / str(uid) / "json_files_directory" / folder
+        _folder_dir.mkdir(parents=True, exist_ok=True)
+        json_filename = human_dataset_name(theme_title, body.date_from, body.date_to, _folder_dir)
         indexes = load_indexes()
         nk = max(indexes.keys()) + 1 if indexes else 1
         register_dataset(uid, folder, json_filename, raw, nk)
@@ -270,7 +275,7 @@ def _run_import(job_id: str, body: ImportBody):
             "user_id": uid, "folder": folder, "file": json_filename,
             "archive": str(arch_file), "date_from": body.date_from, "date_to": body.date_to,
             "bytes": raw.stat().st_size, "index_key": nk,
-            "index_name": json_filename.replace(".json", "").lower(),
+            "index_name": dataset_index_name(json_filename),
             "created": datetime.now().isoformat(),
         }
         append_registry(rec)
