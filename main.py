@@ -13595,7 +13595,7 @@ def _ai_bot_scope(user):
 
 
 @app.get("/ai-bot/datasets", tags=["agent mode"])
-async def ai_bot_datasets(user: User = Depends(current_user)):
+async def ai_bot_datasets(user: User = Depends(current_user_any)):
     """Темы, доступные пользователю в AI-боте: свои папки и выданные администратором.
 
     Раньше список тем AI-бот брал из `/qdrant/collections`. Тот маршрут доступен только
@@ -13604,6 +13604,10 @@ async def ai_bot_datasets(user: User = Depends(current_user)):
     данных, что на остальных вкладках, плюс имя коллекции и число сообщений для подписи.
     """
     from agent_engine.tools_data import datasets_public
+    from dataset_names import dataset_theme as _dataset_theme
+    from dataset_names import period_label as _period_label
+    from dataset_names import with_period as _with_period
+    from dataset_periods import data_period as _data_period
 
     try:
         collections = {c.name: c for c in qdrant_client.get_collections().collections}
@@ -13637,11 +13641,22 @@ async def ai_bot_datasets(user: User = Depends(current_user)):
             except Exception:
                 size = 0
         owner = shared.get(name)
+        # Подпись как в папках: «Признаки ОРВИ 01.08.2026-01.10.2026». Период берём из имени
+        # файла, а если его там нет — из самих данных (см. dataset_periods).
+        theme = _dataset_theme(name) or str(item.get("label") or "").strip() or name
+        period_text = str(item.get("period") or "").strip()
+        if not period_text:
+            _lo, _hi = _data_period(name)
+            _span = _period_label(_lo, _hi)
+            if _span:
+                period_text = _span.replace("-", " \u2014 ")
+        pretty_label = _with_period(theme, period_text=period_text)
         items.append({
             "index": item["index"],
             "name": name,
-            "label": str(item.get("label") or "").strip() or name,
-            "period": str(item.get("period") or ""),
+            "label": pretty_label,
+            "title": pretty_label,
+            "period": period_text,
             "collection": collection,
             "points_count": points,
             "vector_size": size,
@@ -13655,9 +13670,13 @@ async def ai_bot_datasets(user: User = Depends(current_user)):
 
 
 @app.get("/agent/datasets", tags=["agent mode"])
-async def agent_datasets(user: User = Depends(current_user)):
+async def agent_datasets(user: User = Depends(current_user_any)):
     """Список доступных тем: подпись, период, название датасета и номер индекса."""
     from agent_engine.tools_data import datasets_public
+
+    from dataset_names import dataset_theme as _dataset_theme
+    from dataset_names import with_period as _with_period
+    from dataset_periods import data_period as _data_period
 
     items = []
     for item in datasets_public():
@@ -13665,7 +13684,19 @@ async def agent_datasets(user: User = Depends(current_user)):
             _guard_index_access(user, item["index"])
         except Exception:
             continue
-        items.append(item)
+        # title — подпись для интерфейса, как в папках: «Тема ДД.ММ.ГГГГ-ДД.ММ.ГГГГ».
+        row = dict(item)
+        theme = _dataset_theme(item.get("name")) or str(item.get("label") or "").strip()
+        period_text = str(item.get("period") or "").strip()
+        if period_text:
+            row["title"] = _with_period(theme, period_text=period_text)
+        else:
+            try:
+                _lo, _hi = _data_period(item.get("name"))
+            except Exception:
+                _lo, _hi = 0.0, 0.0
+            row["title"] = _with_period(theme, _lo, _hi)
+        items.append(row)
     return {"datasets": items, "total": len(items), "note": "тему можно указывать названием или index"}
 
 

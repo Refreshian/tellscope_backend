@@ -101,6 +101,14 @@ def _split_name(name: str) -> "tuple[str, str]":
     text = _re.sub(r"[0-9a-f]{16,}", "", text).strip(" _-.")
     words = [word for word in text.replace("_", " ").replace("-", " ").split() if word]
     label = " ".join(_nice_word(word) for word in words)
+    # Общее правило чистки: убирает префикс источника и отметку выгрузки, иначе в подписи
+    # оставалось «БА Признаки Орви 20261003 175906».
+    try:
+        from dataset_names import dataset_theme as _dataset_theme
+
+        label = _dataset_theme(text) or label
+    except Exception:
+        pass
     return (label or _stem(name), period)
 
 

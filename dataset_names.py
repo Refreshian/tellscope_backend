@@ -30,6 +30,12 @@ ALIASES = {
     "beyond taylor": "Beyond Taylor",
     "ozon": "Озон",
     "priznaki orvi": "Признаки ОРВИ",
+    "признаки орви": "Признаки ОРВИ",
+    # Аббревиатуры пишем заглавными: в подписи «Признаки орви» выглядит небрежно.
+    "орви": "ОРВИ",
+    "сми": "СМИ",
+    "оив": "ОИВ",
+    "pr": "PR",
     "moskovskiy transport": "Московский транспорт",
     "smirnov medicina moskvy": "Смирнов Медицина Москвы",
     "smirnov stroim dom": "Смирнов Строим дом",
@@ -65,11 +71,10 @@ def _theme(title: str) -> str:
     return text
 
 
-def pretty_dataset_name(file_name, min_ts=None, max_ts=None) -> str:
-    """Подпись датасета для интерфейса. Исходное имя файла не меняется."""
+def _strip_technical(file_name: str) -> str:
+    """Имя без префикса источника, отметки выгрузки и хеша, с пробелами вместо подчёркиваний."""
     raw = str(file_name or "").strip()
-    stem = raw[:-5] if raw.lower().endswith(".json") else raw
-    text = stem
+    text = raw[:-5] if raw.lower().endswith(".json") else raw
     low = text.lower()
     for prefix in PREFIXES:
         if low.startswith(prefix):
@@ -78,13 +83,40 @@ def pretty_dataset_name(file_name, min_ts=None, max_ts=None) -> str:
     text = HASH_RE.sub(" ", text)
     text = STAMP_RE.sub(" ", text)
     text = re.sub(r"[_]+", " ", text)
-    text = re.sub(r"\s{2,}", " ", text).strip(" -\u2013\u2014_")
+    return re.sub(r"\s{2,}", " ", text).strip(" -\u2013\u2014_")
 
-    period = PERIOD_RE.search(text)
+
+def dataset_theme(file_name) -> str:
+    """Тема датасета без периода: «Признаки ОРВИ», «KFC», «Озон отзывы»."""
+    text = _strip_technical(PERIOD_RE.sub(" ", str(file_name or "")))
+    return _theme(text)
+
+
+def with_period(label, min_ts=None, max_ts=None, period_text: str = "") -> str:
+    """Подпись «Тема 01.09.2026-30.09.2026».
+
+    Период берётся из готовой строки, из имени файла или из данных — что есть. Если период
+    в подписи уже указан, второй раз его не добавляем.
+    """
+    text = str(label or "").strip()
+    if not text or PERIOD_RE.search(text):
+        return text
+    span = str(period_text or "").strip()
+    if not span:
+        span = period_label(min_ts, max_ts)
+    if not span:
+        return text
+    span = span.replace("\u2014", "-").replace("\u2013", "-").replace(" ", "")
+    return ("%s %s" % (text, span)).strip()
+
+
+def pretty_dataset_name(file_name, min_ts=None, max_ts=None) -> str:
+    """Подпись датасета для интерфейса. Исходное имя файла не меняется."""
+    raw = str(file_name or "").strip()
+    stem = raw[:-5] if raw.lower().endswith(".json") else raw
+    period = PERIOD_RE.search(stem)
     if period:
-        theme = _theme(PERIOD_RE.sub(" ", text))
-        return ("%s %s-%s" % (theme, period.group(1), period.group(2))).strip()
-
-    theme = _theme(text)
+        return ("%s %s-%s" % (dataset_theme(stem), period.group(1), period.group(2))).strip()
+    theme = dataset_theme(stem)
     label = period_label(min_ts, max_ts)
     return ("%s %s" % (theme, label)).strip() if label else theme

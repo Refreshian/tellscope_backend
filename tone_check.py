@@ -703,7 +703,21 @@ def _guard_dataset(user: Any, spec: Any) -> Tuple[Optional[int], str]:
 
 
 def _pretty_label(name: str) -> str:
-    """Человеческое имя датасета: 'ba_озон_отзывы_20260912_150434' → 'Озон отзывы'."""
+    """Подпись датасета как в папках: «Признаки ОРВИ 01.08.2026-01.10.2026».
+
+    Раньше подпись собиралась отдельным правилом и выглядела как «Признаки Орви», а у
+    выгрузок из Brand Analytics в неё попадали префикс источника и отметка выгрузки.
+    """
+    try:
+        from dataset_names import dataset_theme, with_period
+        from dataset_periods import data_period
+
+        theme = dataset_theme(name)
+        if theme:
+            low, high = data_period(name)
+            return with_period(theme, low, high)
+    except Exception:
+        pass
     try:
         from agent_engine.tools_reports import _pretty_topic_name
 
