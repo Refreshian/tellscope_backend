@@ -26,8 +26,14 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 say "сборка фронтенда"
+# Сборку выполняет dev, а не root: после root-сборки в dist остаются файлы root,
+# и следующая сборка падает на очистке каталога (rimraf/emptyDir: permission denied).
+chown -R dev:dev "$FE/dist" 2>/dev/null || true
+rm -rf "$FE/dist"
+su dev -c "cd $FE && $(command -v yarn) build"
+chown -R dev:dev "$FE/dist"
+# Публикация ниже работает с относительным dist — возвращаемся в каталог фронтенда.
 cd "$FE"
-yarn build
 
 say "публикация сборки"
 cp -r dist/. "$WEB"/
