@@ -7795,55 +7795,33 @@ async def get_user_folders(
     me: User = Depends(current_user),
 ):
     import os
-    from pathlib import Path
 
     user = get_user_profile(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Доступ к чужим папкам: только суперпользователю или через реестр shares
-    if str(me.id) != str(user_id) and not me.is_superuser:
-        _shared_folders = [it["folder"] for it in _load_shares()
-                           if int(it["owner_user_id"]) == int(user_id) and int(it["user_id"]) == int(me.id)]
-        if not _shared_folders:
-            raise HTTPException(status_code=403, detail="Нет доступа к данным этого пользователя")
-        raw = await redis_db.hget(str(user_id), "json_files_directory")
-        jd = {}
-        if raw:
-            try:
-                jd = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
-            except Exception:
-                jd = {}
-        want = set(_shared_folders)
-        return {"user_id": user_id, "shared_only": True,
-                "json_files_directory": {k: v for k, v in jd.items() if k in want},
-                "bertopic_files_directory": {}, "csv_files_directory": {}}
-    
+    own_call = str(me.id) == str(user_id)
+    shares = _load_shares()
+    shared_here = [it for it in shares
+                   if str(it.get("owner_user_id")) == str(user_id) and str(it.get("user_id")) == str(me.id)]
+
+    # Чужие папки: суперпользователю или тому, кому папку выдали администратором.
+    if not own_call and not me.is_superuser and not shared_here:
+        raise HTTPException(status_code=403, detail="Нет доступа к данным этого пользователя")
+
+    def _decode_map(raw):
+        """Значение поля Redis: байты с JSON внутри (кириллица — в utf-8)."""
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     file_path = '/home/dev/tellscope_app/tellscope_backend/data/indexes.pkl'
     indexes = load_dict_from_pickle(file_path)
-    
-    folders = await redis_db.hgetall(user_id)
-    if not folders:
-        return {
-            "user_id": user_id, 
-            "json_files_directory": {}, 
-            "bertopic_files_directory": {},
-            "csv_files_directory": {}
-        }
 
-    # ✅ ИСПРАВЛЕНИЕ: Правильная декодировка кириллицы из Redis
-    formatted_folders = {}
-    for folder_key, files_value in folders.items():
-        folder_name = folder_key.decode('utf-8')  # Декодируем ключ
-        try:
-            # Загружаем JSON с ensure_ascii=False для корректной обработки кириллицы
-            files_data = json.loads(files_value.decode('utf-8'))
-            formatted_folders[folder_name] = files_data
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            logger.error(f"Ошибка декодирования данных для папки {folder_name}: {e}")
-            formatted_folders[folder_name] = {}
-
-    # Получение данных из Elasticsearch с обработкой ошибок
     try:
         es_indexes = list(es.indices.get(index='*').keys())
     except Exception as e:
@@ -7852,125 +7830,171 @@ async def get_user_folders(
 
     query = {
         "aggs": {
-            "max_timeCreate": {
-                "max": {
-                    "field": "timeCreate"
-                }
-            },
-            "min_timeCreate": {
-                "min": {
-                    "field": "timeCreate"
-                }
-            }
+            "max_timeCreate": {"max": {"field": "timeCreate"}},
+            "min_timeCreate": {"min": {"field": "timeCreate"}},
         },
     }
-
-    json_folders = {}
 
     # Имя файла может быть человекочитаемым («Озон отзывы 01.09.2026-01.10.2026.json»),
     # а имя индекса Elasticsearch — без пробелов и в нижнем регистре. Приводим к общему виду:
     # иначе файл не находил свой индекс и просто исчезал из списка в интерфейсе.
     from load_data_elastic import dataset_index_name as _dataset_index_name
 
-    # ✅ Проверяем наличие ключа json_files_directory
-    json_files_dir = formatted_folders.get('json_files_directory', {})
-    
-    # Инициализация папок
-    for folder_name in json_files_dir.keys():
-        json_folders[folder_name] = []
+    def _build_files(owner_id, files_map, only_folders=None, share=None):
+        """Папки и файлы одного владельца в том виде, в каком их рисует интерфейс."""
+        built = {}
+        for folder_name, files in (files_map or {}).items():
+            if only_folders is not None and folder_name not in only_folders:
+                continue
+            built[folder_name] = []
+            for file_name in (files or []):
+                file_name_stripped = _dataset_index_name(file_name)
 
-    # Обработка файлов
-    for folder_name, files in json_files_dir.items():
-        for file_name in files:
-            file_name_stripped = _dataset_index_name(file_name)
-
-            if file_name_stripped in es_indexes:
-                try:
-                    date_period_query = es.search(index=file_name_stripped, body=query)['aggregations']
-                    
-                    index_numbers = [i for i in indexes if indexes[i] == file_name_stripped]
-                    index_number = index_numbers[0] if index_numbers else None
-                    
-                    file_info = {
-                        # Показываем имя файла как есть — «Озон отзывы 01.09.2026-01.10.2026»,
-                        # а не нормализованное «озон_отзывы_...». Без расширения, как и раньше:
-                        # по этому значению интерфейс открывает и удаляет датасет.
-                        "file": str(file_name).replace('.json', ''),
-                        "min_data": date_period_query['min_timeCreate']['value'],
-                        "max_data": date_period_query['max_timeCreate']['value'],
-                    }
-                    
-                    if index_number is not None:
-                        file_info["index_number"] = index_number
-
+                if file_name_stripped in es_indexes:
                     try:
-                        _fpath = os.path.join('/home/dev/tellscope_app/tellscope_backend/data', str(user_id), 'json_files_directory', folder_name, file_name if str(file_name).lower().endswith('.json') else str(file_name) + '.json')
-                        if os.path.exists(_fpath):
-                            file_info['created'] = os.path.getmtime(_fpath)
-                    except Exception:
-                        pass
+                        date_period_query = es.search(index=file_name_stripped, body=query)['aggregations']
 
-                    json_folders[folder_name].append(file_info)
+                        index_numbers = [i for i in indexes if indexes[i] == file_name_stripped]
 
-                except Exception as e:
-                    print(f"Error processing file {file_name_stripped}: {str(e)}")
+                        file_info = {
+                            # Показываем имя файла как есть — «Озон отзывы 01.09.2026-01.10.2026»,
+                            # а не нормализованное «озон_отзывы_...». Без расширения, как и раньше:
+                            # по этому значению интерфейс открывает и удаляет датасет.
+                            "file": str(file_name).replace('.json', ''),
+                            "min_data": date_period_query['min_timeCreate']['value'],
+                            "max_data": date_period_query['max_timeCreate']['value'],
+                            "owner_user_id": int(owner_id),
+                        }
+
+                        if index_numbers:
+                            file_info["index_number"] = index_numbers[0]
+
+                        try:
+                            _fname = file_name if str(file_name).lower().endswith('.json') else str(file_name) + '.json'
+                            _fpath = os.path.join('/home/dev/tellscope_app/tellscope_backend/data',
+                                                  str(owner_id), 'json_files_directory', folder_name, _fname)
+                            if os.path.exists(_fpath):
+                                file_info['created'] = os.path.getmtime(_fpath)
+                        except Exception:
+                            pass
+
+                        if share is not None:
+                            # Папка выдана администратором: помечаем владельца и режим, чтобы
+                            # интерфейс не принимал её за свою и показывал, чьи это данные.
+                            file_info["shared"] = True
+                            file_info["access"] = share.get("access", "read")
+
+                        built[folder_name].append(file_info)
+
+                    except Exception as e:
+                        print(f"Error processing file {file_name_stripped}: {str(e)}")
+                        continue
+        return built
+
+    json_folders = {}
+    shared_folders = {}
+    formatted_folders = {}
+    bertopic_folders = {}
+    projector_folders = {}
+    csv_files_directory = {}
+
+    if own_call:
+        folders = await redis_db.hgetall(user_id)
+        for folder_key, files_value in (folders or {}).items():
+            folder_name = folder_key.decode('utf-8') if isinstance(folder_key, bytes) else str(folder_key)
+            formatted_folders[folder_name] = _decode_map(files_value)
+
+        json_files_dir = formatted_folders.get('json_files_directory', {})
+        json_folders = _build_files(user_id, json_files_dir)
+
+        # Папки, выданные мне администратором. Раньше они попадали только в отдельный
+        # список «Доступные мне», а дерево папок строилось по своим данным — выданная
+        # папка не появлялась в «Наборах данных» вовсе.
+        for share in shares:
+            if str(share.get("user_id")) != str(me.id) or str(share.get("owner_user_id")) == str(me.id):
+                continue
+            folder = share.get("folder")
+            if not folder:
+                continue
+            owner_id = str(share.get("owner_user_id"))
+            owner_map = _decode_map(await redis_db.hget(owner_id, "json_files_directory"))
+            built = _build_files(owner_id, owner_map, only_folders={folder}, share=share)
+            for name, items in built.items():
+                if not items:
                     continue
+                # Одноимённую свою папку не затираем: файлы соседствуют, у каждого
+                # проставлен owner_user_id.
+                json_folders.setdefault(name, []).extend(items)
+                shared_folders[name] = {"owner_user_id": int(owner_id), "access": share.get("access", "read")}
 
-    # Обработка bertopic_files_directory
-    bertopic_folders = formatted_folders.get('bertopic_files_directory', {})
-    
-    # Обработка projector_files_directory
-    projector_folders = formatted_folders.get('projector_files_directory', {})
-        
-    # CSV файлы
-    csv_files_directory = formatted_folders.get('csv_files_directory', {})
-    
+        bertopic_folders = formatted_folders.get('bertopic_files_directory', {})
+        projector_folders = formatted_folders.get('projector_files_directory', {})
+        csv_files_directory = formatted_folders.get('csv_files_directory', {})
+    else:
+        owner_map = _decode_map(await redis_db.hget(user_id, "json_files_directory"))
+        if me.is_superuser and not shared_here:
+            share_mark = None
+            only_folders = None
+        else:
+            only_folders = {it.get("folder") for it in shared_here}
+            share_mark = shared_here[0] if shared_here else {"access": "read"}
+        json_folders = _build_files(user_id, owner_map, only_folders=only_folders, share=share_mark)
+        if share_mark is not None:
+            for name in json_folders:
+                shared_folders[name] = {"owner_user_id": int(user_id), "access": share_mark.get("access", "read")}
+
     # Если CSV данных нет, сканируем файловую систему
-    if not csv_files_directory:
+    if own_call and not csv_files_directory:
         bertopic_base_path = f'/home/dev/tellscope_app/tellscope_backend/data/{user_id}/bertopic_files_directory'
-        
+
         if os.path.exists(bertopic_base_path):
             for root, dirs, files in os.walk(bertopic_base_path):
                 csv_files = [f for f in files if f.startswith('result_graph_') and f.endswith('.csv')]
-                
+
                 if csv_files:
                     relative_path = os.path.relpath(root, bertopic_base_path)
-                    
+
                     csv_info_list = []
                     for csv_file in csv_files:
                         full_path = os.path.join(root, csv_file)
-                        
+
                         csv_info = {
                             "file": csv_file,
                             "full_path": full_path,
                             "relative_path": f"{relative_path}/{csv_file}".replace('\\', '/'),
                         }
-                        
+
                         try:
                             file_size = os.path.getsize(full_path)
                             csv_info["size"] = file_size
                         except:
                             csv_info["size"] = 0
-                        
+
                         csv_info_list.append(csv_info)
-                    
+
                     folder_key = relative_path if relative_path != '.' else 'root'
                     csv_files_directory[folder_key] = csv_info_list
 
         # ✅ Сохраняем с ensure_ascii=False
         await redis_db.hset(
-            user_id, 
-            "csv_files_directory", 
+            user_id,
+            "csv_files_directory",
             json.dumps(csv_files_directory, ensure_ascii=False)
         )
 
-    return {
+    payload = {
         "user_id": user_id,
         "json_files_directory": json_folders,
         "bertopic_files_directory": bertopic_folders,
         "projector_files_directory": projector_folders,
-        "csv_files_directory": csv_files_directory
+        "csv_files_directory": csv_files_directory,
     }
+    if shared_folders:
+        payload["shared_folders"] = shared_folders
+    if not own_call:
+        payload["shared_only"] = True
+        payload["owner_id"] = user_id
+    return payload
 
 
 ###########################################################################################################
